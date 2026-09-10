@@ -34,24 +34,6 @@ def test_help_and_version_require_no_config_file() -> None:
         main(["--version"])
 
 
-def test_serve_is_not_implemented_yet(tmp_path: Path) -> None:
-    config_path = tmp_path / "config.toml"
-    config_path.write_text(
-        """
-        [defaults]
-        username = "bgrossman@jumpmind.com"
-        api_token = "token"
-
-        [[sites]]
-        name = "acme"
-        url = "https://acme.atlassian.net"
-        key_prefixes = ["ACME"]
-        """
-    )
-    exit_code = main(["--config", str(config_path)])
-    assert exit_code == 2
-
-
 def test_missing_config_exits_2_with_no_traceback(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     missing = tmp_path / "nope.toml"
     exit_code = main(["--check", "--config", str(missing)])

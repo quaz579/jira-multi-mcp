@@ -15,18 +15,19 @@ from pathlib import Path
 import httpx
 
 from jira_multi_mcp import __version__
+from jira_multi_mcp.children import minimal_env
 from jira_multi_mcp.config import load_config
 from jira_multi_mcp.errors import JiraMultiError
 from jira_multi_mcp.logging_setup import LOGGER_NAME, collect_secrets, configure_logging
 from jira_multi_mcp.model import AppConfig, SiteConfig
 from jira_multi_mcp.secrets import redact_text
+from jira_multi_mcp.server import serve
 from jira_multi_mcp.sources import ConfigSource, EnvOverlaySource, TomlFileConfigSource
 
 _CLOUD_MYSELF_PATH = "/rest/api/3/myself"
 _SERVER_MYSELF_PATH = "/rest/api/2/myself"
 _UVX_TOKENS = ("uvx",)
 _UV_TOOL_RUN_TOKENS = ("uv", "tool", "run")
-_WARM_ENV_PASSTHROUGH = ("PATH", "HOME")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -108,16 +109,29 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.check:
         return asyncio.run(_cmd_check(config, allow_partial=args.allow_partial))
 
-    sys.stderr.write("serve is implemented in M2\n")
-    return 2
+    return asyncio.run(serve(config, verbose=args.verbose))
 
 
 def _literal_token_source(site: SiteConfig, env_var_suffix: str) -> str:
     """Where a literal (non ``*_env``) token value came from: the TOML file,
     or a ``JIRA_MULTI_SITE_<NAME>_<FIELD>`` env-overlay variable naming the
-    value directly rather than pointing at another env var to read it from."""
-    overlay_var = f"{EnvOverlaySource.PREFIX}{site.name.upper()}_{env_var_suffix}"
-    return "env overlay" if os.environ.get(overlay_var) else "file"
+    value directly rather than pointing at another env var to read it from.
+
+    Scans rather than reconstructing one uppercase-name guess: ``EnvOverlaySource``
+    lowercases whatever case the ``<NAME>`` segment was actually written in (only
+    the fixed ``JIRA_MULTI_SITE_`` prefix and ``_<FIELD>`` suffix are exact-case),
+    so a real variable like ``JIRA_MULTI_SITE_acme_API_TOKEN`` must still match a
+    site named ``acme``.
+    """
+    prefix = EnvOverlaySource.PREFIX
+    suffix = f"_{env_var_suffix}"
+    for key in os.environ:
+        if not key.startswith(prefix) or not key.endswith(suffix):
+            continue
+        middle = key[len(prefix) : -len(suffix)]
+        if middle.lower() == site.name:
+            return "env overlay"
+    return "file"
 
 
 def _render_config(config: AppConfig) -> str:
@@ -156,6 +170,8 @@ def _render_config(config: AppConfig) -> str:
             lines.append(f"  auth = server_dc (personal_token = *** [{source}])")
         if site.enabled_tools is not None:
             lines.append(f"  enabled_tools = {sorted(site.enabled_tools)!r}")
+        if site.projects_filter is not None:
+            lines.append(f"  projects_filter = {list(site.projects_filter)!r}")
     return redact_text("\n".join(lines) + "\n", collect_secrets(config))
 
 
@@ -173,8 +189,7 @@ def _refresh_insertion_index(command: Sequence[str]) -> int:
 def _warm_env(config: AppConfig) -> dict[str, str]:
     """A minimal, explicit child env: no ambient secrets (e.g. an API token)
     leak into a subprocess that only needs to resolve and print --help."""
-    names = (*_WARM_ENV_PASSTHROUGH, *config.upstream.env_passthrough)
-    return {name: value for name in names if (value := os.environ.get(name)) is not None}
+    return minimal_env(config.upstream.env_passthrough)
 
 
 def _cmd_warm(config: AppConfig, *, refresh: bool) -> int:

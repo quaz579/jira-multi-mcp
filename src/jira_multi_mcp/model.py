@@ -57,6 +57,7 @@ class SiteConfig:
     personal_token_env: str | None = None
     read_only: bool = False
     enabled_tools: frozenset[str] | None = None
+    projects_filter: tuple[str, ...] | None = None
 
     @property
     def auth_mode(self) -> str:

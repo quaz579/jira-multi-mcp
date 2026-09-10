@@ -33,3 +33,7 @@ class UnknownPrefixError(SiteResolutionError):
 
 class CrossSiteError(SiteResolutionError):
     """A single tool call's arguments referenced more than one configured site."""
+
+
+class SchemaConflictError(JiraMultiError):
+    """An upstream tool's input schema already defines the ``site`` property."""

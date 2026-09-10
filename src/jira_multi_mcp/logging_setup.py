@@ -15,8 +15,19 @@ list, whose handler is attached directly to that logger and never propagates
 to root. Call ``attach_redaction(name)`` for any such logger once its name is
 known -- e.g. M2 calls ``attach_redaction("fastmcp")`` again right after
 importing fastmcp, so a handler fastmcp adds to its own logger at import time
-is covered too (belt-and-suspenders on top of the logger-level filter already
-attached here, which alone is sufficient functionally).
+is covered too.
+
+Correction: the logger-level filter added here is NOT what protects a record
+from a *child* logger (e.g. ``fastmcp.server``) that merely propagates up
+through ``fastmcp``'s non-propagating handler -- a filter attached via
+``Logger.addFilter`` only runs for records that *originate* at that logger,
+never for ones passing through it on their way up the tree via
+``Logger.callHandlers``. What actually protects that case is that
+``attach_redaction`` also adds the filter directly to each of the logger's
+*handlers* (not just the logger object), and handler-level filters DO run for
+every record the handler processes, including propagated ones. So the
+handler-level attachment -- not the logger-level one -- is load-bearing for
+child-logger propagation; see ``attach_redaction``'s implementation.
 """
 
 from __future__ import annotations

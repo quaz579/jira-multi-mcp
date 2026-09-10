@@ -10,7 +10,7 @@ import pytest
 
 from jira_multi_mcp.cli import main
 from jira_multi_mcp.config import load_config
-from jira_multi_mcp.logging_setup import configure_logging, resolve_log_dir
+from jira_multi_mcp.logging_setup import attach_redaction, configure_logging, resolve_log_dir
 from jira_multi_mcp.secrets import RedactingFilter, RedactingFormatter, Secret, redact_text
 from jira_multi_mcp.sources import EnvOverlaySource, TomlFileConfigSource
 
@@ -299,6 +299,38 @@ def test_late_handler_on_a_redacted_logger_still_gets_a_redacted_traceback(tmp_p
     finally:
         logger.removeHandler(late_handler)
         logger.propagate = True
+
+    output = stream.getvalue()
+    assert TOKEN not in output
+    assert "***" in output
+
+
+def test_child_logger_record_redacted_via_parents_non_propagating_handler(tmp_path: Path) -> None:
+    """M2's server.py calls ``attach_redaction("fastmcp")`` again right after
+    importing fastmcp, because fastmcp attaches its own non-propagating
+    handler directly to the "fastmcp" logger. A record from a CHILD logger
+    (e.g. "fastmcp.server", standing in for fastmcp's real per-module
+    loggers) still reaches that handler via normal propagation up the
+    logger tree -- it must come out redacted too."""
+    import io
+
+    config = load_config(sources=[TomlFileConfigSource(_write_config(tmp_path)), EnvOverlaySource({})])
+    configure_logging(config, verbose=False)
+
+    stream = io.StringIO()
+    parent_logger = logging.getLogger("fastmcp")
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(logging.Formatter("%(message)s"))
+    parent_logger.addHandler(handler)
+    parent_logger.propagate = False
+    attach_redaction("fastmcp")
+
+    child_logger = logging.getLogger("fastmcp.server")
+    try:
+        child_logger.error(f"child leak {TOKEN}")
+    finally:
+        parent_logger.removeHandler(handler)
+        parent_logger.propagate = True
 
     output = stream.getvalue()
     assert TOKEN not in output
