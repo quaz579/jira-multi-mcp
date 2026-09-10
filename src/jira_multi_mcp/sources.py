@@ -52,11 +52,15 @@ class TomlFileConfigSource:
         if not self.path.is_file():
             raise ConfigError(f"config file not found: {self.path}")
         self._warn_if_insecure_permissions()
-        with self.path.open("rb") as fh:
-            try:
+        try:
+            with self.path.open("rb") as fh:
                 data = tomllib.load(fh)
-            except tomllib.TOMLDecodeError as exc:
-                raise ConfigError(f"{self.name}: invalid TOML: {exc}") from exc
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"{self.name}: invalid TOML: {exc}") from exc
+        except UnicodeDecodeError as exc:
+            raise ConfigError(f"{self.name}: file is not valid UTF-8: {exc}") from exc
+        except OSError as exc:
+            raise ConfigError(f"{self.name}: could not read config file ({exc.__class__.__name__})") from exc
 
         sites: dict[str, dict[str, Any]] = {}
         for entry in data.get("sites", []):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -98,6 +99,25 @@ def test_merge_sources_later_wins_field_by_field() -> None:
     assert merged["defaults"] == {"username": "a", "toolset_preset": "all"}
     assert merged["sites"]["acme"]["url"] == "https://acme.atlassian.net"
     assert merged["sites"]["acme"]["key_prefixes"] == ["ACME", "ACMEOPS"]
+
+
+def test_toml_file_source_invalid_utf8_is_a_config_error(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_bytes(b'[defaults]\nusername = "\xff\xfe not valid utf-8"\n')
+    with pytest.raises(ConfigError, match="UTF-8"):
+        TomlFileConfigSource(path).load()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores file permission bits")
+def test_toml_file_source_unreadable_file_is_a_config_error_not_a_raw_oserror(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sites]]\nname = "acme"\n')
+    path.chmod(0o000)
+    try:
+        with pytest.raises(ConfigError, match="could not read config file"):
+            TomlFileConfigSource(path).load()
+    finally:
+        path.chmod(0o600)
 
 
 def test_merge_sources_can_add_a_new_site_without_touching_others() -> None:
