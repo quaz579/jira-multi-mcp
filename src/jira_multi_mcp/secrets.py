@@ -39,33 +39,69 @@ class Secret:
         return hash(self._value)
 
 
-class RedactingFilter(logging.Filter):
-    """Scrubs known secret values out of every log record it sees.
+def _secret_values(secrets: Iterable[Secret]) -> tuple[str, ...]:
+    """Longest-first so a token that is a substring of another is still fully masked."""
+    return tuple(
+        sorted(
+            {s.get_secret_value() for s in secrets if len(s.get_secret_value()) >= _MIN_REDACT_LEN},
+            key=len,
+            reverse=True,
+        )
+    )
 
-    Must be attached to each handler individually: a filter on a logger does
-    not apply to records a child logger propagates through it, only to
-    records that logger itself emits directly.
+
+def _redact_with_values(text: str, values: tuple[str, ...]) -> str:
+    redacted = text
+    for value in values:
+        if value in redacted:
+            redacted = redacted.replace(value, _MASK)
+    return redacted
+
+
+def redact_text(text: str, secrets: Iterable[Secret]) -> str:
+    return _redact_with_values(text, _secret_values(secrets))
+
+
+class RedactingFilter(logging.Filter):
+    """Scrubs known secret values out of a record's raw message/args.
+
+    This only covers ``record.getMessage()``; it does NOT touch a formatted
+    traceback (``exc_info``/``exc_text``) or ``stack_info``, which are
+    rendered later by the handler's formatter. Use :class:`RedactingFormatter`
+    on every handler to cover those too — this filter is kept in addition
+    because it lets ``record.msg`` be scrubbed before other filters/handlers
+    that don't use the formatter (e.g. anything reading ``record.msg`` directly).
     """
 
     def __init__(self, secrets: Iterable[Secret]) -> None:
         super().__init__()
-        self._values = tuple(
-            sorted(
-                {s.get_secret_value() for s in secrets if len(s.get_secret_value()) >= _MIN_REDACT_LEN},
-                key=len,
-                reverse=True,
-            )
-        )
+        self._values = _secret_values(secrets)
 
     def filter(self, record: logging.LogRecord) -> bool:
         if not self._values:
             return True
         message = record.getMessage()
-        redacted = message
-        for value in self._values:
-            if value in redacted:
-                redacted = redacted.replace(value, _MASK)
+        redacted = _redact_with_values(message, self._values)
         if redacted != message:
             record.msg = redacted
             record.args = ()
         return True
+
+
+class RedactingFormatter(logging.Formatter):
+    """Scrubs known secret values out of the FULLY formatted record.
+
+    ``RedactingFilter`` only sees ``record.getMessage()``; the traceback text
+    a formatter appends for ``exc_info``/``stack_info`` bypasses it entirely,
+    so a secret embedded in an exception message (e.g. ``RuntimeError(token)``)
+    would otherwise reach stderr and the log file unredacted. Wrap the base
+    formatter's output instead of relying on the filter alone.
+    """
+
+    def __init__(self, fmt: str, secrets: Iterable[Secret]) -> None:
+        super().__init__(fmt)
+        self._values = _secret_values(secrets)
+
+    def format(self, record: logging.LogRecord) -> str:
+        formatted = super().format(record)
+        return _redact_with_values(formatted, self._values)
