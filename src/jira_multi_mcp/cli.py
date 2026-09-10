@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -25,6 +26,7 @@ _CLOUD_MYSELF_PATH = "/rest/api/3/myself"
 _SERVER_MYSELF_PATH = "/rest/api/2/myself"
 _UVX_TOKENS = ("uvx",)
 _UV_TOOL_RUN_TOKENS = ("uv", "tool", "run")
+_WARM_ENV_PASSTHROUGH = ("PATH", "HOME")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -88,9 +90,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(sources=_sources_for(args.config))
     except JiraMultiError as exc:
-        # Routed through the (redacting) logger rather than a bare stderr
-        # write, so this stays covered if a future ConfigError message ever
-        # carries something sensitive-looking.
+        # Routed through the logger (not a bare stderr write) for consistency
+        # with the rest of the CLI. Note load_config failed on this path, so
+        # zero secrets are registered yet and nothing here is actually
+        # redacted -- this only guards a future ConfigError message once a
+        # partial config load can register some secrets before failing.
         logging.getLogger(LOGGER_NAME).error("error: %s", exc)
         return 2
 
@@ -106,6 +110,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     sys.stderr.write("serve is implemented in M2\n")
     return 2
+
+
+def _literal_token_source(site: SiteConfig, env_var_suffix: str) -> str:
+    """Where a literal (non ``*_env``) token value came from: the TOML file,
+    or a ``JIRA_MULTI_SITE_<NAME>_<FIELD>`` env-overlay variable naming the
+    value directly rather than pointing at another env var to read it from."""
+    overlay_var = f"{EnvOverlaySource.PREFIX}{site.name.upper()}_{env_var_suffix}"
+    return "env overlay" if os.environ.get(overlay_var) else "file"
 
 
 def _render_config(config: AppConfig) -> str:
@@ -128,15 +140,23 @@ def _render_config(config: AppConfig) -> str:
         lines.append(f"  key_prefixes = {list(site.key_prefixes)!r}")
         lines.append(f"  read_only = {site.read_only}")
         if site.api_token is not None:
-            source = f"env:{site.api_token_env}" if site.api_token_env else "file"
+            source = (
+                f"env:{site.api_token_env}"
+                if site.api_token_env
+                else _literal_token_source(site, "API_TOKEN")
+            )
             lines.append(f"  username = {site.username!r}")
             lines.append(f"  auth = cloud (api_token = *** [{source}])")
         else:
-            source = f"env:{site.personal_token_env}" if site.personal_token_env else "file"
+            source = (
+                f"env:{site.personal_token_env}"
+                if site.personal_token_env
+                else _literal_token_source(site, "PERSONAL_TOKEN")
+            )
             lines.append(f"  auth = server_dc (personal_token = *** [{source}])")
         if site.enabled_tools is not None:
             lines.append(f"  enabled_tools = {sorted(site.enabled_tools)!r}")
-    return "\n".join(lines) + "\n"
+    return redact_text("\n".join(lines) + "\n", collect_secrets(config))
 
 
 def _refresh_insertion_index(command: Sequence[str]) -> int:
@@ -150,27 +170,46 @@ def _refresh_insertion_index(command: Sequence[str]) -> int:
     )
 
 
+def _warm_env(config: AppConfig) -> dict[str, str]:
+    """A minimal, explicit child env: no ambient secrets (e.g. an API token)
+    leak into a subprocess that only needs to resolve and print --help."""
+    names = (*_WARM_ENV_PASSTHROUGH, *config.upstream.env_passthrough)
+    return {name: value for name in names if (value := os.environ.get(name)) is not None}
+
+
 def _cmd_warm(config: AppConfig, *, refresh: bool) -> int:
+    secrets = collect_secrets(config)
     command = list(config.upstream.command)
     if refresh:
         try:
             command.insert(_refresh_insertion_index(command), "--refresh")
         except JiraMultiError as exc:
-            sys.stderr.write(f"error: {exc}\n")
+            sys.stderr.write(f"error: {redact_text(str(exc), secrets)}\n")
             return 1
     command.append("--help")
     try:
-        completed = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        completed = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=config.defaults.call_timeout_seconds,
+            env=_warm_env(config),
+        )
     except subprocess.TimeoutExpired as exc:
-        sys.stderr.write(f"error: upstream command {command!r} timed out after {exc.timeout}s\n")
+        sys.stderr.write(
+            f"error: upstream command {redact_text(str(command), secrets)} timed out after {exc.timeout}s\n"
+        )
         return 1
     except OSError as exc:
-        sys.stderr.write(f"error: failed to run upstream command {command!r}: {exc}\n")
+        sys.stderr.write(
+            f"error: failed to run upstream command {redact_text(str(command), secrets)}: {exc}\n"
+        )
         return 1
     if completed.returncode != 0:
-        sys.stderr.write(f"warm failed (exit {completed.returncode}): {completed.stderr.strip()}\n")
+        detail = redact_text(completed.stderr.strip(), secrets)
+        sys.stderr.write(f"warm failed (exit {completed.returncode}): {detail}\n")
         return 1
-    sys.stdout.write(f"upstream cache warmed: {' '.join(command)}\n")
+    sys.stdout.write(f"upstream cache warmed: {redact_text(' '.join(command), secrets)}\n")
     return 0
 
 
@@ -245,6 +284,18 @@ async def _cmd_check(config: AppConfig, *, allow_partial: bool) -> int:
             # table down with it.
             detail = redact_text(f"{raw.__class__.__name__}: {raw}", secrets)
             results.append(_CheckResult(site=site, ok=False, detail=detail))
+        elif raw.detail:
+            # _check_site's own httpx.HTTPError/error-body branches build
+            # `detail` from exception text or a Jira response body, neither
+            # of which goes through a redacting logger on this path.
+            raw = _CheckResult(
+                site=raw.site,
+                ok=raw.ok,
+                detail=redact_text(raw.detail, secrets),
+                display_name=raw.display_name,
+                account_id=raw.account_id,
+            )
+            results.append(raw)
         else:
             results.append(raw)
     sys.stdout.write(_render_check_table(results))

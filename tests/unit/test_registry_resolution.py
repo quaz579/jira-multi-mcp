@@ -101,6 +101,17 @@ def test_explicit_is_case_insensitive(multi_site_registry: SiteRegistry) -> None
     assert result.site.name == "acme"
 
 
+def test_explicit_is_stripped_of_surrounding_whitespace(multi_site_registry: SiteRegistry) -> None:
+    result = resolve_site(multi_site_registry, {}, explicit="  acme  ", tool_name="x")
+    assert result.site.name == "acme"
+    assert result.reason == "explicit"
+
+
+def test_explicit_all_whitespace_falls_through_to_key_inference(multi_site_registry: SiteRegistry) -> None:
+    result = resolve_site(multi_site_registry, {"issue_key": "BETA-1"}, explicit="   ", tool_name="x")
+    assert result.site.name == "beta"
+
+
 def test_unknown_explicit_site_lists_configured_names(multi_site_registry: SiteRegistry) -> None:
     with pytest.raises(UnknownSiteError) as exc_info:
         resolve_site(multi_site_registry, {}, explicit="nope", tool_name="x")
@@ -161,6 +172,24 @@ def test_projects_filter_is_comma_separated(multi_site_registry: SiteRegistry) -
 def test_projects_filter_numeric_project_id_is_skipped_not_unknown(multi_site_registry: SiteRegistry) -> None:
     with pytest.raises(AmbiguousSiteError):
         resolve_site(multi_site_registry, {"projects_filter": "10001"}, tool_name="jira_search")
+
+
+def test_projects_filter_numeric_only_gives_a_present_but_unrouted_message(
+    multi_site_registry: SiteRegistry,
+) -> None:
+    with pytest.raises(AmbiguousSiteError) as exc_info:
+        resolve_site(multi_site_registry, {"projects_filter": "10001"}, tool_name="jira_search")
+    message = str(exc_info.value)
+    assert "projects_filter" in message
+    assert "present but contained no recognizable" in message
+
+
+def test_zero_keys_message_does_not_claim_an_arg_was_present_when_none_was(
+    multi_site_registry: SiteRegistry,
+) -> None:
+    with pytest.raises(AmbiguousSiteError) as exc_info:
+        resolve_site(multi_site_registry, {}, tool_name="jira_search")
+    assert "present but contained no recognizable" not in str(exc_info.value)
 
 
 def test_projects_filter_mixed_numeric_and_real_key_still_routes(multi_site_registry: SiteRegistry) -> None:

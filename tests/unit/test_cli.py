@@ -165,6 +165,41 @@ def test_warm_refresh_on_non_uvx_command_errors_clearly(
     assert "--refresh requires" in capsys.readouterr().err
 
 
+def test_warm_uses_a_minimal_explicit_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("JIRA_API_TOKEN", "should-not-leak-into-the-child")
+    monkeypatch.setenv("SOME_OTHER_SECRET_LOOKING_VAR", "also-should-not-leak")
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+        [defaults]
+        call_timeout_seconds = 45
+
+        [[sites]]
+        name = "acme"
+        url = "https://acme.atlassian.net"
+        key_prefixes = ["ACME"]
+        personal_token = "token"
+        """
+    )
+    captured_env: dict[str, str] = {}
+    captured_timeout: list[float] = []
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured_env.update(kwargs.get("env") or {})
+        captured_timeout.append(kwargs["timeout"])
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    exit_code = main(["--warm", "--config", str(config_path)])
+
+    assert exit_code == 0
+    assert "PATH" in captured_env
+    assert "JIRA_API_TOKEN" not in captured_env
+    assert "SOME_OTHER_SECRET_LOOKING_VAR" not in captured_env
+    assert captured_timeout == [45.0]
+
+
 def test_warm_timeout_is_reported_not_raised(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text(

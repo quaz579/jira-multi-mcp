@@ -38,10 +38,11 @@ PROJECTS_FILTER_ARGS: tuple[str, ...] = ("projects_filter",)
 # though they can contain text that looks like an issue key.
 NEVER_PARSED: frozenset[str] = frozenset({"jql"})
 
-ISSUE_KEY_RE = re.compile(r"^([A-Z][A-Z0-9_]+)-\d+(?:-\d+)*$")
+ISSUE_KEY_RE = re.compile(r"^([A-Z][A-Z0-9_]*)-\d+(?:-\d+)*$")
 
 # Shape of a bare project key (also used to validate a configured key_prefix).
-PROJECT_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
+# A single letter is a valid Jira project key upstream, so this allows one.
+PROJECT_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 _ROUTABLE_ARGS = frozenset(ISSUE_KEY_ARGS) | frozenset(PROJECT_KEY_ARGS) | frozenset(PROJECTS_FILTER_ARGS)
 assert not (NEVER_PARSED & _ROUTABLE_ARGS), "NEVER_PARSED must never overlap a routable argument name"

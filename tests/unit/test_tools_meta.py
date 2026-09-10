@@ -50,3 +50,13 @@ def test_project_key_regex_examples() -> None:
     assert PROJECT_KEY_RE.match("ACME_OPS")
     assert not PROJECT_KEY_RE.match("10001")
     assert not PROJECT_KEY_RE.match("acme")
+
+
+def test_project_key_regex_allows_a_single_letter_like_upstream() -> None:
+    assert PROJECT_KEY_RE.match("X")
+
+
+def test_issue_key_regex_allows_a_single_letter_project_prefix() -> None:
+    match = ISSUE_KEY_RE.match("X-1")
+    assert match is not None
+    assert match.group(1) == "X"

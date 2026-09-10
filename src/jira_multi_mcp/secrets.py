@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
+from typing import Any
 
 _MASK = "***"
 _MIN_REDACT_LEN = 4
+# A plain Formatter used only to render exc_info into text ourselves, so we
+# can redact it and store it in record.exc_text before any real handler runs.
+_EXC_FORMATTER = logging.Formatter()
 
 
 class Secret:
@@ -63,14 +67,22 @@ def redact_text(text: str, secrets: Iterable[Secret]) -> str:
 
 
 class RedactingFilter(logging.Filter):
-    """Scrubs known secret values out of a record's raw message/args.
+    """Scrubs known secret values out of a record before any handler runs it.
 
-    This only covers ``record.getMessage()``; it does NOT touch a formatted
-    traceback (``exc_info``/``exc_text``) or ``stack_info``, which are
-    rendered later by the handler's formatter. Use :class:`RedactingFormatter`
-    on every handler to cover those too — this filter is kept in addition
-    because it lets ``record.msg`` be scrubbed before other filters/handlers
-    that don't use the formatter (e.g. anything reading ``record.msg`` directly).
+    Covers ``record.msg``/``record.args``, the rendered exception text
+    (computed and stored in ``record.exc_text`` with ``record.exc_info``
+    cleared, so a handler that renders its own traceback from ``exc_info``
+    directly -- e.g. fastmcp's ``RichHandler`` -- can never reach the raw
+    frames), and ``record.stack_info``. This only protects a record that
+    passes through a logger or handler this filter is attached to; see
+    ``logging_setup.attach_redaction`` for extending coverage to a logger
+    discovered later (e.g. only after importing a third-party package).
+
+    Also tolerant of a malformed third-party log call, e.g.
+    ``logger.error("bad %d", "x")``: stdlib invokes a filter's
+    ``getMessage()`` outside the handler's own ``try/except`` ->
+    ``handleError`` safety net, so a bad format string would otherwise
+    propagate straight out of ``Logger.handle`` and crash the process.
     """
 
     def __init__(self, secrets: Iterable[Secret]) -> None:
@@ -78,24 +90,70 @@ class RedactingFilter(logging.Filter):
         self._values = _secret_values(secrets)
 
     def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+        except Exception:
+            self._mark_format_error(record)
+        else:
+            if self._values:
+                redacted = _redact_with_values(message, self._values)
+                if redacted != message:
+                    record.msg = redacted
+                    record.args = ()
+
         if not self._values:
             return True
-        message = record.getMessage()
-        redacted = _redact_with_values(message, self._values)
-        if redacted != message:
-            record.msg = redacted
-            record.args = ()
+
+        record.args = self._redact_args(record.args)
+        if record.exc_info:
+            record.exc_text = _redact_with_values(
+                _EXC_FORMATTER.formatException(record.exc_info), self._values
+            )
+            record.exc_info = None
+        if record.stack_info:
+            record.stack_info = _redact_with_values(str(record.stack_info), self._values)
         return True
+
+    def _mark_format_error(self, record: logging.LogRecord) -> None:
+        """Makes an unrenderable record safe to log instead of raising or falling
+        into ``Handler.handleError``'s own raw ``Arguments: (...)`` dump.
+
+        Setting ``record.args = ()`` also makes the rewritten ``record.msg``
+        safe from a second ``%``-substitution attempt by the real formatter
+        later, since stdlib's ``getMessage()`` only applies ``%`` when
+        ``self.args`` is non-empty.
+        """
+        safe_args = self._redact_args(record.args)
+        raw_msg = str(record.msg)
+        if self._values:
+            raw_msg = _redact_with_values(raw_msg, self._values)
+        record.msg = f"[log-format-error] {raw_msg} args={safe_args!r}"
+        record.args = ()
+
+    def _redact_args(self, args: Any) -> Any:
+        if not self._values or not args:
+            return args
+        if isinstance(args, Mapping):
+            return {key: self._redact_one(value) for key, value in args.items()}
+        if isinstance(args, tuple):
+            return tuple(self._redact_one(value) for value in args)
+        return args
+
+    def _redact_one(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return _redact_with_values(value, self._values)
+        text = repr(value)
+        redacted = _redact_with_values(text, self._values)
+        return redacted if redacted != text else value
 
 
 class RedactingFormatter(logging.Formatter):
-    """Scrubs known secret values out of the FULLY formatted record.
+    """Defense in depth: re-scrubs the fully formatted line.
 
-    ``RedactingFilter`` only sees ``record.getMessage()``; the traceback text
-    a formatter appends for ``exc_info``/``stack_info`` bypasses it entirely,
-    so a secret embedded in an exception message (e.g. ``RuntimeError(token)``)
-    would otherwise reach stderr and the log file unredacted. Wrap the base
-    formatter's output instead of relying on the filter alone.
+    ``RedactingFilter`` already redacts ``msg``/``args``/``exc_text``/
+    ``stack_info`` on the record itself before any handler runs, so this is
+    normally redundant -- kept in case a handler's formatter builds its
+    output from something the filter doesn't touch.
     """
 
     def __init__(self, fmt: str, secrets: Iterable[Secret]) -> None:

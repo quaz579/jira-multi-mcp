@@ -196,3 +196,110 @@ def test_print_config_shows_the_dc_auth_branch(tmp_path: Path, capsys: pytest.Ca
     captured = capsys.readouterr()
     assert "server_dc" in captured.out
     assert TOKEN not in captured.out
+
+
+def test_print_config_labels_a_literal_token_from_the_env_overlay(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text(
+        """
+        [[sites]]
+        name = "acme"
+        url = "https://acme.atlassian.net"
+        key_prefixes = ["ACME"]
+        """
+    )
+    monkeypatch.setenv("JIRA_MULTI_SITE_ACME_USERNAME", "bgrossman@jumpmind.com")
+    monkeypatch.setenv("JIRA_MULTI_SITE_ACME_API_TOKEN", TOKEN)
+
+    exit_code = main(["--print-config", "--config", str(path)])
+
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert "env overlay" in captured.out
+    assert TOKEN not in captured.out
+
+
+def test_redacting_filter_does_not_crash_on_a_malformed_log_call() -> None:
+    record = logging.LogRecord(
+        name="test",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="bad %d",
+        args=("x",),
+        exc_info=None,
+    )
+    filt = RedactingFilter([Secret(TOKEN)])
+
+    assert filt.filter(record) is True
+    assert "[log-format-error]" in record.getMessage()
+    assert record.args == ()
+
+
+def test_malformed_log_call_through_configured_logging_does_not_raise_and_is_marked(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Primed first (as cli.main does) so an earlier test's now-closed capsys
+    # stream can't still be attached to root when load_config's own advisory
+    # logging runs, which would otherwise print unrelated "Logging error"
+    # noise this test isn't about.
+    configure_logging(None, verbose=False)
+    config = load_config(sources=[TomlFileConfigSource(_write_config(tmp_path)), EnvOverlaySource({})])
+    logger = configure_logging(config, verbose=False)
+
+    logger.error("bad %d", "x")  # must not raise, and must not fall into handleError
+
+    stderr = capsys.readouterr().err
+    assert "[log-format-error]" in stderr
+    assert "Arguments:" not in stderr
+
+
+def test_chained_exception_and_stack_info_are_still_redacted(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config = load_config(sources=[TomlFileConfigSource(_write_config(tmp_path)), EnvOverlaySource({})])
+    logger = configure_logging(config, verbose=False)
+
+    try:
+        try:
+            raise ValueError(f"inner leak {TOKEN}")
+        except ValueError as inner:
+            raise RuntimeError(f"outer leak {TOKEN}") from inner
+    except RuntimeError:
+        logger.error("chained failure", exc_info=True, stack_info=True)
+
+    stderr = capsys.readouterr().err
+    assert TOKEN not in stderr
+    assert "***" in stderr
+
+
+def test_late_handler_on_a_redacted_logger_still_gets_a_redacted_traceback(tmp_path: Path) -> None:
+    """The r2 reproduction: a handler attached AFTER configure_logging (no
+    RedactingFormatter/Filter of its own -- standing in for fastmcp's own
+    RichHandler on the non-propagating "fastmcp" logger) must still see a
+    redacted exc_info, because the logger-level filter runs first."""
+    import io
+
+    config = load_config(sources=[TomlFileConfigSource(_write_config(tmp_path)), EnvOverlaySource({})])
+    configure_logging(config, verbose=False)
+
+    stream = io.StringIO()
+    late_handler = logging.StreamHandler(stream)
+    late_handler.setFormatter(logging.Formatter("%(message)s"))
+    logger = logging.getLogger("fastmcp")
+    logger.addHandler(late_handler)
+    logger.propagate = False
+    try:
+        try:
+            raise RuntimeError(f"late leak {TOKEN}")
+        except RuntimeError:
+            logger.error("late handler test", exc_info=True)
+    finally:
+        logger.removeHandler(late_handler)
+        logger.propagate = True
+
+    output = stream.getvalue()
+    assert TOKEN not in output
+    assert "***" in output

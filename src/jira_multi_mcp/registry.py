@@ -74,6 +74,7 @@ def resolve_site(
     explicit: str | None = None,
     tool_name: str = "",
 ) -> SiteResolution:
+    explicit = explicit.strip() if explicit else explicit
     if explicit:
         site = registry.get_by_name(explicit)
         if site is None:
@@ -87,6 +88,10 @@ def resolve_site(
     matched_sites: dict[str, SiteConfig] = {}
     matched_detail: dict[str, list[str]] = {}
     first_reason: str | None = None
+    # Args that had a non-empty value but whose tokens never resolved to a
+    # site (e.g. a purely numeric `projects_filter`) — tracked so the
+    # "ambiguous" error can say so, instead of claiming no argument was given.
+    present_but_unrouted: list[str] = []
 
     def record(prefix: str, token: str, arg_name: str) -> None:
         nonlocal first_reason
@@ -104,14 +109,20 @@ def resolve_site(
     for arg_name in ISSUE_KEY_ARGS:
         if arg_name not in arguments or arguments[arg_name] is None:
             continue
+        had_content = False
+        matched = False
         for token in _split(arguments[arg_name]):
             candidate = token.strip().upper()
             if not candidate:
                 continue
+            had_content = True
             match = ISSUE_KEY_RE.match(candidate)
             if not match:
                 continue
             record(match.group(1), candidate, arg_name)
+            matched = True
+        if had_content and not matched:
+            present_but_unrouted.append(arg_name)
 
     for arg_name in PROJECT_KEY_ARGS:
         if arg_name not in arguments or arguments[arg_name] is None:
@@ -136,17 +147,30 @@ def resolve_site(
     for arg_name in PROJECTS_FILTER_ARGS:
         if arg_name not in arguments or arguments[arg_name] is None:
             continue
+        had_content = False
+        matched = False
         for token in _split(arguments[arg_name]):
             candidate = token.strip().upper()
             if not candidate:
                 continue
+            had_content = True
             if not PROJECT_KEY_RE.match(candidate):
                 # e.g. a numeric project id ("10001") — never a routing signal,
                 # and not an error: it just doesn't help resolve a site.
                 continue
             record(candidate, candidate, arg_name)
+            matched = True
+        if had_content and not matched:
+            present_but_unrouted.append(arg_name)
 
     if not matched_sites:
+        if present_but_unrouted:
+            args_detail = ", ".join(present_but_unrouted)
+            raise AmbiguousSiteError(
+                f"tool '{tool_name}': {args_detail} present but contained no recognizable issue/project "
+                f"key (jql is never parsed for site routing); pass 'site' explicitly. "
+                f"Configured prefixes: {registry.prefix_table()}"
+            )
         raise AmbiguousSiteError(
             f"tool '{tool_name}': no explicit 'site' and no issue/project key argument to infer one from "
             f"(jql is never parsed for site routing); pass 'site' explicitly. "
