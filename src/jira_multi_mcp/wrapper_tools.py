@@ -18,10 +18,24 @@ from jira_multi_mcp.children import ChildManager
 
 def build_jira_sites_tool(manager: ChildManager) -> Tool:
     """Per-site health, never credentials: name, host, prefixes, read_only,
-    state, error, log path, upstream version, and whether that site was the
-    tool-discovery source."""
+    state, error, last_error/last_error_at, log path, the FastMCP library
+    version each child reports, and whether that site was the tool-discovery
+    source. Also carries the ONE shared ``upstream_version`` (mcp-atlassian's
+    own version, probed once at startup -- every site launches the same
+    command) and, when no configured site is currently healthy, a top-level
+    ``note`` explaining that no child could be reached."""
 
-    async def jira_sites() -> list[dict[str, Any]]:
-        return manager.health()
+    async def jira_sites() -> dict[str, Any]:
+        sites = manager.health()
+        payload: dict[str, Any] = {
+            "sites": sites,
+            "upstream_version": manager.upstream_version(),
+        }
+        if not any(site["state"] == "healthy" for site in sites):
+            payload["note"] = (
+                "no configured site is currently healthy; tool discovery could not run "
+                "against any child. See each site's 'error'/'log_path' above."
+            )
+        return payload
 
     return Tool.from_function(jira_sites, name="jira_sites")

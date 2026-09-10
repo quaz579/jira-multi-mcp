@@ -109,7 +109,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.check:
         return asyncio.run(_cmd_check(config, allow_partial=args.allow_partial))
 
-    return asyncio.run(serve(config, verbose=args.verbose))
+    try:
+        return asyncio.run(serve(config, verbose=args.verbose))
+    except JiraMultiError as exc:
+        # e.g. SchemaConflictError raised while building the mirrored tool
+        # set: a deliberate error, not a bug, so it gets the same clean
+        # "error: ..." + exit 2 shape as a config-load failure, not a raw
+        # traceback.
+        logging.getLogger(LOGGER_NAME).error("error: %s", exc)
+        return 2
 
 
 def _literal_token_source(site: SiteConfig, env_var_suffix: str) -> str:

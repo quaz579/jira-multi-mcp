@@ -3,11 +3,15 @@ selection, and health reporting -- all against in-process fake children."""
 
 from __future__ import annotations
 
+import os
+import sys
+import time
 from contextlib import AsyncExitStack
 from pathlib import Path
 
+import anyio
 import pytest
-from fastmcp.client.transports import ClientTransport, FastMCPTransport
+from fastmcp.client.transports import ClientTransport, FastMCPTransport, StdioTransport
 from fastmcp.exceptions import ToolError
 
 from jira_multi_mcp.children import BASE_ENV_PASSTHROUGH, ChildManager, build_child_env, minimal_env
@@ -33,7 +37,7 @@ def _cloud_site(name: str, *prefixes: str, **overrides: object) -> SiteConfig:
 # --- build_child_env ---
 
 
-def test_toolsets_is_always_all(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_toolsets_is_always_all() -> None:
     site = _cloud_site("acme", "ACME")
     env = build_child_env(site, UpstreamConfig(), Defaults())
     assert env["TOOLSETS"] == "all"
@@ -180,9 +184,141 @@ async def test_all_sites_failed_means_no_tools_discovered(tmp_path: Path) -> Non
         assert all(h["state"] == "failed" for h in manager.health())
 
 
-async def test_aclose_does_not_raise(tmp_path: Path) -> None:
+async def test_aclose_kills_a_real_child_process(tmp_path: Path) -> None:
+    """Regression test for the M2r1 HIGH finding: with keep_alive=True,
+    StdioTransport.connect_session's `finally` skips disconnect(), so merely
+    unwinding an AsyncExitStack around the Client never asks the transport to
+    kill the subprocess. ChildManager.aclose() must close every child's
+    Client explicitly instead of relying on that unwind alone -- proved here
+    against a REAL OS subprocess, not an in-process fake."""
+    pid_file = tmp_path / "pid.txt"
+    script = (
+        "import os\n"
+        f"with open({str(pid_file)!r}, 'w') as f:\n"
+        "    f.write(str(os.getpid()))\n"
+        "from fastmcp import FastMCP\n"
+        "mcp = FastMCP('probe')\n"
+        "mcp.run(transport='stdio', show_banner=False)\n"
+    )
     registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = _make_manager(
+        registry,
+        tmp_path,
+        lambda site, up: StdioTransport(command=sys.executable, args=["-c", script], keep_alive=True),
+    )
+
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=15)
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "healthy"
+
+        pid = int(pid_file.read_text().strip())
+        os.kill(pid, 0)  # still alive; raises ProcessLookupError otherwise
+
+        await manager.aclose()
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            await anyio.sleep(0.05)
+        else:
+            pytest.fail(f"child pid {pid} was still alive 5s after ChildManager.aclose()")
+
+
+async def test_probe_failure_after_connect_keeps_the_client_for_later_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the same HIGH finding: a child whose liveness probe
+    fails AFTER its session was entered must still be closeable later --
+    losing the reference here is exactly what let such a child leak for the
+    rest of the process's life."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
+
+    async def _boom(client: object) -> None:
+        raise RuntimeError("probe failed")
+
+    monkeypatch.setattr(manager, "_probe_liveness", _boom)
+
+    closed: list[str] = []
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        handle = manager._handles["acme"]  # noqa: SLF001 - whitebox on our own fake
+        assert handle.state == "failed"
+        assert handle.client is not None
+
+        original_close = handle.client.close
+
+        async def _spy_close() -> None:
+            closed.append("acme")
+            await original_close()  # type: ignore[no-untyped-call]
+
+        monkeypatch.setattr(handle.client, "close", _spy_close)
+        await manager.aclose()
+
+    assert closed == ["acme"]
+
+
+async def test_connect_failure_error_is_redacted(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME", api_token=Secret("zz-unique-secret-zz"))])
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        raise RuntimeError("auth failed with token zz-unique-secret-zz")
+
+    manager = _make_manager(registry, tmp_path, factory)
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        health = {h["name"]: h for h in manager.health()}
+        assert "zz-unique-secret-zz" not in str(health["acme"]["error"])
+        assert "***" in str(health["acme"]["error"])
+
+
+async def test_connect_timeout_error_is_a_clear_message_not_bare_exception_repr(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        raise TimeoutError
+
+    manager = _make_manager(registry, tmp_path, factory)
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["error"] == "connect timed out after 5s"
+
+
+async def test_mark_failed_redacts_the_reason_and_records_a_timestamp(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME", api_token=Secret("zz-unique-secret-zz"))])
     manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
     async with AsyncExitStack() as stack:
         await manager.start_all(stack, connect_timeout=5)
-        await manager.aclose()
+        manager.mark_failed("acme", "connection closed near token zz-unique-secret-zz")
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "failed"
+        assert "zz-unique-secret-zz" not in str(health["acme"]["last_error"])
+        assert "***" in str(health["acme"]["last_error"])
+        assert health["acme"]["last_error_at"] is not None
+
+
+async def test_probe_upstream_version_captures_stdout(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    upstream = UpstreamConfig(command=(sys.executable, "-c", "import sys; print(sys.argv[-1])"))
+    manager = ChildManager(registry, upstream, Defaults(), tmp_path)
+
+    version = await manager.probe_upstream_version()
+
+    assert version == "--version"
+    assert manager.upstream_version() == "--version"
+
+
+async def test_probe_upstream_version_handles_a_missing_command(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    upstream = UpstreamConfig(command=(str(tmp_path / "does-not-exist"),))
+    manager = ChildManager(registry, upstream, Defaults(), tmp_path)
+
+    version = await manager.probe_upstream_version()
+
+    assert version is None
+    assert manager.upstream_version() is None

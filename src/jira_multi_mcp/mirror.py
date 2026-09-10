@@ -12,6 +12,7 @@ import anyio
 import mcp_types
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.base import Tool, ToolResult
+from mcp import MCPError
 from pydantic import PrivateAttr
 
 from jira_multi_mcp.children import ChildManager
@@ -22,6 +23,21 @@ from jira_multi_mcp.tools_meta import WRAPPER_OWNED_TOOLS
 _logger = logging.getLogger(__name__)
 
 SITE_PARAM = "site"
+
+_CONNECTION_ERROR_TYPES = (anyio.ClosedResourceError, anyio.BrokenResourceError)
+
+
+def _is_connection_failure(exc: BaseException) -> bool:
+    """Whether ``exc`` looks like the child's pipe/session breaking mid-call
+    (as opposed to a plain application error), the trigger for marking a site
+    ``failed`` in ``jira_sites`` -- restart is out of scope (M4), but a dead
+    site should stop being reported ``healthy``."""
+    if isinstance(exc, _CONNECTION_ERROR_TYPES):
+        return True
+    if isinstance(exc, MCPError):
+        text = str(exc).lower()
+        return "closed" in text or "connection" in text
+    return False
 
 
 def augment_input_schema(schema: Mapping[str, Any], registry: SiteRegistry) -> dict[str, Any]:
@@ -118,16 +134,17 @@ class MultiSiteProxyTool(Tool):
             raise ToolError(
                 f"[site={site.name}] {self.name} timed out after {self.timeout}s. Child log: {log_path}"
             ) from exc
-        except ToolError:
-            raise
         except Exception as exc:
             # The child died or the connection otherwise broke mid-call (not a
             # timeout, not a tool-level error the child reported normally) --
             # give it the same [site=] shape and a pointer to its log instead
             # of letting a raw MCPError/connection exception escape unshaped.
+            reason = f"{exc.__class__.__name__}: {exc}"
+            if _is_connection_failure(exc):
+                self._manager.mark_failed(site.name, reason)
+            redacted = self._manager.redact(reason)
             raise ToolError(
-                f"[site={site.name}] {self.name} failed: {exc.__class__.__name__}: {exc}. "
-                f"Child log: {log_path}"
+                f"[site={site.name}] {self.name} failed: {redacted}. Child log: {log_path}"
             ) from exc
 
         if result.is_error:
@@ -135,7 +152,7 @@ class MultiSiteProxyTool(Tool):
                 block.text for block in result.content if isinstance(block, mcp_types.TextContent)
             )
             hint = ""
-            if site.read_only and not (self.annotations and self.annotations.read_only_hint):
+            if site.read_only and self.annotations is not None and self.annotations.read_only_hint is False:
                 hint = f" (site '{site.name}' is configured read_only = true)"
             raise ToolError(f"[site={site.name}] {text}{hint}")
 

@@ -8,6 +8,7 @@ from collections.abc import AsyncGenerator
 from contextlib import AsyncExitStack
 from pathlib import Path
 
+import anyio
 import mcp_types
 import pytest
 from fastmcp import Client, FastMCP
@@ -87,7 +88,9 @@ async def test_download_attachments_is_shadowed_from_the_parent(rig: _Rig) -> No
     tools = await client.list_tools()
     names = {t.name for t in tools}
     assert "jira_download_attachments" not in names
-    assert WRAPPER_OWNED_TOOLS.isdisjoint(names)
+    assert "jira_sites" in names  # the wrapper's own tool, not mirrored from a child
+    # No *mirrored* (child-shadowing) wrapper-owned tool should ever leak through.
+    assert (WRAPPER_OWNED_TOOLS - {"jira_sites"}).isdisjoint(names)
 
 
 async def test_site_is_stripped_before_forwarding_to_the_child(rig: _Rig) -> None:
@@ -189,7 +192,9 @@ async def test_jira_sites_shape_and_no_credentials(rig: _Rig) -> None:
     client, _, _ = rig
     result = await client.call_tool_mcp("jira_sites", {})
     assert result.is_error is False
-    sites = result.structured_content["result"]
+    payload = result.structured_content
+    assert "note" not in payload  # both configured sites are healthy
+    sites = payload["sites"]
     assert {s["name"] for s in sites} == {"acme", "beta"}
     for site in sites:
         assert site["state"] == "healthy"
@@ -202,6 +207,27 @@ async def test_jira_sites_shape_and_no_credentials(rig: _Rig) -> None:
     assert beta["discovery_source"] is False
     assert acme["host"] == "acme.atlassian.net"
     assert acme["key_prefixes"] == ["ACME"]
+
+
+async def test_jira_sites_note_when_no_site_is_healthy(tmp_path: Path) -> None:
+    registry = SiteRegistry([_site("acme", "ACME")])
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        raise RuntimeError("simulated connect failure")
+
+    manager = ChildManager(registry, UpstreamConfig(), Defaults(), tmp_path, transport_factory=factory)
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        tools = await manager.discover_tools()
+        parent = FastMCP("test-parent")
+        parent.add_tool(build_jira_sites_tool(manager))
+        async with Client(FastMCPTransport(parent)) as client:
+            result = await client.call_tool_mcp("jira_sites", {})
+            payload = result.structured_content
+            assert payload["sites"][0]["state"] == "failed"
+            assert "note" in payload
+            assert "no configured site is currently healthy" in payload["note"]
+    assert tools == []
 
 
 async def test_discover_tools_prefers_unrestricted_site_over_read_only(
@@ -227,19 +253,31 @@ class _DeadChildClient:
     """Stands in for a connection that broke mid-call (e.g. the child process
     died) -- distinct from a timeout, which anyio.fail_after handles."""
 
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
     async def call_tool_mcp(self, name: str, arguments: dict[str, object]) -> mcp_types.CallToolResult:
-        raise ConnectionError("child pipe broke")
+        raise self._exc
 
 
 class _DeadChildManager:
-    def __init__(self, log_path: Path) -> None:
+    def __init__(self, log_path: Path, exc: Exception | None = None, secret: str = "") -> None:
         self._log_path = log_path
+        self._exc = exc or ConnectionError("child pipe broke")
+        self._secret = secret
+        self.marked_failed: list[str] = []
 
     async def client_for(self, site_name: str) -> _DeadChildClient:
-        return _DeadChildClient()
+        return _DeadChildClient(self._exc)
 
     def log_path(self, site_name: str) -> Path:
         return self._log_path
+
+    def redact(self, text: str) -> str:
+        return text.replace(self._secret, "***") if self._secret else text
+
+    def mark_failed(self, site_name: str, reason: str) -> None:
+        self.marked_failed.append(site_name)
 
 
 async def test_non_timeout_child_failure_is_shaped_like_a_site_error(tmp_path: Path) -> None:
@@ -260,3 +298,55 @@ async def test_non_timeout_child_failure_is_shaped_like_a_site_error(tmp_path: P
     assert "ConnectionError" in message
     assert "child pipe broke" in message
     assert str(log_path) in message
+
+
+async def test_non_timeout_child_failure_redacts_a_leaked_secret(tmp_path: Path) -> None:
+    registry = SiteRegistry([_site("acme", "ACME")])
+    log_path = tmp_path / "acme.log"
+    manager = _DeadChildManager(
+        log_path,
+        exc=ConnectionError("child pipe broke near token super-secret-token"),
+        secret="super-secret-token",
+    )
+    mcp_tool = mcp_types.Tool(
+        name="jira_get_issue",
+        input_schema={"type": "object", "properties": {"issue_key": {"type": "string"}}},
+    )
+    tool = MultiSiteProxyTool.from_mcp_tool(manager, registry, mcp_tool, timeout=5.0)  # type: ignore[arg-type]
+
+    with pytest.raises(ToolError) as exc_info:
+        await tool.run({"issue_key": "ACME-1"})
+
+    message = str(exc_info.value)
+    assert "super-secret-token" not in message
+    assert "***" in message
+
+
+async def test_connection_level_failure_marks_the_site_failed(tmp_path: Path) -> None:
+    registry = SiteRegistry([_site("acme", "ACME")])
+    manager = _DeadChildManager(tmp_path / "acme.log", exc=anyio.ClosedResourceError())
+    mcp_tool = mcp_types.Tool(
+        name="jira_get_issue",
+        input_schema={"type": "object", "properties": {"issue_key": {"type": "string"}}},
+    )
+    tool = MultiSiteProxyTool.from_mcp_tool(manager, registry, mcp_tool, timeout=5.0)  # type: ignore[arg-type]
+
+    with pytest.raises(ToolError):
+        await tool.run({"issue_key": "ACME-1"})
+
+    assert manager.marked_failed == ["acme"]
+
+
+async def test_generic_application_failure_does_not_mark_the_site_failed(tmp_path: Path) -> None:
+    registry = SiteRegistry([_site("acme", "ACME")])
+    manager = _DeadChildManager(tmp_path / "acme.log", exc=RuntimeError("some other bug"))
+    mcp_tool = mcp_types.Tool(
+        name="jira_get_issue",
+        input_schema={"type": "object", "properties": {"issue_key": {"type": "string"}}},
+    )
+    tool = MultiSiteProxyTool.from_mcp_tool(manager, registry, mcp_tool, timeout=5.0)  # type: ignore[arg-type]
+
+    with pytest.raises(ToolError):
+        await tool.run({"issue_key": "ACME-1"})
+
+    assert manager.marked_failed == []

@@ -9,15 +9,17 @@ from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import time
 from collections.abc import Callable, Sequence
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, TextIO
 from urllib.parse import urlsplit
 
 import anyio
+import anyio.to_thread
 import mcp_types
 from fastmcp import Client
 from fastmcp.client.transports import ClientTransport, StdioTransport
@@ -26,6 +28,7 @@ from mcp import MCPError
 
 from jira_multi_mcp.model import Defaults, SiteConfig, UpstreamConfig
 from jira_multi_mcp.registry import SiteRegistry
+from jira_multi_mcp.secrets import Secret, redact_text
 from jira_multi_mcp.tools_meta import CURATED_TOOLS, WRAPPER_OWNED_TOOLS
 
 _logger = logging.getLogger(__name__)
@@ -95,6 +98,29 @@ TransportFactory = Callable[[SiteConfig, UpstreamConfig], ClientTransport]
 _LOG_FILE_MODE = 0o600
 
 
+def _collect_secrets(sites: Sequence[SiteConfig]) -> list[Secret]:
+    secrets: list[Secret] = []
+    for site in sites:
+        if site.api_token is not None:
+            secrets.append(site.api_token)
+        if site.personal_token is not None:
+            secrets.append(site.personal_token)
+    return secrets
+
+
+def _close_leaked_log_file(transport: ClientTransport | None) -> None:
+    """Closes the log file we eagerly opened for a site whose child never
+    actually connected (the transport/connect itself failed before a session
+    was established) -- nothing else will ever write to or close that fd, so
+    holding it open would leak one fd per such site for the rest of the
+    process's life. A site whose session DID connect keeps its log file open
+    (it's the live subprocess's stderr) until ``ChildManager.aclose()``."""
+    log_file = getattr(transport, "log_file", None)
+    if log_file is not None and not isinstance(log_file, Path):
+        with suppress(Exception):
+            log_file.close()
+
+
 def _open_child_log_file(site: SiteConfig, log_dir: Path) -> TextIO:
     """Opens this site's child log 0600, matching ``server.log`` -- a bare
     ``Path`` handed to ``StdioTransport`` gets opened at the process umask
@@ -137,7 +163,9 @@ class ChildHandle:
     error: str | None = None
     log_path: Path = field(default_factory=Path)
     connected_at: float | None = None
-    server_version: str | None = None
+    fastmcp_server_version: str | None = None
+    last_error: str | None = None
+    last_error_at: float | None = None
 
 
 class ChildManager:
@@ -173,6 +201,14 @@ class ChildManager:
         # (unset while starting, and left `None` after a union-across-children
         # discovery, since no single site is "the" source in that case).
         self._discovery_source: str | None = None
+        self._secrets: list[Secret] = _collect_secrets(registry.sites)
+        self._upstream_version: str | None = None
+
+    def redact(self, text: str) -> str:
+        """Masks every configured site's credential out of model- or
+        log-visible text built outside the logging redaction path (e.g. a
+        ``ToolError`` message forwarded straight to the calling model)."""
+        return redact_text(text, self._secrets)
 
     async def start_all(self, stack: AsyncExitStack, connect_timeout: float) -> None:
         """Connects every configured child concurrently.
@@ -206,40 +242,97 @@ class ChildManager:
 
     async def _start_one(self, site: SiteConfig, stack: AsyncExitStack, connect_timeout: float) -> None:
         handle = self._handles[site.name]
+        transport: ClientTransport | None = None
+        entered = False
         try:
             transport = self._transport_factory(site, self._upstream)
             client: Client[ClientTransport] = Client(transport)
             with anyio.fail_after(connect_timeout):
                 await stack.enter_async_context(client)
+                entered = True
+                # Keep the reference as soon as the session is entered, even
+                # if the liveness probe below fails: the child process is
+                # already running at this point, and only ChildManager.aclose()
+                # (via this handle's client) will ever ask it to stop. Losing
+                # the reference here is exactly the M2r1 HIGH finding: a child
+                # whose probe fails after connecting used to leak for the rest
+                # of the process's life.
+                handle.client = client
                 await self._probe_liveness(client)
-        except Exception as exc:  # noqa: BLE001 - isolate one site's failure from the rest
-            handle.client = None
+        except TimeoutError:
             handle.state = "failed"
-            handle.error = f"{exc.__class__.__name__}: {exc}"
+            handle.error = f"connect timed out after {connect_timeout}s"
             _logger.warning(
                 "site '%s' failed to start: %s (see %s)", site.name, handle.error, handle.log_path
             )
+            if not entered:
+                _close_leaked_log_file(transport)
+            return
+        except Exception as exc:  # noqa: BLE001 - isolate one site's failure from the rest
+            handle.state = "failed"
+            handle.error = self.redact(f"{exc.__class__.__name__}: {exc}")
+            _logger.warning(
+                "site '%s' failed to start: %s (see %s)", site.name, handle.error, handle.log_path
+            )
+            if not entered:
+                _close_leaked_log_file(transport)
             return
 
-        handle.client = client
         handle.state = "healthy"
         handle.connected_at = time.time()
         info = client.server_info
-        handle.server_version = info.version if info is not None else None
-        _logger.info("site '%s' healthy: child serverInfo.version=%s", site.name, handle.server_version)
-        self._warn_on_version_mismatch()
+        handle.fastmcp_server_version = info.version if info is not None else None
+        _logger.info(
+            "site '%s' healthy: child fastmcp serverInfo.version=%s", site.name, handle.fastmcp_server_version
+        )
 
-    def _warn_on_version_mismatch(self) -> None:
-        versions = {
-            h.server_version
-            for h in self._handles.values()
-            if h.state == "healthy" and h.server_version is not None
-        }
-        if len(versions) > 1:
-            _logger.warning(
-                "configured sites are running different mcp-atlassian versions: %s",
-                ", ".join(sorted(versions)),
+    def mark_failed(self, site_name: str, reason: str) -> None:
+        """Records a call-time connection failure discovered by the mirror
+        (e.g. the child's pipe broke mid-session) so ``jira_sites`` reflects
+        it instead of continuing to show a stale ``healthy``. Does not restart
+        or reconnect the child (M4) -- it only stops ``client_for`` handing
+        the dead client out again and records when/why."""
+        handle = self._handles.get(site_name)
+        if handle is None:
+            return
+        handle.state = "failed"
+        redacted = self.redact(reason)
+        handle.error = redacted
+        handle.last_error = redacted
+        handle.last_error_at = time.time()
+        _logger.warning("site '%s' marked failed after a call: %s", site_name, redacted)
+
+    async def probe_upstream_version(self) -> str | None:
+        """Runs the shared ``upstream.command --version`` once at startup.
+
+        Every site launches the same command, so this is one call, not one
+        per site; it also reports mcp-atlassian's OWN version, unlike each
+        child's FastMCP ``serverInfo.version`` (that's the bundled fastmcp
+        library version, not mcp-atlassian's -- see ``ChildHandle.fastmcp_server_version``).
+        Run off the event loop thread since this shells out synchronously;
+        never raises -- a probe failure must not block startup.
+        """
+        command = [*self._upstream.command, "--version"]
+        env = minimal_env(self._upstream.env_passthrough)
+        try:
+            completed = await anyio.to_thread.run_sync(
+                lambda: subprocess.run(command, capture_output=True, text=True, timeout=30, env=env)
             )
+        except Exception as exc:  # noqa: BLE001 - a version probe must never block startup
+            _logger.warning("upstream_version unavailable: %s: %s", exc.__class__.__name__, exc)
+            return None
+        if completed.returncode != 0:
+            _logger.warning(
+                "upstream_version unavailable: exit %d: %s", completed.returncode, completed.stderr.strip()
+            )
+            return None
+        version = completed.stdout.strip()
+        self._upstream_version = version
+        _logger.info("upstream command version: %s", version)
+        return version
+
+    def upstream_version(self) -> str | None:
+        return self._upstream_version
 
     async def client_for(self, site_name: str) -> Client[ClientTransport]:
         handle = self._handles.get(site_name)
@@ -282,8 +375,10 @@ class ChildManager:
                     "read_only": handle.site.read_only,
                     "state": handle.state,
                     "error": handle.error,
+                    "last_error": handle.last_error,
+                    "last_error_at": handle.last_error_at,
                     "log_path": str(handle.log_path),
-                    "server_version": handle.server_version,
+                    "fastmcp_server_version": handle.fastmcp_server_version,
                     "discovery_source": handle.site.name == self._discovery_source,
                 }
             )
@@ -294,8 +389,34 @@ class ChildManager:
         return handle.log_path if handle is not None else None
 
     async def aclose(self) -> None:
-        # Clients are entered into the caller's AsyncExitStack (see start_all)
-        # and are closed when that stack unwinds; nothing owned directly here
-        # needs explicit teardown, but this gives server.py a single named
-        # call site to hang shutdown logging off of.
+        """Explicitly closes every child that ever connected.
+
+        With ``keep_alive=True`` (needed so a healthy child is reused across
+        calls instead of respawned each time), ``StdioTransport.connect_session``'s
+        ``finally`` deliberately skips ``disconnect()`` -- so merely unwinding
+        the caller's ``AsyncExitStack`` (which only runs each ``Client``'s
+        normal, ref-counted ``__aexit__``) never asks the transport to
+        terminate the subprocess; upstream mcp-atlassian only exits on its own
+        a few seconds after noticing its parent is gone. ``Client.close()``
+        forces a real disconnect (killing the child process tree -- see
+        ``mcp.client.stdio.stdio_client``'s teardown) and is idempotent, so
+        this is safe to call even though the exit stack will still run each
+        client's ordinary ``__aexit__`` afterward, and safe to call twice
+        (e.g. once from a shutdown-signal handler, once from here).
+        """
         _logger.info("child manager shutting down")
+        async with anyio.create_task_group() as tg:
+            for handle in self._handles.values():
+                if handle.client is not None:
+                    tg.start_soon(self._close_one, handle)
+
+    async def _close_one(self, handle: ChildHandle) -> None:
+        assert handle.client is not None
+        try:
+            await handle.client.close()  # type: ignore[no-untyped-call]
+        except Exception as exc:  # noqa: BLE001 - one child's teardown failure must not block the rest
+            _logger.warning(
+                "error closing child '%s': %s",
+                handle.site.name,
+                self.redact(f"{exc.__class__.__name__}: {exc}"),
+            )

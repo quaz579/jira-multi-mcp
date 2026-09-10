@@ -102,8 +102,11 @@ CURATED_TOOLS: frozenset[str] = frozenset(
     }
 )
 
-# Tools this wrapper implements itself (in wrapper_tools.py, M3) instead of
+# Tools this wrapper implements itself (in wrapper_tools.py) instead of
 # exposing the upstream child's version. The upstream "jira_download_attachments"
-# returns base64 in-band; ours writes to disk. Mirror logic (M2) must exclude
-# these names from ENABLED_TOOLS on children and never forward calls to them.
-WRAPPER_OWNED_TOOLS: frozenset[str] = frozenset({"jira_download_attachments"})
+# returns base64 in-band; ours writes to disk. "jira_sites" is wrapper-only and
+# no real child has ever advertised a tool by that name, but listing it here
+# too means a future upstream tool collision would be shadowed rather than
+# silently double-registered. Mirror logic must exclude these names from
+# ENABLED_TOOLS on children and never forward calls to them.
+WRAPPER_OWNED_TOOLS: frozenset[str] = frozenset({"jira_download_attachments", "jira_sites"})
