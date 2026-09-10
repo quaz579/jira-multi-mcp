@@ -2,13 +2,27 @@
 
 from __future__ import annotations
 
+import logging
+import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from jira_multi_mcp.errors import AmbiguousSiteError, CrossSiteError, UnknownPrefixError, UnknownSiteError
 from jira_multi_mcp.model import SiteConfig
-from jira_multi_mcp.tools_meta import ISSUE_KEY_ARGS, ISSUE_KEY_RE, PROJECT_KEY_ARGS
+from jira_multi_mcp.tools_meta import (
+    ISSUE_KEY_ARGS,
+    ISSUE_KEY_RE,
+    PROJECT_KEY_ARGS,
+    PROJECT_KEY_RE,
+    PROJECTS_FILTER_ARGS,
+)
+
+_logger = logging.getLogger(__name__)
+
+# A project-key argument may carry an issue key by mistake (e.g. "ACME-1");
+# strip a trailing issue-number suffix rather than fail the whole call.
+_TRAILING_ISSUE_NUMBER_RE = re.compile(r"(-\d+)+$")
 
 
 class SiteRegistry:
@@ -105,6 +119,30 @@ def resolve_site(
         for token in _split(arguments[arg_name]):
             candidate = token.strip().upper()
             if not candidate:
+                continue
+            stripped = _TRAILING_ISSUE_NUMBER_RE.sub("", candidate)
+            if stripped != candidate:
+                _logger.debug(
+                    "tool '%s': %s looked like an issue key, not a project key; "
+                    "stripping the issue number: %r -> %r",
+                    tool_name,
+                    arg_name,
+                    candidate,
+                    stripped,
+                )
+                candidate = stripped
+            record(candidate, candidate, arg_name)
+
+    for arg_name in PROJECTS_FILTER_ARGS:
+        if arg_name not in arguments or arguments[arg_name] is None:
+            continue
+        for token in _split(arguments[arg_name]):
+            candidate = token.strip().upper()
+            if not candidate:
+                continue
+            if not PROJECT_KEY_RE.match(candidate):
+                # e.g. a numeric project id ("10001") — never a routing signal,
+                # and not an error: it just doesn't help resolve a site.
                 continue
             record(candidate, candidate, arg_name)
 

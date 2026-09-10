@@ -27,11 +27,24 @@ PROJECT_KEY_ARGS: tuple[str, ...] = (
     "target_project_key",
 )
 
+# jira_search's own project-scoping argument (comma-separated). It may mix
+# real project keys with numeric project ids; only tokens that look like a
+# project key are used for routing (see PROJECT_KEY_RE) — a numeric id is
+# silently skipped rather than treated as an unknown prefix, since it never
+# carries one.
+PROJECTS_FILTER_ARGS: tuple[str, ...] = ("projects_filter",)
+
 # Arguments that must never be inspected for site-routing purposes, even
 # though they can contain text that looks like an issue key.
 NEVER_PARSED: frozenset[str] = frozenset({"jql"})
 
 ISSUE_KEY_RE = re.compile(r"^([A-Z][A-Z0-9_]+)-\d+(?:-\d+)*$")
+
+# Shape of a bare project key (also used to validate a configured key_prefix).
+PROJECT_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
+
+_ROUTABLE_ARGS = frozenset(ISSUE_KEY_ARGS) | frozenset(PROJECT_KEY_ARGS) | frozenset(PROJECTS_FILTER_ARGS)
+assert not (NEVER_PARSED & _ROUTABLE_ARGS), "NEVER_PARSED must never overlap a routable argument name"
 
 # The curated subset of upstream's Jira tools this server mirrors by default
 # (toolset_preset = "curated"). Excludes agile board/sprint tools (out of

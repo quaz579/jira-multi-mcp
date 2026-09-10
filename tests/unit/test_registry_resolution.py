@@ -141,3 +141,28 @@ def test_zero_keys_is_ambiguous_with_prefix_table(multi_site_registry: SiteRegis
 
 def test_prefix_table_format(multi_site_registry: SiteRegistry) -> None:
     assert multi_site_registry.prefix_table() == "acme: ACME, ACMEOPS | beta: BETA | jm: JM | jmc: JMC"
+
+
+def test_project_key_with_issue_number_suffix_is_stripped(multi_site_registry: SiteRegistry) -> None:
+    result = resolve_site(multi_site_registry, {"project_key": "ACME-1"}, tool_name="x")
+    assert result.site.name == "acme"
+
+
+def test_projects_filter_routes_by_matching_project_key(multi_site_registry: SiteRegistry) -> None:
+    result = resolve_site(multi_site_registry, {"projects_filter": "ACME"}, tool_name="jira_search")
+    assert result.site.name == "acme"
+
+
+def test_projects_filter_is_comma_separated(multi_site_registry: SiteRegistry) -> None:
+    result = resolve_site(multi_site_registry, {"projects_filter": "ACME,ACMEOPS"}, tool_name="jira_search")
+    assert result.site.name == "acme"
+
+
+def test_projects_filter_numeric_project_id_is_skipped_not_unknown(multi_site_registry: SiteRegistry) -> None:
+    with pytest.raises(AmbiguousSiteError):
+        resolve_site(multi_site_registry, {"projects_filter": "10001"}, tool_name="jira_search")
+
+
+def test_projects_filter_mixed_numeric_and_real_key_still_routes(multi_site_registry: SiteRegistry) -> None:
+    result = resolve_site(multi_site_registry, {"projects_filter": "10001,BETA"}, tool_name="jira_search")
+    assert result.site.name == "beta"
