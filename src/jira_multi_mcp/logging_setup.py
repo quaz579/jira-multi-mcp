@@ -17,7 +17,7 @@ known -- e.g. M2 calls ``attach_redaction("fastmcp")`` again right after
 importing fastmcp, so a handler fastmcp adds to its own logger at import time
 is covered too.
 
-Correction: the logger-level filter added here is NOT what protects a record
+Note: the logger-level filter added here is NOT what protects a record
 from a *child* logger (e.g. ``fastmcp.server``) that merely propagates up
 through ``fastmcp``'s non-propagating handler -- a filter attached via
 ``Logger.addFilter`` only runs for records that *originate* at that logger,

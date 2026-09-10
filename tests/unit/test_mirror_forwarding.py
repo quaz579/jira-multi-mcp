@@ -12,9 +12,10 @@ import mcp_types
 import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.client.transports import ClientTransport, FastMCPTransport
+from fastmcp.exceptions import ToolError
 
 from jira_multi_mcp.children import ChildManager
-from jira_multi_mcp.mirror import build_mirrored_tools
+from jira_multi_mcp.mirror import MultiSiteProxyTool, build_mirrored_tools
 from jira_multi_mcp.model import Defaults, SiteConfig, UpstreamConfig
 from jira_multi_mcp.registry import SiteRegistry
 from jira_multi_mcp.secrets import Secret
@@ -220,3 +221,42 @@ async def test_discover_tools_prefers_unrestricted_site_over_read_only(
         health = {h["name"]: h for h in manager.health()}
         assert health["beta"]["discovery_source"] is True
         assert health["acme"]["discovery_source"] is False
+
+
+class _DeadChildClient:
+    """Stands in for a connection that broke mid-call (e.g. the child process
+    died) -- distinct from a timeout, which anyio.fail_after handles."""
+
+    async def call_tool_mcp(self, name: str, arguments: dict[str, object]) -> mcp_types.CallToolResult:
+        raise ConnectionError("child pipe broke")
+
+
+class _DeadChildManager:
+    def __init__(self, log_path: Path) -> None:
+        self._log_path = log_path
+
+    async def client_for(self, site_name: str) -> _DeadChildClient:
+        return _DeadChildClient()
+
+    def log_path(self, site_name: str) -> Path:
+        return self._log_path
+
+
+async def test_non_timeout_child_failure_is_shaped_like_a_site_error(tmp_path: Path) -> None:
+    registry = SiteRegistry([_site("acme", "ACME")])
+    log_path = tmp_path / "acme.log"
+    manager = _DeadChildManager(log_path)
+    mcp_tool = mcp_types.Tool(
+        name="jira_get_issue",
+        input_schema={"type": "object", "properties": {"issue_key": {"type": "string"}}},
+    )
+    tool = MultiSiteProxyTool.from_mcp_tool(manager, registry, mcp_tool, timeout=5.0)  # type: ignore[arg-type]
+
+    with pytest.raises(ToolError) as exc_info:
+        await tool.run({"issue_key": "ACME-1"})
+
+    message = str(exc_info.value)
+    assert "[site=acme]" in message
+    assert "ConnectionError" in message
+    assert "child pipe broke" in message
+    assert str(log_path) in message

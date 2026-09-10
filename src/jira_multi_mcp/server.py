@@ -29,12 +29,12 @@ _SERVER_NAME = "jira-multi-mcp"
 
 async def serve(config: AppConfig, *, verbose: bool = False) -> int:
     configure_logging(config, verbose=verbose)
-    # Load-bearing, not redundant: fastmcp's own import-time logging setup
-    # attaches a non-propagating RichHandler directly to the "fastmcp"
-    # logger, whose children bypass root's handlers entirely. Re-attaching
-    # here (fastmcp is fully imported by this point) guarantees our filter
-    # covers whatever handler that setup installed. See logging_setup's
-    # module docstring for the full mechanism.
+    # Defense in depth: fastmcp's own import-time logging setup attaches a
+    # non-propagating RichHandler directly to the "fastmcp" logger. By this
+    # point fastmcp is fully imported (configure_logging above already covers
+    # this logger via _REDACTED_LOGGER_NAMES), so this re-attach is a no-op
+    # in the current call order -- kept so the guarantee holds even if that
+    # order ever changes. See logging_setup's module docstring.
     attach_redaction("fastmcp")
 
     log_dir = resolve_log_dir()

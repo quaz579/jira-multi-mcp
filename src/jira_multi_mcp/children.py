@@ -14,7 +14,7 @@ from collections.abc import Callable, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Literal, TextIO
 from urllib.parse import urlsplit
 
 import anyio
@@ -26,7 +26,7 @@ from mcp import MCPError
 
 from jira_multi_mcp.model import Defaults, SiteConfig, UpstreamConfig
 from jira_multi_mcp.registry import SiteRegistry
-from jira_multi_mcp.tools_meta import WRAPPER_OWNED_TOOLS
+from jira_multi_mcp.tools_meta import CURATED_TOOLS, WRAPPER_OWNED_TOOLS
 
 _logger = logging.getLogger(__name__)
 
@@ -70,8 +70,6 @@ def build_child_env(
     if site.enabled_tools is not None:
         effective_allowlist: frozenset[str] | None = site.enabled_tools
     elif defaults.toolset_preset == "curated":
-        from jira_multi_mcp.tools_meta import CURATED_TOOLS
-
         effective_allowlist = CURATED_TOOLS
     else:
         effective_allowlist = None  # preset "all", no site override: no restriction
@@ -94,6 +92,24 @@ def build_child_env(
 
 TransportFactory = Callable[[SiteConfig, UpstreamConfig], ClientTransport]
 
+_LOG_FILE_MODE = 0o600
+
+
+def _open_child_log_file(site: SiteConfig, log_dir: Path) -> TextIO:
+    """Opens this site's child log 0600, matching ``server.log`` -- a bare
+    ``Path`` handed to ``StdioTransport`` gets opened at the process umask
+    (0644 here), leaving the child's raw stderr more readable than our own
+    logs. Must return a real OS-backed file (``fileno()``-capable): mcp's
+    ``stdio_client(errlog=...)`` hands it straight to the subprocess as its
+    stderr fd, so a pure-Python write()-only wrapper breaks connecting
+    entirely (confirmed empirically) -- meaning this stream can NOT be
+    redacted the way the logging-based ``server.log`` is; a future upstream
+    version that ever echoed a credential here would leak it verbatim.
+    """
+    path = log_dir / f"{site.name}.log"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, _LOG_FILE_MODE)
+    return os.fdopen(fd, mode="a", encoding="utf-8", errors="replace")
+
 
 def default_transport_factory(
     site: SiteConfig,
@@ -109,7 +125,7 @@ def default_transport_factory(
         env=build_child_env(site, upstream, defaults, verbose=verbose),
         cwd=upstream.workspace_dir,
         keep_alive=True,
-        log_file=log_dir / f"{site.name}.log",
+        log_file=_open_child_log_file(site, log_dir),
     )
 
 

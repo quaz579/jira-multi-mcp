@@ -110,13 +110,24 @@ class MultiSiteProxyTool(Tool):
         client = await self._manager.client_for(site.name)
 
         assert self.timeout is not None, f"mirrored tool '{self.name}' was built without a timeout"
+        log_path = self._manager.log_path(site.name)
         try:
             with anyio.fail_after(self.timeout):
                 result = await client.call_tool_mcp(self.name, args)
         except TimeoutError as exc:
-            log_path = self._manager.log_path(site.name)
             raise ToolError(
                 f"[site={site.name}] {self.name} timed out after {self.timeout}s. Child log: {log_path}"
+            ) from exc
+        except ToolError:
+            raise
+        except Exception as exc:
+            # The child died or the connection otherwise broke mid-call (not a
+            # timeout, not a tool-level error the child reported normally) --
+            # give it the same [site=] shape and a pointer to its log instead
+            # of letting a raw MCPError/connection exception escape unshaped.
+            raise ToolError(
+                f"[site={site.name}] {self.name} failed: {exc.__class__.__name__}: {exc}. "
+                f"Child log: {log_path}"
             ) from exc
 
         if result.is_error:
