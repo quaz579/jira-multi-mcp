@@ -112,3 +112,76 @@ def test_warm_without_refresh_does_not_insert_it(tmp_path: Path, monkeypatch: py
 
     assert exit_code == 0
     assert captured_command == ["uvx", "mcp-atlassian@latest", "--help"]
+
+
+def test_warm_refresh_inserts_after_uv_tool_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+        [upstream]
+        command = ["uv", "tool", "run", "mcp-atlassian"]
+
+        [[sites]]
+        name = "acme"
+        url = "https://acme.atlassian.net"
+        key_prefixes = ["ACME"]
+        personal_token = "token"
+        """
+    )
+    captured_command: list[str] = []
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured_command.extend(command)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    exit_code = main(["--warm", "--refresh", "--config", str(config_path)])
+
+    assert exit_code == 0
+    assert captured_command == ["uv", "tool", "run", "--refresh", "mcp-atlassian", "--help"]
+
+
+def test_warm_refresh_on_non_uvx_command_errors_clearly(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+        [upstream]
+        command = ["python", "-m", "mcp_atlassian"]
+
+        [[sites]]
+        name = "acme"
+        url = "https://acme.atlassian.net"
+        key_prefixes = ["ACME"]
+        personal_token = "token"
+        """
+    )
+
+    exit_code = main(["--warm", "--refresh", "--config", str(config_path)])
+
+    assert exit_code == 1
+    assert "--refresh requires" in capsys.readouterr().err
+
+
+def test_warm_timeout_is_reported_not_raised(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+        [[sites]]
+        name = "acme"
+        url = "https://acme.atlassian.net"
+        key_prefixes = ["ACME"]
+        personal_token = "token"
+        """
+    )
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        raise subprocess.TimeoutExpired(cmd=command, timeout=120)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    exit_code = main(["--warm", "--config", str(config_path)])
+
+    assert exit_code == 1

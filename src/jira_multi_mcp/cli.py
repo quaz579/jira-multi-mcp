@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import subprocess
 import sys
 from collections.abc import Sequence
@@ -15,12 +16,15 @@ import httpx
 from jira_multi_mcp import __version__
 from jira_multi_mcp.config import load_config
 from jira_multi_mcp.errors import JiraMultiError
-from jira_multi_mcp.logging_setup import configure_logging
+from jira_multi_mcp.logging_setup import LOGGER_NAME, collect_secrets, configure_logging
 from jira_multi_mcp.model import AppConfig, SiteConfig
+from jira_multi_mcp.secrets import redact_text
 from jira_multi_mcp.sources import ConfigSource, EnvOverlaySource, TomlFileConfigSource
 
 _CLOUD_MYSELF_PATH = "/rest/api/3/myself"
 _SERVER_MYSELF_PATH = "/rest/api/2/myself"
+_UVX_TOKENS = ("uvx",)
+_UV_TOOL_RUN_TOKENS = ("uv", "tool", "run")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -84,7 +88,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(sources=_sources_for(args.config))
     except JiraMultiError as exc:
-        sys.stderr.write(f"error: {exc}\n")
+        # Routed through the (redacting) logger rather than a bare stderr
+        # write, so this stays covered if a future ConfigError message ever
+        # carries something sensitive-looking.
+        logging.getLogger(LOGGER_NAME).error("error: %s", exc)
         return 2
 
     configure_logging(config, verbose=args.verbose)
@@ -132,13 +139,31 @@ def _render_config(config: AppConfig) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _refresh_insertion_index(command: Sequence[str]) -> int:
+    """Where to insert ``--refresh`` — right after the ``uvx`` or ``uv tool run`` token(s)."""
+    if tuple(command[: len(_UVX_TOKENS)]) == _UVX_TOKENS:
+        return len(_UVX_TOKENS)
+    if tuple(command[: len(_UV_TOOL_RUN_TOKENS)]) == _UV_TOOL_RUN_TOKENS:
+        return len(_UV_TOOL_RUN_TOKENS)
+    raise JiraMultiError(
+        f"--refresh requires upstream.command to start with 'uvx' or 'uv tool run', got {list(command)!r}"
+    )
+
+
 def _cmd_warm(config: AppConfig, *, refresh: bool) -> int:
     command = list(config.upstream.command)
     if refresh:
-        command.insert(1, "--refresh")
+        try:
+            command.insert(_refresh_insertion_index(command), "--refresh")
+        except JiraMultiError as exc:
+            sys.stderr.write(f"error: {exc}\n")
+            return 1
     command.append("--help")
     try:
         completed = subprocess.run(command, capture_output=True, text=True, timeout=120)
+    except subprocess.TimeoutExpired as exc:
+        sys.stderr.write(f"error: upstream command {command!r} timed out after {exc.timeout}s\n")
+        return 1
     except OSError as exc:
         sys.stderr.write(f"error: failed to run upstream command {command!r}: {exc}\n")
         return 1
@@ -158,7 +183,7 @@ class _CheckResult:
     account_id: str = ""
 
 
-async def _check_site(site: SiteConfig, timeout: float) -> _CheckResult:
+async def _check_site(site: SiteConfig, *, call_timeout: float, connect_timeout: float) -> _CheckResult:
     if site.personal_token is not None:
         path = _SERVER_MYSELF_PATH
         headers = {"Authorization": f"Bearer {site.personal_token.get_secret_value()}"}
@@ -170,6 +195,7 @@ async def _check_site(site: SiteConfig, timeout: float) -> _CheckResult:
         auth = httpx.BasicAuth(site.username or "", site.api_token.get_secret_value())
 
     url = f"{site.url}{path}"
+    timeout = httpx.Timeout(call_timeout, connect=connect_timeout)
     try:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.get(url, headers=headers, auth=auth)
@@ -199,9 +225,28 @@ async def _check_site(site: SiteConfig, timeout: float) -> _CheckResult:
 
 
 async def _cmd_check(config: AppConfig, *, allow_partial: bool) -> int:
-    results = await asyncio.gather(
-        *(_check_site(site, config.defaults.call_timeout_seconds) for site in config.sites)
+    raw_results = await asyncio.gather(
+        *(
+            _check_site(
+                site,
+                call_timeout=config.defaults.call_timeout_seconds,
+                connect_timeout=config.defaults.connect_timeout_seconds,
+            )
+            for site in config.sites
+        ),
+        return_exceptions=True,
     )
+    secrets = collect_secrets(config)
+    results: list[_CheckResult] = []
+    for site, raw in zip(config.sites, raw_results, strict=True):
+        if isinstance(raw, BaseException):
+            # A site whose check raised something other than httpx.HTTPError
+            # (already handled inside _check_site) must not take the whole
+            # table down with it.
+            detail = redact_text(f"{raw.__class__.__name__}: {raw}", secrets)
+            results.append(_CheckResult(site=site, ok=False, detail=detail))
+        else:
+            results.append(raw)
     sys.stdout.write(_render_check_table(results))
     all_ok = all(r.ok for r in results)
     any_ok = any(r.ok for r in results)
@@ -211,16 +256,28 @@ async def _cmd_check(config: AppConfig, *, allow_partial: bool) -> int:
 
 
 def _render_check_table(results: Sequence[_CheckResult]) -> str:
-    header = f"{'SITE':<12} {'HOST':<28} {'AUTH':<8} {'STATUS':<32} {'PREFIXES'}"
-    lines = [header, "-" * len(header)]
+    rows = []
     for result in results:
         site = result.site
         host = site.url.removeprefix("https://")
         auth_mode = "bearer" if site.personal_token is not None else "basic"
         prefixes = ", ".join(site.key_prefixes)
-        if result.ok:
-            status = f"OK {result.display_name} ({result.account_id})"
-        else:
-            status = f"FAILED {result.detail}"
-        lines.append(f"{site.name:<12} {host:<28} {auth_mode:<8} {status:<32} {prefixes}")
+        status = f"OK {result.display_name} ({result.account_id})" if result.ok else f"FAILED {result.detail}"
+        rows.append((site.name, host, auth_mode, status, prefixes))
+
+    site_width = max(4, *(len(r[0]) for r in rows))
+    host_width = max(4, *(len(r[1]) for r in rows))
+    auth_width = max(4, *(len(r[2]) for r in rows))
+    status_width = max(6, *(len(r[3]) for r in rows))
+
+    header = (
+        f"{'SITE':<{site_width}} {'HOST':<{host_width}} {'AUTH':<{auth_width}} "
+        f"{'STATUS':<{status_width}} {'PREFIXES'}"
+    )
+    lines = [header, "-" * len(header)]
+    for name, host, auth_mode, status, prefixes in rows:
+        lines.append(
+            f"{name:<{site_width}} {host:<{host_width}} {auth_mode:<{auth_width}} "
+            f"{status:<{status_width}} {prefixes}"
+        )
     return "\n".join(lines) + "\n"
