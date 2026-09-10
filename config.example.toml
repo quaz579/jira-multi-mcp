@@ -1,0 +1,64 @@
+# jira-multi-mcp example configuration.
+#
+# Default location: ${XDG_CONFIG_HOME:-~/.config}/jira-multi-mcp/config.toml
+# Override with the JIRA_MULTI_CONFIG environment variable, or --config PATH.
+# Recommended permissions: chmod 600 (a world/group-readable file still loads,
+# but jira-multi-mcp logs a warning).
+
+[defaults]
+# Used by every site that doesn't set its own username/token.
+username       = "you@example.com"
+# Prefer an environment variable over a literal token in this file:
+api_token_env  = "JIRA_API_TOKEN"
+# A literal token also works ("api_token = \"...\""), but jira-multi-mcp logs
+# an INFO line each time suggesting api_token_env instead. Never set both.
+
+# "curated" (~35 hand-picked tools: issues, search, comments, transitions,
+# users, links, worklog, project basics) or "all" (every jira_-prefixed tool
+# upstream exposes).
+toolset_preset = "curated"
+
+call_timeout_seconds    = 120
+connect_timeout_seconds = 90
+attachment_max_bytes    = 104857600
+
+[upstream]
+# Re-resolved from PyPI on every launch (small latency, always current).
+# Pin a version instead for reproducibility, e.g. ["uvx", "mcp-atlassian==0.23.1"].
+command         = ["uvx", "mcp-atlassian@latest"]
+env_passthrough = ["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]
+workspace_dir   = "."
+
+# One [[sites]] entry per Jira Cloud (or Server/DC) instance. `name` must be
+# lowercase (letters, digits, "_" or "-"); it's how you address a site
+# explicitly, and how the JIRA_MULTI_SITE_<NAME>_* env overlay finds it (a
+# name containing "-" can only be reached that way through the TOML file,
+# since environment variable names can't contain a dash).
+
+[[sites]]
+name         = "jumpmind"
+url          = "https://jumpmind.atlassian.net"
+key_prefixes = ["JMC", "JMCH", "JMI"]
+# Every project-key prefix across every [[sites]] entry must be globally
+# unique — that's how a bare "JMC-1234" gets routed without a `site` argument.
+
+[[sites]]
+name         = "dtlr"
+url          = "https://dtlr.atlassian.net"
+key_prefixes = ["JUMP"]
+# Per-site overrides (all optional): username, api_token, api_token_env,
+# personal_token / personal_token_env (Jira Server/Data Center — mutually
+# exclusive with api_token*), read_only, enabled_tools = ["jira_get_issue", ...]
+# (must be a subset of the effective allowlist for toolset_preset).
+
+[[sites]]
+name         = "valiram"
+url          = "https://valiram.atlassian.net"
+key_prefixes = ["VJAP"]
+
+# Example Server/Data Center site (personal access token, no username needed):
+# [[sites]]
+# name = "onprem"
+# url = "https://jira.example.com"
+# key_prefixes = ["ONPREM"]
+# personal_token_env = "ONPREM_JIRA_PAT"

@@ -1,0 +1,35 @@
+"""Exception hierarchy for jira-multi-mcp."""
+
+from __future__ import annotations
+
+
+class JiraMultiError(Exception):
+    """Base class for every error this package raises deliberately."""
+
+
+class ConfigError(JiraMultiError):
+    """The configuration file or environment overlay is invalid or incomplete."""
+
+
+class SiteResolutionError(JiraMultiError, ValueError):
+    """A tool call's target site could not be determined unambiguously.
+
+    Subclasses ValueError too so a caller that only catches ValueError (the
+    common shape for "bad tool arguments") still catches these.
+    """
+
+
+class UnknownSiteError(SiteResolutionError):
+    """An explicit ``site`` argument does not match any configured site."""
+
+
+class AmbiguousSiteError(SiteResolutionError):
+    """No configured site could be inferred from the call's arguments."""
+
+
+class UnknownPrefixError(SiteResolutionError):
+    """An issue or project key referenced a prefix no site is configured for."""
+
+
+class CrossSiteError(SiteResolutionError):
+    """A single tool call's arguments referenced more than one configured site."""
