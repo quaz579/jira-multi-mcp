@@ -34,7 +34,7 @@ _SERVER_NAME = "jira-multi-mcp"
 # every child has been torn down. This is the hard upper bound on how long a
 # supervisor's `kill <pid>` is ever allowed to wait; a module constant so a
 # test can lower it. See `_cancel_on_shutdown_signal`.
-SHUTDOWN_WATCHDOG_SECONDS = 8.0
+SHUTDOWN_WATCHDOG_SECONDS = 5.0
 
 
 async def serve(config: AppConfig, *, verbose: bool = False) -> int:
