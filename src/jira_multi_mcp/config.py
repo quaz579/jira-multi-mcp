@@ -20,15 +20,20 @@ from jira_multi_mcp.sources import (
     TomlFileConfigSource,
     merge_sources,
 )
-from jira_multi_mcp.tools_meta import CURATED_TOOLS, WRAPPER_OWNED_TOOLS
+from jira_multi_mcp.tools_meta import CURATED_TOOLS, PROJECT_KEY_RE, WRAPPER_OWNED_TOOLS
 
 _logger = logging.getLogger(__name__)
 
 _SITE_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]*$")
-_KEY_PREFIX_RE = re.compile(r"^[A-Z][A-Z0-9_]+$")
+_KEY_PREFIX_RE = PROJECT_KEY_RE
 _TOOLSET_PRESETS = ("curated", "all")
 
-_CURATED_ALLOWLIST = CURATED_TOOLS - WRAPPER_OWNED_TOOLS
+# WRAPPER_OWNED_TOOLS names are still valid for `enabled_tools`: they're part
+# of the curated tool set, just served by the wrapper itself (see
+# tools_meta.WRAPPER_OWNED_TOOLS) rather than forwarded to the child. Written
+# as a union (not just CURATED_TOOLS) so this stays correct if a future
+# wrapper-owned tool is ever added outside the curated set.
+_CURATED_ALLOWLIST = CURATED_TOOLS | WRAPPER_OWNED_TOOLS
 
 
 def resolve_config_path() -> Path:
@@ -44,8 +49,41 @@ def resolve_config_path() -> Path:
 def load_config(sources: Sequence[ConfigSource] | None = None) -> AppConfig:
     if sources is None:
         sources = [TomlFileConfigSource(resolve_config_path()), EnvOverlaySource()]
-    raw = merge_sources(*(source.load() for source in sources))
-    return _build_app_config(raw)
+    loaded = [(source, source.load()) for source in sources]
+
+    # Merge the non-overlay sources (e.g. the TOML file) first, so we know
+    # which site names existed before any env overlay touches them.
+    base = merge_sources(*(raw for source, raw in loaded if not isinstance(source, EnvOverlaySource)))
+    known_site_names = set(base["sites"])
+
+    merged = merge_sources(base, *(raw for source, raw in loaded if isinstance(source, EnvOverlaySource)))
+    _drop_incomplete_env_only_sites(merged, known_site_names)
+    return _build_app_config(merged)
+
+
+def _drop_incomplete_env_only_sites(raw: RawConfig, known_site_names: set[str]) -> None:
+    """Drops a site that ONLY an env overlay introduced but didn't fully define.
+
+    A stray ``JIRA_MULTI_SITE_<NAME>_*`` variable (typo, leftover from another
+    tool) would otherwise create a new, incomplete site and hard-fail config
+    loading. Overlaying a field onto a site the TOML file already defines is
+    unaffected — this only guards a site whose *entire* definition comes from
+    the environment.
+    """
+    for site_name in list(raw["sites"]):
+        if site_name in known_site_names:
+            continue
+        fields = raw["sites"][site_name]
+        if "url" in fields and "key_prefixes" in fields:
+            continue
+        _logger.warning(
+            "ignoring incomplete site '%s' introduced only by a JIRA_MULTI_SITE_%s_* "
+            "environment variable (needs at least _URL and _KEY_PREFIXES); "
+            "set both or remove the variable",
+            site_name,
+            site_name.upper(),
+        )
+        del raw["sites"][site_name]
 
 
 def _build_app_config(raw: RawConfig) -> AppConfig:
@@ -81,6 +119,13 @@ def _parse_defaults(fields: dict[str, Any]) -> Defaults:
 
     api_token, api_token_env = _split_token_fields(fields, "api_token", site_label="defaults")
     personal_token, personal_token_env = _split_token_fields(fields, "personal_token", site_label="defaults")
+    if (api_token is not None or api_token_env is not None) and (
+        personal_token is not None or personal_token_env is not None
+    ):
+        raise ConfigError(
+            "[defaults]: specify either api_token/api_token_env or "
+            "personal_token/personal_token_env, not both"
+        )
 
     return Defaults(
         username=fields.get("username"),
@@ -101,10 +146,31 @@ def _parse_upstream(fields: dict[str, Any]) -> UpstreamConfig:
     workspace_dir = fields.get("workspace_dir")
     defaults = UpstreamConfig()
     return UpstreamConfig(
-        command=tuple(command) if command is not None else defaults.command,
-        env_passthrough=tuple(env_passthrough) if env_passthrough is not None else defaults.env_passthrough,
+        command=_parse_str_list(
+            command, "upstream.command", default=defaults.command, require_non_empty=True
+        ),
+        env_passthrough=_parse_str_list(
+            env_passthrough,
+            "upstream.env_passthrough",
+            default=defaults.env_passthrough,
+            require_non_empty=False,
+        ),
         workspace_dir=workspace_dir if workspace_dir is not None else defaults.workspace_dir,
     )
+
+
+def _parse_str_list(
+    value: Any, label: str, *, default: tuple[str, ...], require_non_empty: bool
+) -> tuple[str, ...]:
+    """Rejects a bare string (e.g. ``command = "uvx"``), which ``tuple()`` would
+    silently explode into one-character elements instead of a single-item list."""
+    if value is None:
+        return default
+    if not isinstance(value, list) or not all(isinstance(item, str) and item for item in value):
+        raise ConfigError(f"{label} must be a list of non-empty strings, got {value!r}")
+    if require_non_empty and not value:
+        raise ConfigError(f"{label} must be a non-empty list of strings")
+    return tuple(value)
 
 
 def _positive_number(fields: dict[str, Any], key: str, default: float, label: str) -> float:
@@ -160,10 +226,10 @@ def _parse_site(name: str, fields: dict[str, Any], defaults: Defaults) -> SiteCo
         personal_token, personal_token_env = defaults.personal_token, defaults.personal_token_env
 
     resolved_api_token, resolved_api_token_env = _resolve_token(
-        api_token, api_token_env, site_name=name, field="api_token"
+        api_token, api_token_env, site_name=name, field="api_token", own=site_has_cloud
     )
     resolved_personal_token, resolved_personal_token_env = _resolve_token(
-        personal_token, personal_token_env, site_name=name, field="personal_token"
+        personal_token, personal_token_env, site_name=name, field="personal_token", own=site_has_personal
     )
 
     if resolved_api_token is not None and resolved_personal_token is not None:
@@ -199,8 +265,14 @@ def _parse_url(site_name: str, raw_url: Any) -> str:
     if not raw_url or not isinstance(raw_url, str):
         raise ConfigError(f"site '{site_name}': 'url' is required")
     parts = urlsplit(raw_url)
+    if parts.username or parts.password:
+        # Never echo raw_url here: it's exactly the thing that carries the leaked credential.
+        raise ConfigError(
+            f"site '{site_name}': 'url' must not embed credentials (user:pass@host); "
+            "use api_token/api_token_env or personal_token/personal_token_env instead"
+        )
     if parts.scheme != "https" or not parts.netloc:
-        raise ConfigError(f"site '{site_name}': 'url' must be an https URL, got {raw_url!r}")
+        raise ConfigError(f"site '{site_name}': 'url' must be an https URL")
     return raw_url.rstrip("/")
 
 
@@ -241,12 +313,15 @@ def _parse_enabled_tools(site_name: str, raw_tools: Any, toolset_preset: str) ->
 
 
 def _resolve_token(
-    literal: Secret | None, env_name: str | None, *, site_name: str, field: str
+    literal: Secret | None, env_name: str | None, *, site_name: str, field: str, own: bool
 ) -> tuple[Secret | None, str | None]:
     if literal is not None:
+        origin = f"site '{site_name}'" if own else f"[defaults] (inherited by site '{site_name}')"
         _logger.info(
-            "site '%s': %s is set directly in the config file; consider using %s_env instead",
-            site_name,
+            "%s: %s is a literal value (from the config file or a JIRA_MULTI_SITE_* variable, "
+            "not %s_env); consider using %s_env instead",
+            origin,
+            field,
             field,
             field,
         )
@@ -256,6 +331,11 @@ def _resolve_token(
         if value is None:
             raise ConfigError(
                 f"site '{site_name}': environment variable '{env_name}' referenced by {field}_env is not set"
+            )
+        if value == "":
+            raise ConfigError(
+                f"site '{site_name}': environment variable '{env_name}' referenced by {field}_env "
+                "is set but empty"
             )
         return Secret(value), env_name
     return None, None
