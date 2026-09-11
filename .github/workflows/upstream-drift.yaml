@@ -1,0 +1,28 @@
+name: Upstream drift
+
+on:
+  schedule:
+    # Every Monday 09:00 UTC.
+    - cron: "0 9 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: upstream-drift
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.13"
+      - run: uv sync --all-groups --frozen
+      - run: uv run python scripts/upstream_tool_inventory.py --create-issue
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

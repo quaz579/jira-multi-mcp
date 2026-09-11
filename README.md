@@ -1,80 +1,370 @@
 # jira-multi-mcp
 
-A single MCP server that talks to several Jira Cloud sites at once. It spawns
-the upstream [`sooperset/mcp-atlassian`](https://github.com/sooperset/mcp-atlassian)
-server unmodified, one child process per configured site, mirrors its tools
-behind a `site` selector so a caller can just say "look at JUMP-2274" and get
-routed by issue-key prefix, and adds attachment download/upload tools that
-write straight to disk instead of returning base64.
+One MCP server that talks to several Jira Cloud sites at once. Ask Claude Code
+to "look at JUMP-2274" or "get JMC-13447" and it reaches the right site
+automatically, with no `site` argument needed. It also downloads and uploads
+attachments straight to disk, instead of the base64-in-chat-context upstream
+gives you.
 
-Status: pre-alpha, under construction. This repo currently ships config
-loading, the site registry, a CLI (`--check`, `--print-config`, `--warm`), the
-running `serve` MCP server (child processes mirrored behind a `site`
-selector), and the attachment tools described below.
+It works by spawning the upstream [`sooperset/mcp-atlassian`](https://github.com/sooperset/mcp-atlassian)
+server unmodified, one child process per configured site, and mirroring its
+tools behind a `site` selector:
 
-## Attachment tools
+```
+Claude Code ──stdio──▶ jira-multi-mcp (parent)
+                          │  one tool set: jira_get_issue(site?, ...) etc.
+                          │  + jira_sites, jira_list_attachments,
+                          │    jira_download_attachments, jira_upload_attachments
+                          │
+                          ├─▶ child "jumpmind": uvx mcp-atlassian   (JMC, JMCH, JMI)
+                          ├─▶ child "dtlr":     uvx mcp-atlassian   (JUMP)
+                          └─▶ child "valiram":  uvx mcp-atlassian   (VJAP)
 
-Attachments are implemented directly against Jira Cloud REST v3 (not
-forwarded to an upstream child), because upstream `mcp-atlassian` only
-returns attachment content as base64 in-band. Jira Cloud sites only in this
-version — a `personal_token` (Server/Data Center) site gets a clear refusal
-instead.
+  site resolution: explicit `site` arg ▶ else the only configured site ▶ else
+  the project-key prefix found in issue_key / issue_keys / epic_key / parent /
+  project_key / ... (never `jql` — free-text JQL is never parsed for routing)
+```
 
-- `jira_list_attachments(issue_key, site?)` — `id`, `filename`, `size`,
-  `mime_type`, `created`, `author` for every attachment on the issue.
-- `jira_download_attachments(issue_key, target_dir, site?, filenames?, attachment_ids?, overwrite?)`
-  — writes attachments to `target_dir` and returns their paths (read the file
-  from disk afterward; prefer this over any base64 tool). Use an absolute
-  `target_dir`: a relative one resolves against the server process's own
-  working directory, not yours (the resolved path is echoed back in the
-  result either way). Omit `filenames`/`attachment_ids` to download
-  everything; a selector that matches nothing on the issue is reported under
-  `failed`, and no directory is created if nothing was selected. An existing
-  file is never silently overwritten: a same-named download falls back to
-  `{name}-{attachment_id}{ext}` (also applied when two selected attachments
-  share a name, regardless of `overwrite`), and if that also exists it's
-  reported under `skipped` rather than written (`overwrite=true` to replace
-  in place instead — done via a temp file + atomic rename, so a mid-download
-  failure never truncates the file it would have replaced). Anything
-  selected but not written lands in `skipped` (name collision) or `failed`
-  (rejected by Jira, over `defaults.attachment_max_bytes`, an unsafe
-  filename, or a connection error). `downloaded[].filename` is the name
-  actually written to disk; `original_filename` carries Jira's own name when
-  a collision changed it.
-- `jira_upload_attachments(issue_key, paths, site?)` — uploads local files
-  (each must already exist as a regular file; use absolute paths) and
-  returns the created attachments' `id`/`filename`/`size`/`mime_type`.
+No fork of upstream, so its bug fixes and new tools flow straight through —
+see [How it stays current with upstream](#how-it-stays-current-with-upstream).
 
-`site` is optional on all three and inferred from `issue_key`'s project
-prefix the same way every mirrored tool resolves it. All three also enforce
-the target site's `read_only` (write tools only), `enabled_tools`, and
-`projects_filter` settings — the same policy a mirrored tool gets for free
-from its upstream child, applied here directly since these tools never go
-through a child. A mirrored (child) tool relies entirely on the child
-process for `read_only` and `projects_filter` (its `READ_ONLY_MODE` and
-`JIRA_PROJECTS_FILTER` env vars); `enabled_tools` alone is enforced on both
-sides — the child's own `ENABLED_TOOLS` env var, and a wrapper-side check —
-so a misbehaving child can't serve a tool outside its configured allowlist.
+Status: pre-alpha, under construction.
+
+## Install
+
+Requires [`uv`](https://docs.astral.sh/uv/) (which provides `uvx`) on your
+`PATH`; `jira-multi-mcp` itself and the upstream `mcp-atlassian` child are
+both run through it, so nothing else needs a manual `pip install`.
+
+Register it with Claude Code:
+
+```bash
+claude mcp add -s user jira -- uvx --from git+https://github.com/quaz579/jira-multi-mcp jira-multi-mcp
+```
+
+Or add it directly to a project's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "jira": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/quaz579/jira-multi-mcp", "jira-multi-mcp"]
+    }
+  }
+}
+```
+
+Or to Claude Desktop's `claude_desktop_config.json` (same shape, under
+`mcpServers`). Claude Desktop does **not** inherit your shell environment, so
+if a site's token is set via `api_token_env`, add an `"env"` block naming that
+variable — or use a literal `api_token` in the config file instead (0600
+permissions, see below).
+
+Before wiring it into an agent, run the config through `--check` once from a
+terminal — it authenticates against every configured site and exits non-zero
+if any fail, which is much easier to read than an agent's first confused tool
+call:
+
+```bash
+uvx --from git+https://github.com/quaz579/jira-multi-mcp jira-multi-mcp --check
+```
 
 ## Configuration
 
 Copy `config.example.toml` to `${XDG_CONFIG_HOME:-~/.config}/jira-multi-mcp/config.toml`
-(`chmod 600` recommended) and fill in your sites. Override the location with
-`JIRA_MULTI_CONFIG=/path/to/config.toml` or `--config PATH`. Each `[[sites]]`
-entry needs a unique `name`, an `https://` `url`, and a globally-unique set of
-`key_prefixes` (the project prefixes, e.g. `JMC`, used to route a bare
-`JMC-1234` to the right site without saying which one). Auth is either Cloud
-(`username` + `api_token`/`api_token_env`) or Server/Data Center
-(`personal_token`/`personal_token_env`) — see `config.example.toml` for the
-full contract, including the `[defaults]` fallbacks and the
-`JIRA_MULTI_SITE_<NAME>_<FIELD>` environment-variable overlay.
+(`chmod 600` recommended — a world/group-readable file still loads, but
+jira-multi-mcp logs a warning) and fill in your sites. Override the location
+with the `JIRA_MULTI_CONFIG` environment variable or `--config PATH`.
 
-Useful commands:
+### `[defaults]` — fallback values for every site that doesn't set its own
+
+| Key | Default | Notes |
+|---|---|---|
+| `username` | none | Required for Cloud auth (`api_token`/`api_token_env`); not needed for Server/DC (`personal_token`). |
+| `api_token` | none | A literal Cloud API token. Mutually exclusive with `api_token_env` and with either `personal_token*`. |
+| `api_token_env` | none | Name of an environment variable holding the Cloud API token. Preferred over `api_token` — a literal value logs an INFO line suggesting the env form each time it's used. |
+| `personal_token` / `personal_token_env` | none | Same idea, for a Jira Server/Data Center Personal Access Token (Bearer auth). Mutually exclusive with the `api_token*` pair. |
+| `toolset_preset` | `"curated"` | `"curated"` mirrors the ~35 hand-picked tools below; `"all"` mirrors every `jira_`-prefixed tool upstream exposes (agile boards/sprints, service desk, forms, dev-info, and more — not individually verified by this repo). |
+| `call_timeout_seconds` | `120` | Per-call timeout to a child before the tool call fails with a `[site=...]` error naming the child's log. |
+| `connect_timeout_seconds` | `90` | How long to wait for each child to finish starting up. |
+| `attachment_max_bytes` | `104857600` (100 MiB) | Per-file cap enforced by `jira_download_attachments`, checked against both the reported `Content-Length` and the actual streamed byte count. |
+| `recovery_cooldown_seconds`\* | `30` | How long a site that failed 3 consecutive calls stays marked `failed` before it's tried again. |
+
+\* Landing alongside the liveness-recovery work; see `config.example.toml` for the current commented-out placeholder if your checkout predates it.
+
+### `[upstream]` — how the child `mcp-atlassian` process is launched
+
+| Key | Default | Notes |
+|---|---|---|
+| `command` | `["uvx", "mcp-atlassian@latest"]` | The `@latest` suffix forces `uvx` to revalidate against PyPI on every launch (a cheap conditional request, not a full re-download unless the version actually changed) — see [How it stays current with upstream](#how-it-stays-current-with-upstream). Pin a version for reproducibility instead, e.g. `["uvx", "mcp-atlassian==0.23.1"]`. |
+| `env_passthrough` | `["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]` | Extra environment variables forwarded to each child. The child's own env is otherwise minimal (`HOME LOGNAME PATH SHELL TERM USER` plus whatever `jira-multi-mcp` sets for that site) — no ambient secret leaks in by default. |
+| `workspace_dir` | `"."` | Working directory for the child process. |
+
+### `[[sites]]` — one entry per Jira instance
+
+Each entry needs a unique `name` (lowercase letters/digits/`_`/`-`), an
+`https://` `url`, and `key_prefixes` — the project-key prefixes (e.g. `JMC`,
+`JUMP`) used to route a bare `JMC-1234` to the right site with no `site`
+argument. **Every prefix across every site must be globally unique** — that's
+a load-time error otherwise.
+
+| Key | Default | Notes |
+|---|---|---|
+| `username`, `api_token`/`api_token_env`, `personal_token`/`personal_token_env` | inherited from `[defaults]` | Same rules as `[defaults]`; a site that sets none of these inherits whichever auth shape `[defaults]` defines. |
+| `read_only` | `false` | Refuses every write tool against this site with a clear `read_only = true` error. |
+| `enabled_tools` | none (no restriction beyond `toolset_preset`) | An explicit allowlist for this site. Under `toolset_preset = "curated"` it must be a subset of the curated tools; under `"all"` it just needs every entry to be `jira_`-prefixed. Enforced on **both** sides — the child's own `ENABLED_TOOLS` env var, and a wrapper-side check — so a misbehaving child can't serve a tool outside the allowlist. |
+| `projects_filter` | none | Restricts which projects **this site's own upstream child** will search/browse at all (its static `JIRA_PROJECTS_FILTER` env var). Entries are normalized to uppercase project keys; a numeric project id is never accepted here (upstream's own JQL interpolation does accept one — this is stricter on purpose). Distinct from a tool call's own `projects_filter` *argument*, which only affects site *routing*, never enforcement. |
+
+See `config.example.toml` for a filled-in, commented example, including a
+Server/Data Center site (`personal_token_env`, no `username` needed).
+
+### Environment variable overlay
+
+A `JIRA_MULTI_SITE_<NAME>_<FIELD>` variable overrides one field of a site
+already defined in the TOML file (`<NAME>` is the site name, uppercased won't
+match — it's matched case-insensitively against the lowercase name), for
+example `JIRA_MULTI_SITE_jumpmind_API_TOKEN_ENV=JIRA_JUMPMIND_TOKEN`. A site
+name containing `-` can only be reached via the TOML file (environment
+variable names can't contain a dash). A variable that would introduce a
+**new** site the TOML file never defined is ignored (with a warning) unless
+it supplies at least `_URL` and `_KEY_PREFIXES` — a stray/typo'd variable
+should never silently create a broken site.
+
+## Useful commands
 
 - `jira-multi-mcp --print-config` — show the effective, merged configuration
-  with every secret masked as `***`.
+  with every secret masked as `***` (and where each token came from: the
+  file, or an env-overlay variable).
 - `jira-multi-mcp --check` — authenticate against every configured site and
   print a table of `displayName`/`accountId` per site; exits non-zero if any
   site fails (`--allow-partial` to tolerate some failures).
-- `jira-multi-mcp --warm [--refresh]` — prime the `uvx` cache for the
-  upstream `mcp-atlassian` command ahead of time.
+- `jira-multi-mcp --warm [--refresh]` — run the upstream command once to
+  prime `uvx`'s cache ahead of time; `--refresh` forces re-resolution instead
+  of reusing a cached version.
+- `jira-multi-mcp` (no flags) — run the actual MCP server over stdio. This is
+  what a client (Claude Code, Claude Desktop, `.mcp.json`) launches.
+
+## How site resolution works
+
+For a tool call with no explicit `site`: first, if only one site is
+configured, that's the answer. Otherwise `jira-multi-mcp` looks for a
+project-key prefix in the call's own arguments — `issue_key`, `issue_keys`,
+`epic_key`, `parent`, `inward_issue_key`, `outward_issue_key`,
+`issue_ids_or_keys` (an issue key, e.g. `JMC-1234`), and `project_key`,
+`target_project_key` (a bare project key). **`jql` is never parsed** for
+routing, even though free-text JQL often contains something that looks like
+an issue key — `jira_search` (and any other JQL-only call) always needs an
+explicit `site`. A `projects_filter` argument (e.g. on `jira_search`) is also
+inspected for a project-key token, but a purely numeric project id there is
+silently skipped (never a routing signal, and not an error).
+
+If no argument yields a recognizable key, or the arguments reference more
+than one configured site, the call is refused with a clear error listing the
+configured prefixes — pass `site` explicitly instead. An unknown prefix (one
+no configured site owns) is also a clear error rather than a silent
+mismatch.
+
+## Tool set
+
+`toolset_preset = "curated"` (the default) mirrors this hand-picked ~35-tool
+subset of upstream's Jira tools, one `MultiSiteProxyTool` per name, each with
+an added optional `site` parameter:
+
+| Area | Tools |
+|---|---|
+| Issues | `jira_get_issue`, `jira_create_issue`, `jira_batch_create_issues`, `jira_batch_get_changelogs`, `jira_update_issue`, `jira_assign_issue`, `jira_delete_issue`, `jira_move_issue` |
+| Search / fields | `jira_search`, `jira_search_fields`, `jira_get_field_options`, `jira_get_create_fields`, `jira_get_project_fields` |
+| Comments | `jira_add_comment`, `jira_edit_comment` |
+| Transitions | `jira_get_transitions`, `jira_transition_issue` |
+| Attachments (inline image content) | `jira_get_issue_images` |
+| Users / watchers | `jira_get_user_profile`, `jira_search_assignable_users`, `jira_get_issue_watchers`, `jira_add_watcher`, `jira_remove_watcher` |
+| Links | `jira_get_link_types`, `jira_create_issue_link`, `jira_create_remote_issue_link`, `jira_remove_issue_link`, `jira_link_to_epic` |
+| Worklog | `jira_get_worklog`, `jira_add_worklog` |
+| Projects | `jira_get_project_issues`, `jira_get_project_issue_types`, `jira_get_project_versions`, `jira_get_project_components`, `jira_get_all_projects`, `jira_search_projects` |
+
+`toolset_preset = "all"` mirrors every `jira_`-prefixed tool upstream
+exposes instead — agile boards/sprints, service desk, forms, and more — none
+of which this repo has individually verified.
+
+### Wrapper-owned tools
+
+These four are implemented directly by `jira-multi-mcp` against Jira Cloud
+REST v3 (`httpx`), never forwarded to a child — Jira Cloud sites only; a
+Server/Data Center site (`personal_token`) gets a clear refusal instead.
+
+**`jira_sites()`** — no arguments. Per-site health: `name`, `host`,
+`key_prefixes`, `read_only`, `state`, `error`/`last_error`/`last_error_at`,
+`timeouts`, `log_path`, the upstream `mcp-atlassian` version each child
+reports, and whether that site was the tool-discovery source. Never
+credentials. Call this once per session to learn which prefixes exist and
+whether every site is actually healthy.
+
+**`jira_list_attachments(issue_key, site?)`** — read-only. Returns `id`,
+`filename`, `size`, `mime_type`, `created`, `author` for every attachment on
+the issue. Does not fetch content.
+
+| Argument | Required | Notes |
+|---|---|---|
+| `issue_key` | yes | |
+| `site` | no | Inferred from `issue_key`'s prefix if omitted. |
+
+**`jira_download_attachments(issue_key, target_dir, site?, filenames?, attachment_ids?, overwrite?)`**
+— writes attachments to disk and returns their paths; read the file from disk
+afterward (with your file-reading tool) rather than expecting inline content.
+This **shadows** upstream's own `jira_download_attachments`, which only
+returns attachment content as base64 in-band — ours is registered instead,
+so the base64 version is never mirrored and a caller can't accidentally pick
+it.
+
+| Argument | Required | Notes |
+|---|---|---|
+| `issue_key` | yes | |
+| `target_dir` | yes | Use an **absolute** path — a relative one resolves against the server process's own working directory, not yours. The resolved absolute path is echoed back in the result either way. |
+| `site` | no | Inferred from `issue_key`'s prefix if omitted. |
+| `filenames` | no | Omit to download every attachment; an empty list is refused (omit the argument instead of passing `[]`). |
+| `attachment_ids` | no | Same rule as `filenames`. |
+| `overwrite` | no, default `false` | An existing same-named file is never silently clobbered: a collision falls back to `{name}-{attachment_id}{ext}` (also applied when two selected attachments share a name, regardless of `overwrite`), and if that also exists it's reported under `skipped` rather than written. `overwrite=true` replaces in place instead, via a temp file + atomic rename so a mid-download failure never truncates the file it would have replaced. |
+
+A selector that matches nothing on the issue is reported under `failed`.
+Anything selected but not written lands in `skipped` (name collision) or
+`failed` (rejected by Jira, over `attachment_max_bytes`, an unsafe filename,
+or a connection error). No directory is created if nothing was selected.
+`downloaded[].filename` is the name actually written to disk;
+`original_filename` carries Jira's own name when a collision changed it.
+
+**`jira_upload_attachments(issue_key, paths, site?)`** — uploads local files
+as new attachments and returns each created attachment's
+`id`/`filename`/`size`/`mime_type`.
+
+| Argument | Required | Notes |
+|---|---|---|
+| `issue_key` | yes | |
+| `paths` | yes | Each must already exist as a regular file; use absolute paths — a relative one resolves against the server process's own working directory, not yours. |
+| `site` | no | Inferred from `issue_key`'s prefix if omitted. |
+
+A write operation: refused with a clear `read_only = true` error on a site
+configured that way.
+
+`site` is optional on all four (except `jira_sites`, which takes no
+arguments) and inferred from `issue_key`'s project prefix the same way every
+mirrored tool resolves it.
+
+## Per-site policy enforcement
+
+Three settings, enforced differently depending on whether a tool is mirrored
+(goes through a child) or wrapper-owned (talks to Jira directly):
+
+| Setting | Mirrored (child) tool | Wrapper-owned tool |
+|---|---|---|
+| `read_only` | Entirely the child's job — baked in as its own `READ_ONLY_MODE` env var at launch. A write call against a read-only site gets the child's own refusal, plus a `(site 'x' is configured read_only = true)` hint appended when the tool's own annotations don't already mark it read-only. | Checked directly by the wrapper before the call runs. |
+| `enabled_tools` | Enforced **twice**: the child's own `ENABLED_TOOLS` env var, *and* a wrapper-side check on every mirrored call — so a misbehaving child serving a tool outside its configured allowlist is still refused. | Checked directly by the wrapper. |
+| `projects_filter` | Entirely the child's job — its own static `JIRA_PROJECTS_FILTER` env var restricts which projects it will search/browse at all. | Checked directly by the wrapper against the target issue's project (a numeric issue id is refused outright rather than resolved, since that would need an extra Jira call just to find out which project it belongs to). |
+
+## Logs
+
+Server logs go to stderr and to a rotating file under
+`${XDG_STATE_HOME:-~/.local/state}/jira-multi-mcp/logs/server.log` (5 MB × 5
+backups, `chmod 600`), plus one `<site-name>.log` per child in the same
+directory. Every log line — from `jira_multi_mcp` itself, `httpx`,
+`httpcore`, `mcp`, and `fastmcp` — passes through a redacting filter that
+strips every configured token and any URL query string before it's written,
+so a pre-signed attachment-download URL (which carries its own one-shot
+`token=` parameter) is never logged even at `--verbose`. `httpx`/`httpcore`
+are additionally capped at `WARNING` regardless of `--verbose`, since that's
+otherwise where the outbound request line (including the full URL) gets
+logged.
+
+`--verbose` raises `jira_multi_mcp`'s own log level to `DEBUG` (site
+resolution reasoning, per-call detail); it does **not** lower the
+`httpx`/`httpcore` cap above, and it never causes a token or a download URL's
+query string to be logged — the redaction is unconditional.
+
+## Shutdown behavior
+
+Closing stdin (what Claude Code and Claude Desktop do when a session ends)
+is the expected, silent shutdown path — the server notices within roughly
+0.3 seconds and exits cleanly, tearing down every child first. A `SIGTERM`
+(or `SIGINT`) is handled the same way, but rides a 5-second watchdog: if
+tearing down every child hasn't finished by then, the process force-exits
+anyway (reporting failure) rather than hanging indefinitely — the MCP stdio
+transport's own background stdin-reading thread can't always be cancelled
+promptly. Registered via `uvx` (the normal Claude Code registration form),
+`uv` forwards the signal to the actual server process, so this is what a
+supervisor's `kill <pid>` actually experiences.
+
+## Pinning upstream / staying on `@latest`
+
+The default `[upstream] command = ["uvx", "mcp-atlassian@latest"]` makes
+`uvx` send a real (if cheap — a conditional HTTP request, not a full
+re-download unless the version changed) check against PyPI on every launch,
+so a newly published upstream release is picked up automatically. A bare
+`uvx mcp-atlassian` (no `@latest`) is **not** equivalent — once `uv`'s local
+HTTP cache for that package is warm, it's reused with no network call at
+all, so a new release silently isn't picked up until that cache entry goes
+stale. Pin a specific version instead for reproducibility:
+`["uvx", "mcp-atlassian==0.23.1"]`. Either way, `jira-multi-mcp --warm
+[--refresh]` primes (or forces revalidation of) `uvx`'s cache ahead of a
+cold start. See `docs/upstream-notes.md` for the full investigation.
+
+## Troubleshooting
+
+- **A site shows `failed` in `jira_sites`, or a tool call errors with `[site=x]
+  site is unavailable: ... Run 'jira-multi-mcp --check'.`** — run `--check`
+  from a terminal; it authenticates directly and shows the real HTTP status
+  and error body, which is much more specific than a tool-call failure. A
+  site that failed 3 consecutive calls (not startup) stays `failed` for
+  `recovery_cooldown_seconds` before it's tried again.
+- **`Unknown tool` with no other detail** — the tool name either isn't in
+  the curated allowlist (check `toolset_preset`/`enabled_tools`), or no
+  currently-healthy child advertised it at discovery time (a dead site at
+  startup means its tools were never mirrored at all).
+- **A 401 from a site** — the token is wrong, expired, or revoked; regenerate
+  it at `id.atlassian.com/manage-profile/security/api-tokens` and confirm
+  with `--check`.
+- **A 404 where you expected the issue to exist** — Jira Cloud returns 404
+  (not 403) for both "doesn't exist" and "exists but this account has no
+  permission to see it" — cross-check by opening the issue in a browser as
+  the same account before assuming it's a typo.
+- **`site 'x' is configured read_only = true`** — expected on a site
+  deliberately configured that way; not an error to "fix" unless the site
+  should actually accept writes.
+
+## Server / Data Center status
+
+Server/Data Center sites (`personal_token`/`personal_token_env`) are
+accepted by configuration and `--check`, and mirrored tools work against
+them the same as Cloud. The three attachment tools are **Cloud-only** in
+this version — a Server/DC site gets a clear refusal from each of them
+rather than a confusing REST error.
+
+## Security notes
+
+- Prefer `api_token_env`/`personal_token_env` over a literal token in the
+  config file; a literal value still works but logs an INFO reminder each
+  time it's used.
+- `chmod 600` the config file; a world/group-readable file loads anyway but
+  logs a warning.
+- `--print-config` masks every secret as `***` (and shows only where it came
+  from — file or env-overlay variable — never the value).
+- `jira_sites` and every error message are built to never include a
+  credential.
+- An attachment download follows Jira's redirect to a pre-signed media CDN
+  URL; that URL (and its one-shot `token=` query parameter) is never logged,
+  at any verbosity.
+
+## How it stays current with upstream
+
+No fork: `jira-multi-mcp` spawns upstream `mcp-atlassian` as a subprocess and
+only augments its tool schemas with an optional `site` parameter, so any
+upstream bug fix or new tool is picked up automatically once it's
+released — no changes needed here, other than curating a genuinely new tool
+into `CURATED_TOOLS` if you want it mirrored under `toolset_preset =
+"curated"` (it's already reachable under `"all"` without any code change).
+
+A weekly GitHub Actions job (`.github/workflows/upstream-drift.yaml`) parses
+upstream's `main` branch tool list and diffs it against what this repo knows
+about (`tools_meta.CURATED_TOOLS`, `tools_meta.WRAPPER_OWNED_TOOLS`, and the
+toolset tags verified at the time each was curated). If a currently-curated
+tool disappears upstream, or a brand-new toolset shows up, it opens (or
+updates) a single tracking issue — see `scripts/upstream_tool_inventory.py`.
