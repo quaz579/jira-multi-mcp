@@ -38,10 +38,8 @@ PROJECTS_FILTER_ARGS: tuple[str, ...] = ("projects_filter",)
 # though they can contain text that looks like an issue key.
 NEVER_PARSED: frozenset[str] = frozenset({"jql"})
 
-# Comfortably above any real Jira key (longest observed project keys are a
-# handful of characters) but small enough to make a pathological input (e.g.
-# thousands of digits) a cheap, obvious rejection rather than a large string
-# threaded through logging/error messages.
+# Default display length for shorten_for_error: bounds an echoed caller value
+# in error text without needing every call site to pick its own limit.
 _DEFAULT_ERROR_SHOW_LEN = 80
 
 

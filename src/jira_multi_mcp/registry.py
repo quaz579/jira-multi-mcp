@@ -81,7 +81,7 @@ def resolve_site(
         site = registry.get_by_name(explicit)
         if site is None:
             names = ", ".join(s.name for s in registry.sites)
-            raise UnknownSiteError(f"unknown site '{explicit}'; configured sites: {names}")
+            raise UnknownSiteError(f"unknown site {shorten_for_error(explicit)}; configured sites: {names}")
         return SiteResolution(site=site, reason="explicit")
 
     if len(registry.sites) == 1:
@@ -105,9 +105,9 @@ def resolve_site(
                 f"configured prefixes: {registry.prefix_table()}"
             )
         matched_sites[site.name] = site
-        matched_detail.setdefault(site.name, []).append(f"{token} in {arg_name}")
+        matched_detail.setdefault(site.name, []).append(f"{shorten_for_error(token)} in {arg_name}")
         if first_reason is None:
-            first_reason = f"inferred from {token} in {arg_name}"
+            first_reason = f"inferred from {shorten_for_error(token)} in {arg_name}"
 
     for arg_name in ISSUE_KEY_ARGS:
         if arg_name not in arguments or arguments[arg_name] is None:

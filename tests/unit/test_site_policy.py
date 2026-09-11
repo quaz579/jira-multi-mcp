@@ -32,6 +32,15 @@ def test_projects_filter_mismatch_bounds_a_pathological_key() -> None:
     assert "...(" in message
 
 
+def test_projects_filter_mismatch_bounds_a_pathological_project() -> None:
+    huge_key = "B" * 5000 + "-1"  # a well-shaped key, but its project isn't in the site's projects_filter
+    with pytest.raises(ToolError) as exc_info:
+        enforce_site_policy(_filtered_site(), "jira_get_issue", is_write=False, issue_key=huge_key)
+    message = str(exc_info.value)
+    assert len(message) < 400
+    assert "...(" in message
+
+
 def test_projects_filter_malformed_key_bounds_a_pathological_key() -> None:
     huge_key = "9" * 5000  # never matches ISSUE_KEY_RE -- the "malformed" branch
     with pytest.raises(ToolError) as exc_info:
@@ -41,10 +50,12 @@ def test_projects_filter_malformed_key_bounds_a_pathological_key() -> None:
     assert "...(" in message
 
 
-def test_projects_filter_mismatch_escapes_embedded_newline() -> None:
-    # ISSUE_KEY_RE is matched with `.match()`, not `.fullmatch()`, so a key
-    # with trailing garbage after a valid prefix still reaches the
-    # projects_filter-mismatch branch with the newline intact.
+def test_projects_filter_malformed_key_escapes_embedded_newline() -> None:
+    # `candidate` is only `.strip()`-ed (trims the ends, not the middle), and
+    # ISSUE_KEY_RE's trailing `$` can't match before a newline that isn't the
+    # string's last character, so this lands in the "malformed" branch (like
+    # test_projects_filter_malformed_key_bounds_a_pathological_key above),
+    # echoing the raw issue_key with its embedded newline escaped by repr().
     key_with_newline = "OTHER-1\nX-Forwarded-For: evil"
     with pytest.raises(ToolError) as exc_info:
         enforce_site_policy(_filtered_site(), "jira_get_issue", is_write=False, issue_key=key_with_newline)

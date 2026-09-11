@@ -62,7 +62,7 @@ def _validate_comment_id(comment_id: str, site_name: str) -> str:
     if not COMMENT_ID_RE.fullmatch(comment_id):
         raise ToolError(
             f"[site={site_name}] jira_delete_comment: 'comment_id' must be a Jira comment id "
-            f"(digits only), got {comment_id!r}"
+            f"(digits only), got {shorten_for_error(comment_id)}"
         )
     return comment_id
 

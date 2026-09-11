@@ -196,14 +196,19 @@ async def test_delete_comment_refused_by_projects_filter_mismatch() -> None:
         assert not route.called
 
 
-@pytest.mark.parametrize("bad_comment_id", ["12/34", "abc", "", "12?x=1", "12 34", "-1", "1.5", "113395\n"])
+@pytest.mark.parametrize(
+    "bad_comment_id", ["12/34", "abc", "", "12?x=1", "12 34", "-1", "1.5", "113395\n", "9" * 5001 + "x"]
+)
 async def test_delete_comment_rejects_invalid_comment_id_before_any_http_call(
     client: Client[FastMCPTransport], bad_comment_id: str
 ) -> None:
     """``"113395\\n"`` is the trailing-newline case: ``re.match`` (unlike
     ``re.fullmatch``) lets ``$`` match just before a trailing newline, so a
     comment id ending in ``\\n`` used to slip past validation and reach
-    httpx, which then raised an unshaped ``httpx.InvalidURL``."""
+    httpx, which then raised an unshaped ``httpx.InvalidURL``. The trailing-``x``
+    5001-char case (still invalid -- COMMENT_ID_RE is digits-only) pins that
+    the echoed value is bounded by ``shorten_for_error`` rather than reaching
+    the error message untruncated."""
     with respx.mock:
         route = respx.delete(url__regex=r"https://acme\.atlassian\.net/rest/api/3/issue/ACME-1/comment/.*")
 
@@ -215,6 +220,7 @@ async def test_delete_comment_rejects_invalid_comment_id_before_any_http_call(
         text = result.content[0].text  # type: ignore[union-attr]
         assert "comment_id" in text
         assert not route.called
+        assert len(text) < 400
 
 
 @pytest.mark.parametrize(
