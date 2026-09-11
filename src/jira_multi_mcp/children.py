@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import subprocess
 import time
 from collections.abc import AsyncIterator, Callable, Sequence
@@ -152,6 +153,49 @@ def _open_child_log_file(site: SiteConfig, log_dir: Path) -> TextIO:
     path = log_dir / f"{site.name}.log"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, _LOG_FILE_MODE)
     return os.fdopen(fd, mode="a", encoding="utf-8", errors="replace")
+
+
+def _direct_child_pids(parent_pid: int) -> list[int]:
+    """PIDs of every live (non-zombie) direct OS child of ``parent_pid`` right
+    now. Used only by ``ChildManager.aclose()``'s final SIGKILL sweep: every
+    upstream child this manager ever spawns is a direct child of this process
+    (the one blocking, synchronous ``subprocess.run`` in
+    ``probe_upstream_version`` has long since exited and been reaped by the
+    time shutdown runs), so no further filtering is needed.
+
+    Linux (CI is ubuntu-only, per ``.github/workflows/ci.yaml``) reads
+    ``/proc`` directly; the ``ps`` fallback is for running this locally on
+    macOS. A zombie is excluded: it's already dead, just unreaped, and
+    signaling it is at best a no-op -- its pid could even have been recycled
+    for an unrelated process by the time we get here.
+    """
+    if os.path.isdir("/proc"):
+        pids = []
+        for entry in os.listdir("/proc"):
+            if not entry.isdigit():
+                continue
+            try:
+                with open(f"/proc/{entry}/stat") as f:
+                    # `comm` (field 2) can itself contain spaces/parens;
+                    # splitting on the LAST ')' skips past it before counting
+                    # fields -- state is field 3, ppid is field 4.
+                    after_comm = f.read().rsplit(")", 1)[1].split()
+            except OSError:
+                continue  # exited between the listdir() and the open()
+            state, ppid = after_comm[0], int(after_comm[1])
+            if ppid == parent_pid and state != "Z":
+                pids.append(int(entry))
+        return pids
+    out = subprocess.run(["ps", "-eo", "pid=,ppid=,stat="], capture_output=True, text=True).stdout
+    pids = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 3:
+            continue
+        pid, ppid, state = int(parts[0]), int(parts[1]), parts[2]
+        if ppid == parent_pid and not state.startswith("Z"):
+            pids.append(pid)
+    return pids
 
 
 def default_transport_factory(
@@ -846,11 +890,38 @@ class ChildManager:
         # scheduled.
         if self._recovery_tg is not None:
             self._recovery_tg.cancel_scope.cancel()
-        async with anyio.create_task_group() as tg:
-            for handle in self._handles.values():
-                if handle.client is not None:
-                    tg.start_soon(self._close_one, handle)
-        self._close_log_files()
+        try:
+            async with anyio.create_task_group() as tg:
+                for handle in self._handles.values():
+                    if handle.client is not None:
+                        tg.start_soon(self._close_one, handle)
+        finally:
+            # `_close_one` above (via fastmcp's `StdioTransport.disconnect()`)
+            # awaits a plain `asyncio.Task` it created outside this method's
+            # own anyio scope tree -- so a caller bounding this whole call
+            # with `anyio.move_on_after` (see `server.serve`'s shutdown path)
+            # only cancels the coroutine that's awaiting that task; asyncio
+            # cascades that into cancelling the task itself (`Task.cancel()`
+            # forwards to whatever future/task it's currently blocked on),
+            # which can land INSIDE that task's own shielded subprocess-close
+            # escalation and abort it before its SIGKILL ever fires --
+            # confirmed empirically against a SIGSTOP'd two-process upstream
+            # (a `uvx`-style wrapper plus its own child leaf): the wrapper
+            # survived, untouched, until the stopped leaf was resumed by hand.
+            # This sweep is the actual guarantee: every child we spawn is its
+            # own process-group leader (`start_new_session=True`, see
+            # `mcp.client.stdio.stdio_client`), so its bare pid is also its
+            # pgid, and it runs synchronously (no `await`) so it still
+            # executes even when the `try` above was cut short by that same
+            # outer cancellation. A no-op, logging nothing, whenever every
+            # child already closed cleanly above.
+            for pid in _direct_child_pids(os.getpid()):
+                with suppress(ProcessLookupError, PermissionError):
+                    os.killpg(pid, signal.SIGKILL)
+                    _logger.warning(
+                        "force-killed process group %d: still alive after its own close attempt", pid
+                    )
+            self._close_log_files()
 
     def _close_log_files(self) -> None:
         """Closes every site's child log file opened by `_log_file_for`.

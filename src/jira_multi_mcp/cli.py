@@ -8,6 +8,7 @@ import logging
 import os
 import subprocess
 import sys
+import threading
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,7 +22,7 @@ from jira_multi_mcp.errors import JiraMultiError
 from jira_multi_mcp.logging_setup import LOGGER_NAME, collect_secrets, configure_logging
 from jira_multi_mcp.model import AppConfig, SiteConfig
 from jira_multi_mcp.secrets import redact_text
-from jira_multi_mcp.server import serve
+from jira_multi_mcp.server import SHUTDOWN_WATCHDOG_SECONDS, serve
 from jira_multi_mcp.sources import ConfigSource, EnvOverlaySource, TomlFileConfigSource
 
 _CLOUD_MYSELF_PATH = "/rest/api/3/myself"
@@ -110,7 +111,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         return asyncio.run(_cmd_check(config, allow_partial=args.allow_partial))
 
     try:
-        return asyncio.run(serve(config, verbose=args.verbose))
+        return _serve_with_watchdog(config, verbose=args.verbose)
     except JiraMultiError as exc:
         # e.g. SchemaConflictError raised while building the mirrored tool
         # set: a deliberate error, not a bug, so it gets the same clean
@@ -118,6 +119,59 @@ def main(argv: Sequence[str] | None = None) -> int:
         # traceback.
         logging.getLogger(LOGGER_NAME).error("error: %s", exc)
         return 2
+
+
+def _serve_with_watchdog(config: AppConfig, *, verbose: bool) -> int:
+    """Runs ``serve()`` under ``asyncio.run``, with a ``threading.Timer``
+    watchdog that outlives ``serve()`` itself.
+
+    ``serve()`` already bounds its OWN shutdown work with
+    ``SHUTDOWN_WATCHDOG_SECONDS`` (see its module docstring), but that bound
+    lives entirely inside the coroutine `asyncio.run` drives -- it can't cover
+    `asyncio.run`'s own post-return cleanup (`_cancel_all_tasks` cancelling
+    any task `serve()` leaves running, e.g. a child-transport task whose own
+    subprocess teardown is still in flight). Confirmed empirically: a real
+    upstream child SIGSTOP'd mid-close left the process hung well past
+    `serve()` having already returned, only exiting once the child was
+    resumed by hand. A `threading.Timer` runs on its own OS thread, so it
+    still fires even if the very thing stuck is the event loop `asyncio.run`
+    is trying to close.
+
+    The timer is armed the moment `serve()`'s coroutine itself returns (or
+    raises) -- not for the whole call -- so ordinary startup/serving time is
+    never mistaken for the shutdown window this exists to bound. It fires
+    with `serve()`'s OWN exit code (already known by then), matching
+    `_force_exit`'s 0-if-clean/1-if-not convention instead of always
+    reporting failure.
+    """
+    watchdog: threading.Timer | None = None
+
+    def _arm(rc: int) -> None:
+        nonlocal watchdog
+        watchdog = threading.Timer(SHUTDOWN_WATCHDOG_SECONDS, os._exit, args=(rc,))
+        watchdog.daemon = True
+        watchdog.start()
+
+    async def _serve_then_arm() -> int:
+        try:
+            rc = await serve(config, verbose=verbose)
+        except BaseException:
+            # A startup failure (e.g. `JiraMultiError`) still means every
+            # coroutine inside `serve()` has already unwound -- the only
+            # remaining risk is the SAME `asyncio.run` cleanup phase, so this
+            # path needs the exact same guard; `1` is just what `_force_exit`
+            # would report for "did not close cleanly", never actually
+            # surfaced (the exception itself decides `main`'s return code).
+            _arm(1)
+            raise
+        _arm(rc)
+        return rc
+
+    try:
+        return asyncio.run(_serve_then_arm())
+    finally:
+        if watchdog is not None:
+            watchdog.cancel()
 
 
 def _literal_token_source(site: SiteConfig, env_var_suffix: str) -> str:

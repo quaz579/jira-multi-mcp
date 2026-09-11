@@ -212,6 +212,20 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
                     # still blocked waiting to be told to stop.
                     stop_watching_stdin.set()
         finally:
+            # Armed here too, not only in `_shutdown_children`: reaching this
+            # `finally` via `run_stdio_async()` simply returning on its own
+            # (stdin hit EOF after startup finished, no signal involved) never
+            # goes through that function at all -- so without this call, the
+            # ordinary "client just went away" shutdown had NO watchdog on it
+            # whatsoever, however long `manager.aclose()`/`stack.aclose()`
+            # below took. Confirmed empirically against a real two-process
+            # upstream (a `uvx`-style wrapper plus its own child leaf) with
+            # the leaf SIGSTOP'd: the process rode out an indefinite wait
+            # instead of the intended `SHUTDOWN_WATCHDOG_SECONDS`. Harmless to
+            # arm twice when a signal already triggered `_shutdown_children`
+            # first -- `_force_exit`/`os._exit` is idempotent and only the
+            # first call to actually fire ever runs.
+            asyncio.get_running_loop().call_later(SHUTDOWN_WATCHDOG_SECONDS, _force_exit, state)
             # Own httpx clients, no subprocess -- closed first (fast, no
             # watchdog risk) so the shared shutdown budget below is spent
             # entirely on the part that can actually hang: tearing down
