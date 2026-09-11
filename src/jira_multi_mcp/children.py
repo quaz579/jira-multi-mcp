@@ -131,19 +131,6 @@ def _collect_secrets(sites: Sequence[SiteConfig]) -> list[Secret]:
     return secrets
 
 
-def _close_leaked_log_file(transport: ClientTransport | None) -> None:
-    """Closes the log file we eagerly opened for a site whose child never
-    actually connected (the transport/connect itself failed before a session
-    was established) -- nothing else will ever write to or close that fd, so
-    holding it open would leak one fd per such site for the rest of the
-    process's life. A site whose session DID connect keeps its log file open
-    (it's the live subprocess's stderr) until ``ChildManager.aclose()``."""
-    log_file = getattr(transport, "log_file", None)
-    if log_file is not None and not isinstance(log_file, Path):
-        with suppress(Exception):
-            log_file.close()
-
-
 def _open_child_log_file(site: SiteConfig, log_dir: Path) -> TextIO:
     """Opens this site's child log 0600, matching ``server.log`` -- a bare
     ``Path`` handed to ``StdioTransport`` gets opened at the process umask
@@ -154,6 +141,13 @@ def _open_child_log_file(site: SiteConfig, log_dir: Path) -> TextIO:
     entirely (confirmed empirically) -- meaning this stream can NOT be
     redacted the way the logging-based ``server.log`` is; a future upstream
     version that ever echoed a credential here would leak it verbatim.
+
+    Called at most ONCE per site for the whole process's life (see
+    ``ChildManager._log_file_for``): fastmcp's ``StdioTransport`` never
+    closes a caller-supplied ``log_file``, so opening a fresh one on every
+    connect attempt -- including every recovery restart -- would leak one fd
+    per attempt for as long as the process runs. Opened in append mode and
+    reused across restarts of the same site instead.
     """
     path = log_dir / f"{site.name}.log"
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, _LOG_FILE_MODE)
@@ -165,7 +159,7 @@ def default_transport_factory(
     upstream: UpstreamConfig,
     *,
     defaults: Defaults,
-    log_dir: Path,
+    log_file: TextIO,
     verbose: bool = False,
 ) -> ClientTransport:
     return StdioTransport(
@@ -174,7 +168,7 @@ def default_transport_factory(
         env=build_child_env(site, upstream, defaults, verbose=verbose),
         cwd=upstream.workspace_dir,
         keep_alive=True,
-        log_file=_open_child_log_file(site, log_dir),
+        log_file=log_file,
     )
 
 
@@ -227,9 +221,13 @@ class ChildManager:
         self._defaults = defaults
         self._log_dir = log_dir
         self._verbose = verbose
+        # One log file per site, opened lazily and reused across every
+        # (re)connect attempt for that site -- see `_open_child_log_file`'s
+        # docstring for why opening a fresh one per attempt would leak fds.
+        self._log_files: dict[str, TextIO] = {}
         self._transport_factory: TransportFactory = transport_factory or (
             lambda site, up: default_transport_factory(
-                site, up, defaults=defaults, log_dir=log_dir, verbose=verbose
+                site, up, defaults=defaults, log_file=self._log_file_for(site, log_dir), verbose=verbose
             )
         )
         self._handles: dict[str, ChildHandle] = {
@@ -257,6 +255,17 @@ class ChildManager:
         configured as a known secret, so ``redact_text`` alone wouldn't
         catch it."""
         return scrub_urls(redact_text(text, self._secrets))
+
+    def _log_file_for(self, site: SiteConfig, log_dir: Path) -> TextIO:
+        """Returns this site's child log file, opening it the first time
+        (startup or the site's very first recovery) and handing back the
+        SAME open handle on every later call -- a failed connect attempt or
+        a restart never opens a second one. Closed only in ``aclose()``."""
+        log_file = self._log_files.get(site.name)
+        if log_file is None:
+            log_file = _open_child_log_file(site, log_dir)
+            self._log_files[site.name] = log_file
+        return log_file
 
     async def start_all(self, stack: AsyncExitStack, connect_timeout: float) -> None:
         """Connects every configured child concurrently.
@@ -290,8 +299,6 @@ class ChildManager:
 
     async def _start_one(self, site: SiteConfig, stack: AsyncExitStack, connect_timeout: float) -> None:
         handle = self._handles[site.name]
-        transport: ClientTransport | None = None
-        entered = False
         timed_out = False
         try:
             with anyio.move_on_after(connect_timeout) as scope:
@@ -315,7 +322,6 @@ class ChildManager:
                 # process's life.
                 handle.client = client
                 await stack.enter_async_context(client)
-                entered = True
                 await self._probe_liveness(client)
             # `move_on_after` (not `fail_after`) so a plain `TimeoutError` an
             # underlying library raises for its own OS-level reason (e.g. a
@@ -330,8 +336,6 @@ class ChildManager:
             _logger.warning(
                 "site '%s' failed to start: %s (see %s)", site.name, handle.error, handle.log_path
             )
-            if not entered:
-                _close_leaked_log_file(transport)
             return
 
         if timed_out:
@@ -341,8 +345,6 @@ class ChildManager:
             _logger.warning(
                 "site '%s' failed to start: %s (see %s)", site.name, handle.error, handle.log_path
             )
-            if not entered:
-                _close_leaked_log_file(transport)
             return
 
         handle.state = "healthy"
@@ -532,8 +534,6 @@ class ChildManager:
         # `client_for`), so a `connect_timeout_seconds` of e.g. 90s must not
         # be allowed to blow straight through a 10s call timeout on its own.
         connect_timeout = min(self._defaults.connect_timeout_seconds, self._defaults.call_timeout_seconds)
-        transport: ClientTransport | None = None
-        entered = False
         # Recovery now runs inside the caller's own
         # `anyio.fail_after(call_timeout_seconds)` (see `client_for`'s
         # docstring), so that timeout firing while `__aenter__`/
@@ -552,21 +552,16 @@ class ChildManager:
                 client: Client[ClientTransport] = Client(transport)
                 handle.client = client
                 await client.__aenter__()  # type: ignore[no-untyped-call]
-                entered = True
                 await self._probe_liveness(client)
             timed_out = scope.cancelled_caught
         except (Exception, cancelled_exc) as exc:  # noqa: BLE001 - one site's failed recovery must not raise
             self._fail_recovery(handle, self.redact(f"{exc.__class__.__name__}: {exc}"))
-            if not entered:
-                _close_leaked_log_file(transport)
             if isinstance(exc, cancelled_exc):
                 raise
             return
 
         if timed_out:
             self._fail_recovery(handle, f"connect timed out after {connect_timeout}s")
-            if not entered:
-                _close_leaked_log_file(transport)
             return
 
         handle.state = "healthy"
@@ -666,6 +661,19 @@ class ChildManager:
             for handle in self._handles.values():
                 if handle.client is not None:
                     tg.start_soon(self._close_one, handle)
+        self._close_log_files()
+
+    def _close_log_files(self) -> None:
+        """Closes every site's child log file opened by `_log_file_for`.
+
+        Idempotent via draining the dict (a second `aclose()` call -- e.g.
+        once from a shutdown-signal handler, once from `serve()`'s own
+        `finally` -- finds it already empty and closes nothing again).
+        """
+        for name in list(self._log_files):
+            log_file = self._log_files.pop(name)
+            with suppress(Exception):
+                log_file.close()
 
     async def _close_one(self, handle: ChildHandle) -> None:
         assert handle.client is not None

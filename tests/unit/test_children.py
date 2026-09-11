@@ -263,6 +263,57 @@ async def test_aclose_kills_a_real_child_process(tmp_path: Path) -> None:
             pytest.fail(f"child pid {pid} was still alive 5s after ChildManager.aclose()")
 
 
+async def test_recovery_reuses_the_same_log_file_instead_of_leaking_one_fd_per_attempt(
+    tmp_path: Path,
+) -> None:
+    """The MEDIUM finding: fastmcp's `StdioTransport` never closes a
+    caller-supplied `log_file`, so opening a fresh one on every recovery
+    attempt would leak one fd per attempt for the rest of the process's
+    life. Proved against the REAL default transport factory (an actual,
+    fast-exiting subprocess each cycle, not a fake) by counting THIS
+    process's own open fds -- the log file is opened by the parent to hand
+    to the child as its stderr, so a leak would show up here directly."""
+    if not Path("/dev/fd").is_dir():
+        pytest.skip("requires /dev/fd (not available on this platform)")
+
+    script = (
+        "import sys\n"
+        "if '--version' in sys.argv:\n"
+        "    sys.exit(0)\n"
+        "from fastmcp import FastMCP\n"
+        "mcp = FastMCP('probe')\n"
+        "mcp.run(transport='stdio', show_banner=False)\n"
+    )
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(command=(sys.executable, "-c", script)),
+        Defaults(recovery_cooldown_seconds=0.02, connect_timeout_seconds=10),
+        tmp_path,
+    )
+
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=15)
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "healthy"
+
+        baseline = len(os.listdir("/dev/fd"))
+
+        for _ in range(5):
+            manager.mark_failed("acme", "simulated pipe break")
+            await anyio.sleep(0.05)  # past the cooldown
+            await manager.client_for("acme")  # triggers one real recovery/respawn
+
+        after = len(os.listdir("/dev/fd"))
+        # A little fd noise (the listdir call itself, GC timing) is
+        # tolerated; a real per-attempt leak would show as +5 (one per
+        # recovery cycle), not +0 or +1.
+        assert after - baseline <= 1, (
+            f"open fd count grew by {after - baseline} across 5 recovery cycles -- a child log "
+            "file was opened per attempt instead of being reused"
+        )
+
+
 async def test_cancelling_a_stuck_handshake_still_kills_the_spawned_child(tmp_path: Path) -> None:
     """Characterization test, not a regression test: this passes whether or
     not `handle.client` is assigned before or after `enter_async_context`,
