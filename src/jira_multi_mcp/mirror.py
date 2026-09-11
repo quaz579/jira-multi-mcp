@@ -320,13 +320,19 @@ class LateMirror:
 
         Uses try-lock semantics (``acquire_nowait``), consistent with
         ``ChildManager._maybe_recover``: this runs inside `jira_sites`'s own
-        call budget, so a second, concurrent caller queuing behind the lock
-        would burn its own budget waiting on someone else's discovery instead
-        of getting a fast, clear answer -- it just returns ``None`` and the
-        NEXT `jira_sites` call retries. ``discover_tools()`` itself is bounded
-        by ``self._timeout`` (the M4a MEDIUM 2 finding): without that, one
-        slow/hanging child's ``list_tools()`` could stall this call -- and
-        every `jira_sites` call behind its lock -- indefinitely.
+        call budget (its caller wraps this call in the SAME
+        ``anyio.move_on_after(health_recovery_budget_seconds)`` scope it
+        already used for recovery -- see ``wrapper_tools.build_jira_sites_tool``),
+        so a second, concurrent caller queuing behind the lock would burn its
+        own budget waiting on someone else's discovery instead of getting a
+        fast, clear answer -- it just returns ``None`` and the NEXT
+        `jira_sites` call retries. ``discover_tools()`` itself is ALSO bounded
+        by ``self._timeout`` (the M4a MEDIUM 2 finding, call_timeout_seconds
+        by default) as an inner, independent backstop -- without that, one
+        slow/hanging child's ``list_tools()`` could stall this call for as
+        long as THAT takes even on a caller that isn't going through
+        `jira_sites`'s own budget at all. Whichever of the two is smaller is
+        what actually bounds a `jira_sites` call in practice.
         """
         if self._mirrored:
             return None

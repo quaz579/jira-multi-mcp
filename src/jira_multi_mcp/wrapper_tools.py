@@ -65,22 +65,26 @@ def build_jira_sites_tool(
     docstring). Both are no-ops once nothing is failed / tools are already
     mirrored, so a healthy server pays only the cost of ``manager.health()``.
 
-    Recovery is bounded by ``defaults.health_recovery_budget_seconds`` (the
-    M4a MEDIUM 1 finding): a site whose connect is simply slow (e.g. a
-    generous ``connect_timeout_seconds``) must not make this call itself hang
-    for as long as that connect takes. The recovery attempt itself is NOT
-    cancelled when the budget expires -- only this call's wait for it is;
-    ``ChildManager`` keeps it running in its own background task group (see
-    ``ChildManager.recover_failed_sites``), and ``manager.health()`` reports
-    such a site as ``"recovering"`` until it settles.
+    Both steps run inside ONE ``anyio.move_on_after(defaults.health_recovery_budget_seconds)``
+    scope, so this call's total added latency is bounded by that budget, not
+    by either step's own (much longer) internal timeout --
+    ``recover_failed_sites``'s spawned attempt and ``after_recovery``'s
+    ``discover_tools()`` call both keep running in the background past the
+    budget (see their own docstrings) and are picked up by a later
+    ``jira_sites`` call; only THIS call's wait for them is cut short. When the
+    budget expires mid-``after_recovery``, ``late_mirror`` is left unmirrored
+    (``_mirrored`` stays ``False``) for a later call to retry, and the
+    response's ``note`` says so instead of claiming anything was mirrored.
     """
 
     async def jira_sites(ctx: Context) -> dict[str, Any]:
-        with anyio.move_on_after(defaults.health_recovery_budget_seconds):
-            await manager.recover_failed_sites()
         recovery_note: str | None = None
-        if late_mirror is not None:
-            recovery_note = await late_mirror.after_recovery(ctx)
+        with anyio.move_on_after(defaults.health_recovery_budget_seconds) as scope:
+            await manager.recover_failed_sites()
+            if late_mirror is not None:
+                recovery_note = await late_mirror.after_recovery(ctx)
+        if scope.cancelled_caught and late_mirror is not None and recovery_note is None:
+            recovery_note = "tool mirroring pending; call jira_sites again"
 
         sites = manager.health()
         payload: dict[str, Any] = {

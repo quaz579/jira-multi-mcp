@@ -648,6 +648,59 @@ async def test_after_recovery_bounds_discover_tools_and_a_concurrent_caller_gets
     assert late_mirror._mirrored is False  # noqa: SLF001 - whitebox
 
 
+class _HangingDiscoveryManager:
+    """A fake manager whose ``discover_tools()`` hangs forever (standing in
+    for a SIGSTOP'd healthy child whose ``list_tools()`` never returns), but
+    whose other ``jira_sites``-facing methods behave like an all-healthy,
+    nothing-to-recover server -- isolates the M4a round-4 MEDIUM finding from
+    needing a real child process at all."""
+
+    def __init__(self) -> None:
+        self.discover_calls = 0
+
+    async def recover_failed_sites(self) -> list[str]:
+        return []
+
+    def health(self) -> list[dict[str, object]]:
+        return [{"name": "acme", "state": "healthy", "read_only": False, "enabled_tools_restricted": False}]
+
+    def upstream_version(self) -> str | None:
+        return None
+
+    async def discover_tools(self) -> list[mcp_types.Tool]:
+        self.discover_calls += 1
+        await anyio.sleep_forever()
+        return []  # pragma: no cover - unreachable
+
+
+async def test_jira_sites_is_bounded_by_the_health_recovery_budget_even_when_late_mirror_is_stuck() -> None:
+    """The M4a round-4 MEDIUM finding: `LateMirror.after_recovery` used to
+    run OUTSIDE `jira_sites`'s own `anyio.move_on_after(health_recovery_budget_seconds)`
+    scope, bounded only by the (much longer) `call_timeout_seconds` -- the
+    real repro measured 120s against a budget of 2. A hanging
+    `discover_tools()` (a SIGSTOP'd healthy child's `list_tools()` never
+    returning) must not make a `jira_sites` call take any longer than the
+    budget."""
+    manager = _HangingDiscoveryManager()
+    parent = FastMCP("test-parent")
+    registry = SiteRegistry([_site("acme", "ACME")])
+    late_mirror = LateMirror(parent, manager, registry, _ALLOWLIST, timeout=120.0)  # type: ignore[arg-type]
+    defaults = Defaults(health_recovery_budget_seconds=1.0, call_timeout_seconds=120.0)
+    parent.add_tool(build_jira_sites_tool(manager, defaults, late_mirror=late_mirror))  # type: ignore[arg-type]
+
+    async with Client(FastMCPTransport(parent)) as client:
+        before = time.monotonic()
+        with anyio.fail_after(5.0):
+            result = await client.call_tool_mcp("jira_sites", {})
+        elapsed = time.monotonic() - before
+
+    assert elapsed < 1.5, f"jira_sites took {elapsed:.2f}s against a 1.0s budget"
+    assert manager.discover_calls == 1
+    payload = result.structured_content
+    assert "note" in payload
+    assert "pending" in payload["note"]
+
+
 class _DeadChildClient:
     """Stands in for a connection that broke mid-call (e.g. the child process
     died) -- distinct from a timeout, which anyio.fail_after handles."""

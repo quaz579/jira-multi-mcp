@@ -615,9 +615,13 @@ class ChildManager:
 
     async def recover_failed_sites(self) -> list[str]:
         """Ensures every currently ``failed`` site (past its cooldown) has a
-        recovery attempt running, then waits for those attempts to settle.
-        Returns the names that are ``healthy`` afterward (whether they needed
-        recovering just now or already were).
+        recovery attempt running, then waits only for the attempts THIS call
+        actually put in flight to settle -- a handle whose lock was already
+        held by someone else's still-running attempt is left alone, not
+        waited on, so a call that spawned nothing never burns its caller's
+        budget on someone else's in-flight work. Returns the names that are
+        ``healthy`` afterward (whether they needed recovering just now or
+        already were).
 
         Attempts are spawned into ``recovery_supervisor()``'s long-lived task
         group when one is running, not a temporary one scoped to this call:
@@ -644,25 +648,38 @@ class ChildManager:
         """
         failed = [h for h in self._handles.values() if h.state == "failed"]
         if failed:
+            # Only handles THIS call actually put a task into flight for --
+            # not every currently-`failed` handle. A handle whose
+            # `recovery_lock` was already held before we got here (someone
+            # else's attempt, still running) is that caller's to wait on, not
+            # ours: this call spawned nothing for it, so it has no work of
+            # its own to report on. Without this distinction, a call that
+            # spawned nothing at all still burned its full
+            # `health_recovery_budget_seconds` polling a lock it never even
+            # tried to acquire.
+            spawned = []
             if self._recovery_tg is not None:
                 for handle in failed:
                     if not handle.recovery_lock.locked():
                         self._recovery_tg.start_soon(self._recover_one, handle)
-                # `start_soon` only schedules -- give a newly spawned task at
-                # least one turn to actually run before polling `locked()`
-                # below, or a task that hasn't started yet would still read
-                # as "not locked" and this method would return before
-                # recovery truly began. `_maybe_recover`'s cheap checks and
-                # its `acquire_nowait()` are synchronous (no `await` in
-                # between), so one checkpoint is enough for every just-
-                # spawned task to reach the lock.
-                await anyio.sleep(0)
+                        spawned.append(handle)
+                if spawned:
+                    # `start_soon` only schedules -- give a newly spawned task
+                    # at least one turn to actually run before polling
+                    # `locked()` below, or a task that hasn't started yet
+                    # would still read as "not locked" and this method would
+                    # return before recovery truly began. `_maybe_recover`'s
+                    # cheap checks and its `acquire_nowait()` are synchronous
+                    # (no `await` in between), so one checkpoint is enough for
+                    # every just-spawned task to reach the lock.
+                    await anyio.sleep(0)
             else:
                 async with anyio.create_task_group() as temp_tg:
                     for handle in failed:
                         if not handle.recovery_lock.locked():
                             temp_tg.start_soon(self._recover_one, handle)
-            while any(h.recovery_lock.locked() for h in failed):
+                            spawned.append(handle)
+            while any(h.recovery_lock.locked() for h in spawned):
                 await anyio.sleep(0.02)
 
         return [h.site.name for h in self._handles.values() if h.state == "healthy"]
