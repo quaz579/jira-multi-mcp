@@ -299,27 +299,53 @@ class LateMirror:
         # `already_mirrored=True` when the caller already added tools from
         # this SAME discovery pipeline once (the ordinary startup path in
         # `server.serve`) -- without this, the first `jira_sites` call after
-        # a successful startup would immediately re-discover and try to
-        # `mcp.add_tool` every already-mirrored tool a second time, which
-        # raises (fastmcp's default `on_duplicate="error"`).
+        # a successful startup would immediately re-discover and re-add every
+        # already-mirrored tool a second time. `mcp.add_tool` would NOT raise
+        # on that (fastmcp 4.0.3's default `on_duplicate="warn"` replaces the
+        # existing tool and just logs a warning), but it's still pointless
+        # rediscovery-and-replace work and log spam on every single call.
         self._mirrored = already_mirrored
-        # Double-checked, not just an early-return flag check: `mcp.add_tool`
-        # raises on a duplicate name (fastmcp's default `on_duplicate`), so
-        # two concurrent `jira_sites` calls both observing `_mirrored=False`
-        # and both mirroring would have the second one crash.
+        # Guards against two concurrent `jira_sites` calls both observing
+        # `_mirrored=False` and both running a whole `discover_tools()` +
+        # rebuild for nothing -- not (as an earlier version of this comment
+        # claimed) to stop `mcp.add_tool` from crashing on a duplicate name;
+        # it wouldn't (see above).
         self._lock = anyio.Lock()
 
     async def after_recovery(self, ctx: Context) -> str | None:
         """Returns a note for ``jira_sites`` to surface only when tools WERE
         newly mirrored just now but the connected client couldn't be told
         its tool list changed (it may need a manual re-list); ``None`` in
-        every other case, including "nothing to do"."""
+        every other case, including "nothing to do".
+
+        Uses try-lock semantics (``acquire_nowait``), consistent with
+        ``ChildManager._maybe_recover``: this runs inside `jira_sites`'s own
+        call budget, so a second, concurrent caller queuing behind the lock
+        would burn its own budget waiting on someone else's discovery instead
+        of getting a fast, clear answer -- it just returns ``None`` and the
+        NEXT `jira_sites` call retries. ``discover_tools()`` itself is bounded
+        by ``self._timeout`` (the M4a MEDIUM 2 finding): without that, one
+        slow/hanging child's ``list_tools()`` could stall this call -- and
+        every `jira_sites` call behind its lock -- indefinitely.
+        """
         if self._mirrored:
             return None
-        async with self._lock:
+        try:
+            self._lock.acquire_nowait()
+        except anyio.WouldBlock:
+            return None
+        try:
             if self._mirrored:
                 return None
-            tools = await self._manager.discover_tools()
+            with anyio.move_on_after(self._timeout) as scope:
+                tools = await self._manager.discover_tools()
+            if scope.cancelled_caught:
+                _logger.warning(
+                    "late-mirror discover_tools() timed out after %ss; leaving unmirrored "
+                    "for a later jira_sites call to retry",
+                    self._timeout,
+                )
+                return None
             mirrored = build_mirrored_tools(
                 tools, self._manager, self._registry, self._allowlist, self._timeout
             )
@@ -330,6 +356,8 @@ class LateMirror:
             for tool in mirrored:
                 self._mcp.add_tool(tool)
             self._mirrored = True
+        finally:
+            self._lock.release()
         try:
             await ctx.session.send_tool_list_changed()
         except Exception:  # noqa: BLE001 - best-effort; an older/simpler client may not support this
