@@ -4,14 +4,18 @@ the actual streamed byte count, and directory/overwrite handling."""
 
 from __future__ import annotations
 
+import errno
+import os
 from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
 
+import anyio
 import httpx
 import pytest
 import respx
+from fastmcp.exceptions import ToolError
 
-from jira_multi_mcp.attachments import JiraAttachmentClient
+from jira_multi_mcp.attachments import DownloadedFile, JiraAttachmentClient
 from jira_multi_mcp.model import SiteConfig
 from jira_multi_mcp.secrets import Secret
 
@@ -303,3 +307,165 @@ async def test_unmatched_filename_is_a_failed_entry(http_client: httpx.AsyncClie
     assert len(entries) == 1
     assert entries[0]["status"] == "failed"
     assert "nope.txt" in entries[0]["reason"]
+
+
+async def test_unmatched_id_entry_carries_a_selector_not_a_filename(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    with respx.mock:
+        _mock_list([_attachment("1", "a.txt")])
+        downloaded, entries = await _client(http_client).download("ACME-1", tmp_path, attachment_ids=["999"])
+
+    assert downloaded == []
+    assert entries == [
+        {"selector": "id:999", "reason": "no attachment with id '999' on ACME-1", "status": "failed"}
+    ]
+
+
+async def test_empty_filenames_list_is_refused(http_client: httpx.AsyncClient, tmp_path: Path) -> None:
+    with pytest.raises(ToolError, match="filenames.*empty"):
+        await _client(http_client).download("ACME-1", tmp_path, filenames=[])
+
+
+async def test_empty_attachment_ids_list_is_refused(http_client: httpx.AsyncClient, tmp_path: Path) -> None:
+    with pytest.raises(ToolError, match="attachment_ids.*empty"):
+        await _client(http_client).download("ACME-1", tmp_path, attachment_ids=[])
+
+
+@respx.mock
+async def test_overwrite_onto_a_directory_is_a_failed_entry_not_a_crash(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """Regression: `os.replace(part, dest)` when `dest` is an existing
+    directory raises an unshaped `IsADirectoryError` that used to escape
+    `_download_one` entirely and abort the whole batch."""
+    (tmp_path / "notes.txt").mkdir()
+    _mock_list([_attachment("1", "notes.txt"), _attachment("2", "other.txt")])
+    _mock_content("1", b"new-content")
+    _mock_content("2", b"other-content")
+
+    downloaded, entries = await _client(http_client).download("ACME-1", tmp_path, overwrite=True)
+
+    assert [d.filename for d in downloaded] == ["other.txt"]
+    assert len(entries) == 1
+    assert entries[0]["status"] == "failed"
+    assert entries[0]["reason"] == "destination is a directory"
+    assert (tmp_path / "notes.txt").is_dir()
+    # No leftover `.part` scratch file for either attachment.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["notes.txt", "other.txt"]
+
+
+async def test_concurrent_downloads_of_the_same_attachment_id_do_not_clobber_each_other(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """Regression: two `download()` calls selecting the same attachment id
+    into the same target_dir used to share one `.part` name derived only
+    from `dest.name` and the attachment id -- one call's cleanup could unlink
+    the file the other call was still streaming into. `mkstemp` gives each
+    call's scratch file a unique name regardless, proved here by running two
+    downloads truly concurrently (staggered so their streaming overlaps) in
+    the same task group."""
+
+    def make_response(request: httpx.Request) -> httpx.Response:
+        async def body() -> AsyncIterator[bytes]:
+            yield b"first-chunk-"
+            await anyio.sleep(0.05)
+            yield b"second-chunk"
+
+        return httpx.Response(200, content=body())
+
+    with respx.mock:
+        _mock_list([_attachment("1", "notes.txt")])
+        respx.get("https://acme.atlassian.net/rest/api/3/attachment/content/1").mock(
+            side_effect=make_response
+        )
+
+        client = _client(http_client)
+        results: list[tuple[list[DownloadedFile], list[dict[str, str]]]] = []
+
+        async def run() -> None:
+            results.append(await client.download("ACME-1", tmp_path, overwrite=True))
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(run)
+            tg.start_soon(run)
+
+    assert len(results) == 2
+    for downloaded, entries in results:
+        assert entries == []
+        assert len(downloaded) == 1
+    assert (tmp_path / "notes.txt").read_bytes() == b"first-chunk-second-chunk"
+    # No leftover `.part` scratch file from either call.
+    assert [p.name for p in tmp_path.iterdir()] == ["notes.txt"]
+
+
+@respx.mock
+async def test_mid_stream_read_error_is_a_shaped_failed_entry_with_no_partial_file(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    async def broken_body() -> AsyncIterator[bytes]:
+        yield b"partial"
+        raise httpx.ReadError("connection reset mid-stream")
+
+    _mock_list([_attachment("1", "notes.txt")])
+    respx.get("https://acme.atlassian.net/rest/api/3/attachment/content/1").mock(
+        return_value=httpx.Response(200, content=broken_body())
+    )
+
+    downloaded, entries = await _client(http_client).download("ACME-1", tmp_path)
+
+    assert downloaded == []
+    assert len(entries) == 1
+    assert entries[0]["status"] == "failed"
+    assert "ReadError" in entries[0]["reason"]
+    assert list(tmp_path.iterdir()) == []  # no partial file, no leftover .part
+
+
+@respx.mock
+async def test_no_clobber_falls_back_to_a_copy_when_hard_links_are_unsupported(
+    http_client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`os.link` can fail with e.g. EXDEV (different filesystems) or EPERM/
+    ENOTSUP/EOPNOTSUPP (no hard-link support at all) rather than EEXIST --
+    those must fall back to a plain copy instead of leaking the raw OSError."""
+
+    def flaky_link(src: object, dst: object, **kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    monkeypatch.setattr(os, "link", flaky_link)
+    _mock_list([_attachment("1", "notes.txt")])
+    _mock_content("1", b"cross-device-content")
+
+    downloaded, entries = await _client(http_client).download("ACME-1", tmp_path)
+
+    assert entries == []
+    assert len(downloaded) == 1
+    assert (tmp_path / "notes.txt").read_bytes() == b"cross-device-content"
+    assert [p.name for p in tmp_path.iterdir()] == ["notes.txt"]
+
+
+@respx.mock
+async def test_no_clobber_copy_fallback_still_refuses_a_dest_that_appears_mid_race(
+    http_client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The copy fallback still opens `dest` with O_EXCL: if `dest` appears on
+    disk between `_pick_dest_name`'s check and the fallback actually running,
+    it's still not clobbered. Simulated by having the patched `os.link`
+    itself create `dest` before raising -- standing in for a real race
+    between that check and this call."""
+    dest = tmp_path / "notes.txt"
+
+    def racing_link(src: object, dst: object, **kwargs: object) -> None:
+        Path(str(dst)).write_bytes(b"raced-in-content")
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "link", racing_link)
+    _mock_list([_attachment("1", "notes.txt")])
+    _mock_content("1", b"new-content")
+
+    downloaded, entries = await _client(http_client).download("ACME-1", tmp_path)
+
+    assert downloaded == []
+    assert len(entries) == 1
+    assert entries[0]["status"] == "skipped"
+    assert dest.read_bytes() == b"raced-in-content"

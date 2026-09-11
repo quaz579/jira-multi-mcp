@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
@@ -168,6 +169,43 @@ async def test_upload_sends_multipart_with_no_check_header(
     assert len(uploaded) == 1
     assert uploaded[0].id == "20002"
     assert uploaded[0].filename == "jira-multi-mcp-test.txt"
+
+
+async def test_upload_rejects_a_file_over_max_bytes_without_sending_it(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    site = _cloud_site()
+    upload_path = tmp_path / "big.bin"
+    upload_path.write_bytes(b"x" * 200)
+
+    with respx.mock:
+        route = respx.post("https://acme.atlassian.net/rest/api/3/issue/ACME-1/attachments")
+        with pytest.raises(ToolError, match="max_bytes"):
+            await _client(site, http_client, max_bytes=100).upload("ACME-1", [upload_path])
+        assert not route.called
+
+
+async def test_upload_open_failure_is_redacted(
+    http_client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = _cloud_site()
+    upload_path = tmp_path / "notes.txt"
+    upload_path.write_text("hello")
+    real_open = open
+
+    def flaky_open(path: Any, *args: Any, **kwargs: Any) -> Any:
+        if str(path) == str(upload_path):
+            raise OSError(f"permission denied near token {_SECRET_TOKEN}")
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", flaky_open)
+
+    with pytest.raises(ToolError) as exc_info:
+        await _client(site, http_client).upload("ACME-1", [upload_path])
+
+    message = str(exc_info.value)
+    assert _SECRET_TOKEN not in message
+    assert "***" in message
 
 
 @respx.mock

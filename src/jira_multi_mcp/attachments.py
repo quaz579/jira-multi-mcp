@@ -9,10 +9,13 @@ plan's v1 decision), so every method refuses on a ``personal_token`` site.
 
 from __future__ import annotations
 
+import errno
 import logging
 import mimetypes
 import os
 import re
+import shutil
+import tempfile
 from collections.abc import Callable, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
@@ -27,6 +30,13 @@ from jira_multi_mcp.model import Defaults, SiteConfig
 _logger = logging.getLogger(__name__)
 
 _CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+# os.link(part, dest) errno's that mean "this filesystem/pair of paths
+# doesn't support hard links at all" (as opposed to EEXIST, which means
+# `dest` is simply already there) -- e.g. `part` and `dest` on different
+# filesystems, or a filesystem/OS that never supports hard links. Falls back
+# to a plain copy instead of leaking the raw OSError and aborting the batch.
+_LINK_UNSUPPORTED_ERRNOS = frozenset({errno.EPERM, errno.EXDEV, errno.ENOTSUP, errno.EOPNOTSUPP})
 
 
 class _AttachmentTooLarge(Exception):
@@ -65,15 +75,35 @@ class _DownloadEntry:
     """One selected attachment that was NOT written to disk (name/reason kept
     separate from ``DownloadedFile`` so a caller can bucket "skipped" --
     already exists, both fallback names taken -- from "failed" -- refused by
-    the server, too large, an unsafe filename)."""
+    the server, too large, an unsafe filename).
 
-    def __init__(self, filename: str, reason: str, status: Literal["skipped", "failed"]) -> None:
+    ``filename`` is the real attachment filename, known whenever the entry
+    describes an attachment that was actually looked up; it's ``None`` for an
+    unmatched *selector* (a requested ``filenames``/``attachment_ids`` value
+    with no matching attachment at all), which instead carries ``selector``
+    (e.g. ``"id:999"``) -- there's no real filename to report in that case.
+    """
+
+    def __init__(
+        self,
+        filename: str | None,
+        reason: str,
+        status: Literal["skipped", "failed"],
+        *,
+        selector: str | None = None,
+    ) -> None:
         self.filename = filename
         self.reason = reason
         self.status = status
+        self.selector = selector
 
     def as_dict(self) -> dict[str, str]:
-        return {"filename": self.filename, "reason": self.reason, "status": self.status}
+        result: dict[str, str] = {"reason": self.reason, "status": self.status}
+        if self.filename is not None:
+            result["filename"] = self.filename
+        if self.selector is not None:
+            result["selector"] = self.selector
+        return result
 
 
 def _safe_filename(filename: str) -> str:
@@ -133,6 +163,16 @@ class JiraAttachmentClient:
         overwrite: bool = False,
     ) -> tuple[list[DownloadedFile], list[dict[str, str]]]:
         self._require_cloud("jira_download_attachments")
+        if filenames is not None and len(filenames) == 0:
+            raise ToolError(
+                f"[site={self._site.name}] jira_download_attachments: 'filenames' is an empty list; "
+                "omit the argument entirely to download every attachment"
+            )
+        if attachment_ids is not None and len(attachment_ids) == 0:
+            raise ToolError(
+                f"[site={self._site.name}] jira_download_attachments: 'attachment_ids' is an empty list; "
+                "omit the argument entirely to download every attachment"
+            )
         attachments = await self.list_attachments(issue_key)
         selected, unmatched = self._select(attachments, filenames, attachment_ids, issue_key)
 
@@ -167,13 +207,30 @@ class JiraAttachmentClient:
 
     async def upload(self, issue_key: str, paths: Sequence[Path]) -> list[AttachmentMeta]:
         self._require_cloud("jira_upload_attachments")
+        for path in paths:
+            try:
+                size = path.stat().st_size
+            except OSError as exc:
+                raise ToolError(
+                    self._redact(
+                        f"[site={self._site.name}] jira_upload_attachments: could not stat "
+                        f"'{path}': {exc.__class__.__name__}: {exc}"
+                    )
+                ) from exc
+            if size > self._max_bytes:
+                raise ToolError(
+                    f"[site={self._site.name}] jira_upload_attachments: '{path}' is {size} bytes, "
+                    f"exceeds max_bytes {self._max_bytes}"
+                )
         with ExitStack() as stack:
             try:
                 handles = [stack.enter_context(open(path, "rb")) for path in paths]
             except OSError as exc:
                 raise ToolError(
-                    f"[site={self._site.name}] jira_upload_attachments: could not open "
-                    f"'{exc.filename}': {exc.__class__.__name__}: {exc}"
+                    self._redact(
+                        f"[site={self._site.name}] jira_upload_attachments: could not open "
+                        f"'{exc.filename}': {exc.__class__.__name__}: {exc}"
+                    )
                 ) from exc
             files = [
                 ("file", (path.name, fh, mimetypes.guess_type(path.name)[0] or "application/octet-stream"))
@@ -207,33 +264,49 @@ class JiraAttachmentClient:
             _DownloadEntry(name, f"no attachment with filename '{name}' on {issue_key}", "failed")
             for name in sorted(filename_set - matched_filenames)
         ] + [
-            _DownloadEntry(att_id, f"no attachment with id '{att_id}' on {issue_key}", "failed")
+            # No real filename to report for an unmatched id -- `selector`
+            # carries it instead (see `_DownloadEntry`'s docstring).
+            _DownloadEntry(
+                None,
+                f"no attachment with id '{att_id}' on {issue_key}",
+                "failed",
+                selector=f"id:{att_id}",
+            )
             for att_id in sorted(id_set - matched_ids)
         ]
         return selected, unmatched
 
     def _pick_dest_name(
         self, safe: str, attachment_id: str, target_dir: Path, used_names: set[str], *, overwrite: bool
-    ) -> str | None:
-        """Chooses the basename this attachment writes to, or ``None`` if
-        both it and its id-suffixed fallback are already taken.
+    ) -> tuple[str | None, str | None]:
+        """Chooses the basename this attachment writes to, or ``(None,
+        reason)`` if both it and its id-suffixed fallback are already taken.
 
         ``used_names`` (names already claimed by an earlier attachment in
         THIS SAME ``download()`` call) always forces the fallback name,
         regardless of ``overwrite`` -- ``overwrite`` is about a file that
         pre-dates this call, not about two attachments selected together
         that happen to share a name, which must never collide with each
-        other either way.
+        other either way. The returned reason (when blocked) distinguishes
+        which of those two situations blocked each candidate name, rather
+        than a single message that can't tell a caller whether a re-run with
+        a clean directory would behave differently.
         """
         if safe not in used_names and (overwrite or not (target_dir / safe).exists()):
-            return safe
+            return safe, None
+        safe_reason = "claimed earlier in this same call" if safe in used_names else "already on disk"
         stem, suffix = Path(safe).stem, Path(safe).suffix
         candidate = f"{stem}-{attachment_id}{suffix}"
         if candidate in used_names:
-            return None
+            return None, (
+                f"'{safe}' ({safe_reason}) and '{candidate}' (claimed earlier in this "
+                "same call) are both already taken"
+            )
         if not overwrite and (target_dir / candidate).exists():
-            return None
-        return candidate
+            return None, (
+                f"'{safe}' ({safe_reason}) and '{candidate}' (already on disk) are both already taken"
+            )
+        return candidate, None
 
     async def _download_one(
         self, attachment: AttachmentMeta, target_dir: Path, *, overwrite: bool, used_names: set[str]
@@ -244,19 +317,45 @@ class JiraAttachmentClient:
         if not attachment.content_url:
             return _DownloadEntry(attachment.filename, "attachment has no content URL", "failed")
 
-        dest_name = self._pick_dest_name(safe, attachment.id, target_dir, used_names, overwrite=overwrite)
+        dest_name, blocked_reason = self._pick_dest_name(
+            safe, attachment.id, target_dir, used_names, overwrite=overwrite
+        )
         if dest_name is None:
-            fallback_name = f"{Path(safe).stem}-{attachment.id}{Path(safe).suffix}"
-            return _DownloadEntry(
-                attachment.filename, f"both '{safe}' and '{fallback_name}' already exist", "skipped"
-            )
+            assert blocked_reason is not None
+            return _DownloadEntry(attachment.filename, blocked_reason, "skipped")
         dest = target_dir / dest_name
-        # Streamed into a per-attachment scratch name first, never straight
-        # into `dest`: `overwrite=True` must not truncate an existing file
-        # before the download is known to have fully succeeded, and the
-        # attachment id keeps this unique across concurrent calls targeting
-        # the same dest.
-        part = target_dir / f"{dest.name}.{attachment.id}.part"
+
+        try:
+            result = await self._stream_to_dest(attachment, dest, target_dir, overwrite=overwrite)
+        except (OSError, httpx.HTTPError, ValueError) as exc:
+            # Belt: any per-file failure `_stream_to_dest`'s own steps didn't
+            # already shape into a clearer `_DownloadEntry` lands here instead
+            # of escaping `download()`'s loop and aborting every other
+            # attachment selected in the same call (the exact bug an
+            # unshaped `IsADirectoryError` from `os.replace` caused).
+            return _DownloadEntry(
+                attachment.filename, self._redact(f"{exc.__class__.__name__}: {exc}"), "failed"
+            )
+        if isinstance(result, DownloadedFile):
+            used_names.add(result.filename)
+        return result
+
+    async def _stream_to_dest(
+        self, attachment: AttachmentMeta, dest: Path, target_dir: Path, *, overwrite: bool
+    ) -> DownloadedFile | _DownloadEntry:
+        # A unique scratch file per CALL, not per attachment id: two
+        # concurrent `download()` calls selecting the SAME attachment id (or
+        # simply targeting the same `dest`) must never share one `.part`
+        # name, or one call's cleanup can unlink the file the other is still
+        # streaming into. `mkstemp` guarantees this (O_CREAT|O_EXCL under the
+        # hood) even when both calls race on the exact same `dest.name`.
+        try:
+            fd, part_name = tempfile.mkstemp(dir=str(target_dir), prefix=f".{dest.name}.", suffix=".part")
+        except OSError as exc:
+            return _DownloadEntry(
+                attachment.filename, f"could not create temp file: {exc.__class__.__name__}: {exc}", "failed"
+            )
+        part = Path(part_name)
 
         try:
             # Cloud's attachment `content` URL 302s to a pre-signed media-CDN
@@ -269,71 +368,89 @@ class JiraAttachmentClient:
                 try:
                     await self._raise_for_status(response, "GET", attachment.content_url)
                 except ToolError as exc:
+                    part.unlink(missing_ok=True)
                     return _DownloadEntry(attachment.filename, str(exc), "failed")
 
                 declared_size = self._parse_content_length(response.headers.get("content-length"))
                 if declared_size is not None and declared_size > self._max_bytes:
+                    part.unlink(missing_ok=True)
                     return _DownloadEntry(
                         attachment.filename,
                         f"reported size {declared_size} bytes exceeds max_bytes {self._max_bytes}",
                         "failed",
                     )
 
-                try:
-                    handle = open(part, "wb")
-                except OSError as exc:
-                    return _DownloadEntry(
-                        attachment.filename,
-                        f"could not create temp file: {exc.__class__.__name__}: {exc}",
-                        "failed",
-                    )
-
                 written = 0
-                try:
-                    async for chunk in response.aiter_bytes(65536):
-                        written += len(chunk)
-                        if written > self._max_bytes:
-                            raise _AttachmentTooLarge
-                        handle.write(chunk)
-                except _AttachmentTooLarge:
-                    handle.close()
-                    part.unlink(missing_ok=True)
-                    return _DownloadEntry(
-                        attachment.filename,
-                        f"exceeded max_bytes {self._max_bytes} while streaming",
-                        "failed",
-                    )
-                except BaseException:
-                    handle.close()
-                    part.unlink(missing_ok=True)
-                    raise
-                else:
-                    handle.close()
+                with os.fdopen(fd, "wb") as handle:
+                    try:
+                        async for chunk in response.aiter_bytes(65536):
+                            written += len(chunk)
+                            if written > self._max_bytes:
+                                raise _AttachmentTooLarge
+                            handle.write(chunk)
+                    except _AttachmentTooLarge:
+                        part.unlink(missing_ok=True)
+                        return _DownloadEntry(
+                            attachment.filename,
+                            f"exceeded max_bytes {self._max_bytes} while streaming",
+                            "failed",
+                        )
+                    except BaseException:
+                        # Covers cancellation too (e.g. the caller's timeout
+                        # firing mid-stream): the partial file must never be
+                        # left behind under its scratch name.
+                        part.unlink(missing_ok=True)
+                        raise
         except httpx.HTTPError as exc:
             # A transport-level failure (connect/read timeout, dropped
-            # connection, ...), not a Jira-returned error status -- shape it
-            # the same way rather than letting it escape as a raw httpx
-            # exception. `dest` was never touched (only `part` may exist,
-            # cleaned up by the streaming loop above or, if the failure was
-            # before opening `part`, never created).
+            # connection, a mid-stream ReadError, ...), not a Jira-returned
+            # error status -- shape it the same way rather than letting it
+            # escape as a raw httpx exception. `dest` was never touched (only
+            # `part` may exist, cleaned up above or, if the failure was
+            # before `part` was even created, never created).
             part.unlink(missing_ok=True)
             return _DownloadEntry(attachment.filename, f"{exc.__class__.__name__}: {exc}", "failed")
 
+        return self._finalize(attachment, part, dest, overwrite=overwrite, written=written)
+
+    def _finalize(
+        self, attachment: AttachmentMeta, part: Path, dest: Path, *, overwrite: bool, written: int
+    ) -> DownloadedFile | _DownloadEntry:
+        """Publishes the fully-streamed ``part`` scratch file to ``dest``.
+
+        ``part`` is unlinked in every case: ``os.replace`` already consumes
+        its name, ``os.link`` leaves it behind as a redundant second name to
+        the same content, and the copy fallback below removes it explicitly
+        too -- either way, nothing should ever be left under a `.part` name
+        once this returns.
+        """
         try:
             if overwrite:
-                os.replace(part, dest)
+                try:
+                    os.replace(part, dest)
+                except IsADirectoryError:
+                    return _DownloadEntry(attachment.filename, "destination is a directory", "failed")
             else:
                 try:
                     os.link(part, dest)
                 except FileExistsError:
                     return _DownloadEntry(attachment.filename, f"'{dest.name}' already exists", "skipped")
+                except OSError as exc:
+                    if exc.errno not in _LINK_UNSUPPORTED_ERRNOS:
+                        raise
+                    try:
+                        self._copy_part_to_dest(part, dest)
+                    except FileExistsError:
+                        return _DownloadEntry(attachment.filename, f"'{dest.name}' already exists", "skipped")
+        except OSError as exc:
+            return _DownloadEntry(
+                attachment.filename,
+                self._redact(f"could not finalize download: {exc.__class__.__name__}: {exc}"),
+                "failed",
+            )
         finally:
-            # `os.replace` already consumed `part`'s name; `os.link` leaves it
-            # behind as a redundant second name to the same content -- either
-            # way, cleaned up unconditionally (a no-op if already gone).
             part.unlink(missing_ok=True)
 
-        used_names.add(dest.name)
         return DownloadedFile(
             attachment_id=attachment.id,
             filename=dest.name,
@@ -342,6 +459,20 @@ class JiraAttachmentClient:
             size=written,
             mime_type=attachment.mime_type,
         )
+
+    @staticmethod
+    def _copy_part_to_dest(part: Path, dest: Path) -> None:
+        """Used when ``os.link`` isn't supported at all between ``part`` and
+        ``dest`` (different filesystems, or a filesystem/OS that never
+        supports hard links) -- copies the streamed bytes into a freshly
+        created ``dest`` instead. Still ``O_EXCL``, so a same-named file that
+        appeared on disk after ``_pick_dest_name`` checked (but before this
+        runs) still isn't silently clobbered: it raises ``FileExistsError``,
+        which the caller in ``_finalize`` turns into the same "already
+        exists" skipped entry as the ordinary ``os.link`` collision case."""
+        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "wb") as dest_handle, open(part, "rb") as part_handle:
+            shutil.copyfileobj(part_handle, dest_handle)
 
     @staticmethod
     def _parse_content_length(raw: str | None) -> int | None:
