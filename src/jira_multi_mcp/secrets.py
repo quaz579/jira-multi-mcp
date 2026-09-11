@@ -124,7 +124,10 @@ class RedactingFilter(logging.Filter):
         ``self.args`` is non-empty.
         """
         safe_args = self._redact_args(record.args)
-        raw_msg = str(record.msg)
+        try:
+            raw_msg = str(record.msg)
+        except Exception:
+            raw_msg = f"<unrenderable {record.msg.__class__.__name__}>"
         if self._values:
             raw_msg = _redact_with_values(raw_msg, self._values)
         record.msg = f"[log-format-error] {raw_msg} args={safe_args!r}"
@@ -142,7 +145,10 @@ class RedactingFilter(logging.Filter):
     def _redact_one(self, value: Any) -> Any:
         if isinstance(value, str):
             return _redact_with_values(value, self._values)
-        text = repr(value)
+        try:
+            text = repr(value)
+        except Exception:
+            return value
         redacted = _redact_with_values(text, self._values)
         return redacted if redacted != text else value
 

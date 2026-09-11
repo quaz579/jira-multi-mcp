@@ -100,6 +100,7 @@ _SUFFIX_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("_USERNAME", "username", "str"),
     ("_READ_ONLY", "read_only", "bool"),
     ("_ENABLED_TOOLS", "enabled_tools", "list"),
+    ("_PROJECTS_FILTER", "projects_filter", "list"),
 )
 # Sorted longest-suffix-first so a future field whose suffix is a substring of
 # another's can never be matched by the wrong (shorter) entry.

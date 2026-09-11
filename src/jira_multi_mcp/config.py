@@ -207,6 +207,7 @@ def _parse_site(name: str, fields: dict[str, Any], defaults: Defaults) -> SiteCo
     username = fields.get("username", defaults.username)
     read_only = bool(fields.get("read_only", False))
     enabled_tools = _parse_enabled_tools(name, fields.get("enabled_tools"), defaults.toolset_preset)
+    projects_filter = _parse_projects_filter(name, fields.get("projects_filter"))
 
     api_token, api_token_env = _split_token_fields(fields, "api_token", site_label=f"site '{name}'")
     personal_token, personal_token_env = _split_token_fields(
@@ -258,6 +259,7 @@ def _parse_site(name: str, fields: dict[str, Any], defaults: Defaults) -> SiteCo
         personal_token_env=resolved_personal_token_env,
         read_only=read_only,
         enabled_tools=enabled_tools,
+        projects_filter=projects_filter,
     )
 
 
@@ -310,6 +312,19 @@ def _parse_enabled_tools(site_name: str, raw_tools: Any, toolset_preset: str) ->
                 f"{', '.join(sorted(not_jira))}"
             )
     return tools
+
+
+def _parse_projects_filter(site_name: str, raw_value: Any) -> tuple[str, ...] | None:
+    """Upstream's static ``JIRA_PROJECTS_FILTER`` (restricts which projects the
+    child's search/browse tools see at all) — distinct from a tool call's own
+    ``projects_filter`` argument, which only affects site *routing*."""
+    if raw_value is None:
+        return None
+    if not isinstance(raw_value, list) or not all(isinstance(item, str) and item for item in raw_value):
+        raise ConfigError(f"site '{site_name}': 'projects_filter' must be a list of non-empty strings")
+    if not raw_value:
+        raise ConfigError(f"site '{site_name}': 'projects_filter' must not be empty when set")
+    return tuple(raw_value)
 
 
 def _resolve_token(

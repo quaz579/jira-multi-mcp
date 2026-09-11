@@ -18,8 +18,12 @@ def test_curated_tools_are_all_jira_prefixed() -> None:
     assert all(name.startswith("jira_") for name in CURATED_TOOLS)
 
 
-def test_wrapper_owned_tools_are_a_subset_of_curated() -> None:
-    assert WRAPPER_OWNED_TOOLS <= CURATED_TOOLS
+def test_wrapper_owned_tools_shadowing_an_upstream_tool_are_curated() -> None:
+    # "jira_sites" is wrapper-only and was never an upstream tool name, so it
+    # isn't (and shouldn't be) in CURATED_TOOLS; every WRAPPER_OWNED_TOOLS
+    # entry that DOES shadow a real upstream tool must still be curated.
+    assert (WRAPPER_OWNED_TOOLS - {"jira_sites"}) <= CURATED_TOOLS
+    assert "jira_sites" not in CURATED_TOOLS
 
 
 def test_jql_is_never_a_routing_argument() -> None:
