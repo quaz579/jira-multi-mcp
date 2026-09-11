@@ -51,7 +51,7 @@ def _attachment(att_id: str, filename: str) -> dict[str, object]:
         "size": 0,
         "mimeType": "text/plain",
         "created": "2026-09-10T12:00:00.000+0000",
-        "author": {"displayName": "Ben Grossman"},
+        "author": {"displayName": "Example User"},
         "content": f"https://acme.atlassian.net/rest/api/3/attachment/content/{att_id}",
     }
 

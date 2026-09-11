@@ -138,7 +138,7 @@ class MultiSiteProxyTool(Tool):
         # `read_only` branch. `read_only` enforcement for a mirrored call
         # stays entirely the child's job (READ_ONLY_MODE) plus the existing
         # post-hoc hint appended below on a child error -- verified against
-        # the real site that every CURATED read tool sets
+        # a live Jira Cloud site that every CURATED read tool sets
         # `readOnlyHint=True` explicitly, but the "all" toolset preset can
         # mirror uncurated (e.g. agile/board) tools whose annotations aren't
         # verified, and pre-emptively refusing those here on a read_only site

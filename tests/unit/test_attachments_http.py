@@ -68,7 +68,7 @@ async def test_list_attachments_parses_fields(http_client: httpx.AsyncClient) ->
                             "size": 42,
                             "mimeType": "text/plain",
                             "created": "2026-09-10T12:00:00.000+0000",
-                            "author": {"displayName": "Ben Grossman"},
+                            "author": {"displayName": "Example User"},
                             "content": "https://acme.atlassian.net/rest/api/3/attachment/content/10001",
                         }
                     ]
@@ -86,7 +86,7 @@ async def test_list_attachments_parses_fields(http_client: httpx.AsyncClient) ->
     assert a.size == 42
     assert a.mime_type == "text/plain"
     assert a.created == "2026-09-10T12:00:00.000+0000"
-    assert a.author == "Ben Grossman"
+    assert a.author == "Example User"
     assert a.content_url == "https://acme.atlassian.net/rest/api/3/attachment/content/10001"
 
 
@@ -110,7 +110,7 @@ async def test_download_follows_cross_host_redirect_and_writes_bytes(
                             "size": 5,
                             "mimeType": "text/plain",
                             "created": "2026-09-10T12:00:00.000+0000",
-                            "author": {"displayName": "Ben Grossman"},
+                            "author": {"displayName": "Example User"},
                             "content": content_url,
                         }
                     ]
@@ -152,7 +152,7 @@ async def test_upload_sends_multipart_with_no_check_header(
                     "size": 11,
                     "mimeType": "text/plain",
                     "created": "2026-09-10T12:00:00.000+0000",
-                    "author": {"displayName": "Ben Grossman"},
+                    "author": {"displayName": "Example User"},
                     "content": "https://acme.atlassian.net/rest/api/3/attachment/content/20002",
                 }
             ],
@@ -262,7 +262,7 @@ async def test_transport_error_during_download_is_redacted_and_stripped_of_url_q
                             "size": 5,
                             "mimeType": "text/plain",
                             "created": "2026-09-10T12:00:00.000+0000",
-                            "author": {"displayName": "Ben Grossman"},
+                            "author": {"displayName": "Example User"},
                             "content": content_url,
                         }
                     ]

@@ -69,7 +69,7 @@ async def test_jira_list_attachments_infers_site_from_issue_key(client: Client[F
                             "size": 1,
                             "mimeType": "text/plain",
                             "created": "2026-01-01T00:00:00.000+0000",
-                            "author": {"displayName": "Ben"},
+                            "author": {"displayName": "Example User"},
                             "content": "https://acme.atlassian.net/rest/api/3/attachment/content/1",
                         }
                     ]
@@ -155,7 +155,7 @@ async def test_jira_download_attachments_writes_to_disk_and_returns_paths(
                             "size": 3,
                             "mimeType": "image/png",
                             "created": "2026-01-01T00:00:00.000+0000",
-                            "author": {"displayName": "Ben"},
+                            "author": {"displayName": "Example User"},
                             "content": "https://acme.atlassian.net/rest/api/3/attachment/content/5",
                         }
                     ]
