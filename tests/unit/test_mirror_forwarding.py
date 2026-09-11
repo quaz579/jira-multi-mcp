@@ -623,7 +623,11 @@ async def test_call_timeout_bounds_a_slow_client_for_not_just_the_call(tmp_path:
     """The MEDIUM finding: ``client_for`` (and any recovery it triggers) now
     runs INSIDE ``anyio.fail_after(self.timeout)``, not before it -- proves a
     slow/hung ``client_for`` is bounded by the tool's own call timeout rather
-    than running for free ahead of it."""
+    than running for free ahead of it. ``mark_timeout`` is NOT called here:
+    ``client_for`` never returned a client (no call was ever actually made),
+    so there's nothing for `mark_timeout` to attribute to a real call --
+    the real `ChildManager`'s own recovery-cancellation handling (see
+    `children.py`) already records the failure with a more specific reason."""
     registry = SiteRegistry([_site("acme", "ACME")])
     manager = _SlowClientForManagerSpy(tmp_path / "acme.log")
     mcp_tool = mcp_types.Tool(
@@ -635,7 +639,7 @@ async def test_call_timeout_bounds_a_slow_client_for_not_just_the_call(tmp_path:
     with pytest.raises(ToolError, match="timed out"):
         await tool.run({"issue_key": "ACME-1"})
 
-    assert manager.timeouts == ["acme"]
+    assert manager.timeouts == []
 
 
 class _RecoveringChildManagerSpy:

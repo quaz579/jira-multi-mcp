@@ -887,6 +887,9 @@ async def test_recovery_interrupted_by_the_callers_own_timeout_still_marks_the_s
         assert isinstance(next_retry_at, float)
         assert next_retry_at > before  # not left stuck in the past
         assert not manager._handles["acme"].recovery_lock.locked()  # noqa: SLF001 - whitebox
+        # A cancelled exception stringifies to "" -- a fixed, actually
+        # informative reason instead of the useless "CancelledError: ".
+        assert health["acme"]["last_error"] == "recovery interrupted by the caller's call timeout"
 
 
 async def test_aclose_logs_shutting_down_only_once_across_repeated_calls(

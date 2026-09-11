@@ -598,9 +598,13 @@ class ChildManager:
                 await self._probe_liveness(client)
             timed_out = scope.cancelled_caught
         except (Exception, cancelled_exc) as exc:  # noqa: BLE001 - one site's failed recovery must not raise
-            self._fail_recovery(handle, self.redact(f"{exc.__class__.__name__}: {exc}"))
             if isinstance(exc, cancelled_exc):
+                # `str(a_cancelled_exception)` is empty, so `self.redact(f"...: {exc}")`
+                # below would render as e.g. "CancelledError: " -- a fixed,
+                # actually-informative reason instead.
+                self._fail_recovery(handle, "recovery interrupted by the caller's call timeout")
                 raise
+            self._fail_recovery(handle, self.redact(f"{exc.__class__.__name__}: {exc}"))
             return
 
         if timed_out:

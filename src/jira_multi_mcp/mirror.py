@@ -165,17 +165,23 @@ class MultiSiteProxyTool(Tool):
             # no-op if a recovery has ALREADY replaced this handle's client
             # by the time this call fails -- otherwise a slow, stale
             # in-flight call could clobber a newer, healthy client's state.
-            # `None` (never set, if `client_for` itself is what failed)
-            # means "unconditional", matching the pre-generation behavior.
+            # Stays `None` if `client_for` itself is what the timeout/failure
+            # hit (recovery still in flight, no client obtained yet) -- in
+            # that case `_attempt_recovery` has already recorded its own,
+            # more specific failure reason, so `run` must NOT also call
+            # `mark_timeout`/`mark_failed` here: doing so would overwrite
+            # that reason and, for a timeout, inflate the site's consecutive-
+            # timeout counter for a call that was never actually made.
             generation: int | None = None
             with anyio.fail_after(self.timeout):
                 client = await self._manager.client_for(site.name)
                 generation = self._manager.generation(site.name)
                 result = await client.call_tool_mcp(self.name, args)
         except TimeoutError as exc:
-            self._manager.mark_timeout(
-                site.name, f"{self.name} timed out after {self.timeout}s", generation=generation
-            )
+            if generation is not None:
+                self._manager.mark_timeout(
+                    site.name, f"{self.name} timed out after {self.timeout}s", generation=generation
+                )
             raise ToolError(
                 f"[site={site.name}] {self.name} timed out after {self.timeout}s. Child log: {log_path}"
             ) from exc
