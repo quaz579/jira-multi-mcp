@@ -6,6 +6,7 @@ is orphaned. Also covers the watchdog's exit-code fidelity (M2r2 item 5)."""
 
 from __future__ import annotations
 
+import os
 import signal
 import subprocess
 import sys
@@ -74,6 +75,32 @@ def _pid_alive(pid: int) -> bool:
     except ProcessLookupError:
         return False
     return True
+
+
+def _cpu_seconds(pid: int) -> float:
+    """Total user+system CPU time consumed by ``pid`` so far, in seconds.
+
+    Absolute value is meaningless (interpreter startup + `import fastmcp`
+    alone can cost several tenths of a second) -- only a delta across a
+    window is ever compared. Prefers ``/proc`` (CI is ubuntu-only, per
+    ``.github/workflows/ci.yaml``): ``ps -o time`` on Linux reports whole
+    seconds, too coarse for this comparison. The macOS/BSD `ps -o time=`
+    fallback is only for running this test locally.
+    """
+    if os.path.exists("/proc"):
+        with open(f"/proc/{pid}/stat") as f:
+            # `comm` (field 2) can itself contain spaces/parens; splitting
+            # on the LAST ')' skips past it before counting fields.
+            after_comm = f.read().rsplit(")", 1)[1].split()
+        utime, stime = int(after_comm[11]), int(after_comm[12])  # fields 14, 15
+        return (utime + stime) / os.sysconf("SC_CLK_TCK")
+    out = subprocess.run(
+        ["ps", "-o", "time=", "-p", str(pid)], capture_output=True, text=True, check=True
+    ).stdout.strip()
+    seconds = 0.0
+    for part in out.split(":"):
+        seconds = seconds * 60 + float(part)
+    return seconds
 
 
 def test_sigterm_during_startup_does_not_orphan_the_spawned_child(tmp_path: Path) -> None:
@@ -243,6 +270,56 @@ def test_stdin_eof_still_detected_after_the_client_already_wrote_bytes(tmp_path:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+
+def test_stdin_watcher_does_not_busy_spin_the_cpu_during_a_hanging_connect(tmp_path: Path) -> None:
+    """The HIGH finding: a real MCP client writes its `initialize` request
+    immediately on spawn and keeps stdin open while a slow/hanging upstream
+    connect is in flight. `poller.poll(250)` is level-triggered on those
+    queued-but-unread bytes, so without a sleep between polls the watcher
+    thread pins a full CPU core for the entire startup window (measured
+    ~1 CPU-second per wall second before this fix; ~0.02-0.05 after)."""
+    pid_file = tmp_path / "child.pid"
+    upstream_script = _write_hanging_upstream_script(tmp_path)
+    config_path = _write_config(tmp_path, command=[sys.executable, str(upstream_script), str(pid_file)])
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from jira_multi_mcp.cli import main; sys.exit(main())",
+            "--config",
+            str(config_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_file(pid_file, timeout=15.0)
+        assert proc.stdin is not None
+        proc.stdin.write('{"jsonrpc": "2.0", "method": "initialize"}\n')
+        proc.stdin.flush()
+
+        # Let the watcher settle into steady state, then measure a CPU-time
+        # delta (not an absolute value) across a window entirely inside the
+        # 30s connect_timeout the hanging upstream never satisfies.
+        time.sleep(1.0)
+        cpu_at_1s = _cpu_seconds(proc.pid)
+        time.sleep(2.0)
+        cpu_at_3s = _cpu_seconds(proc.pid)
+
+        delta = cpu_at_3s - cpu_at_1s
+        assert delta < 1.0, (
+            f"parent burned {delta:.2f} CPU-seconds over a 2s window with a hung connect and "
+            "stdin's 'initialize' bytes still queued -- stdin-EOF watcher busy-spin regression"
+        )
+    finally:
+        if proc.stdin is not None:
+            proc.stdin.close()
+        proc.kill()
+        proc.wait(timeout=5)
 
 
 def _write_real_fastmcp_upstream_script(tmp_path: Path) -> Path:

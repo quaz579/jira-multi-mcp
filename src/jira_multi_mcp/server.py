@@ -10,6 +10,7 @@ import logging
 import os
 import select
 import signal
+import stat
 import threading
 from collections.abc import Sequence
 from contextlib import AsyncExitStack
@@ -259,6 +260,26 @@ async def _cancel_on_shutdown_signal(
 _STDIN_WATCH_POLL_MS = 250
 
 
+def _stdin_is_watchable() -> bool:
+    """Whether fd 0 can ever report EOF via ``poll()``'s POLLHUP.
+
+    Only a pipe or a socket's write end closing sets POLLHUP; a TTY, a
+    regular file, or ``/dev/null`` are all POLLIN-readable (or writable)
+    forever, so registering them would make ``_stdin_hit_eof_blocking``
+    poll in a tight loop for the entire startup window with nothing ever
+    unblocking it early -- confirmed empirically on macOS. ``select.poll``
+    itself is POSIX-only (absent on Windows); its absence is treated the
+    same as "can't watch this fd".
+    """
+    if not hasattr(select, "poll"):
+        return False
+    try:
+        mode = os.fstat(0).st_mode
+    except OSError:
+        return False
+    return stat.S_ISFIFO(mode) or stat.S_ISSOCK(mode)
+
+
 def _stdin_hit_eof_blocking(stop_event: threading.Event) -> bool:
     """Runs in a background thread for the whole startup window: True only
     if fd 0's write end closed (the client gave up); False if told to stop.
@@ -273,6 +294,14 @@ def _stdin_hit_eof_blocking(stop_event: threading.Event) -> bool:
     ``initialize``-sized payload still buffered). Never calls ``os.read``:
     those queued bytes belong to ``run_stdio_async``'s eventual real reader,
     not to this watcher.
+
+    A bare ``poll()`` loop would busy-spin a full CPU core for the whole
+    startup window: POLLIN is level-triggered, so once the client's
+    ``initialize`` bytes are queued, every immediate re-poll returns instantly
+    with the same POLLIN-no-HUP result (measured ~1 CPU-second per wall
+    second). Waiting out the rest of the interval on ``stop_event`` between
+    polls fixes that while still noticing both a real HUP and ``stop_event``
+    being set within one interval.
     """
     poller = select.poll()
     poller.register(0, select.POLLIN)
@@ -286,6 +315,10 @@ def _stdin_hit_eof_blocking(stop_event: threading.Event) -> bool:
                 return False
             # POLLIN with no HUP/ERR: the client's own bytes are queued,
             # untouched, for the real reader to pick up once startup ends.
+            # Wait out the rest of the interval instead of re-polling
+            # immediately -- interruptible so `stop_event.set()` is still
+            # noticed promptly.
+            stop_event.wait(_STDIN_WATCH_POLL_MS / 1000)
     return False
 
 
@@ -298,6 +331,9 @@ async def _watch_stdin_for_eof(
     task_status: anyio.abc.TaskStatus[None] = anyio.TASK_STATUS_IGNORED,
 ) -> None:
     task_status.started()
+    if not _stdin_is_watchable():
+        _logger.debug("fd 0 is not a pipe/socket (or select.poll is unavailable); skipping the EOF watcher")
+        return
     hit_eof = await anyio.to_thread.run_sync(_stdin_hit_eof_blocking, stop_event, abandon_on_cancel=True)
     if not hit_eof:
         return
