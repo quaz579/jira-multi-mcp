@@ -182,6 +182,37 @@ def test_warm_uses_a_minimal_explicit_env(tmp_path: Path, monkeypatch: pytest.Mo
     assert captured_timeout == [45.0]
 
 
+def test_warm_stdin_is_devnull(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An upstream that doesn't recognize the trailing `--help` could start
+    serving MCP on inherited stdin -- the live pipe this process itself
+    would otherwise use to talk to a client -- and eat a real request. Also
+    proved end to end with a real subprocess in the adversarial-loop real
+    run (pytest's own default stdin redirection makes an in-process
+    behavioral assertion here unreliable)."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(
+        """
+        [[sites]]
+        name = "acme"
+        url = "https://acme.atlassian.net"
+        key_prefixes = ["ACME"]
+        personal_token = "token"
+        """
+    )
+    captured_stdin: list[object] = []
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        captured_stdin.append(kwargs.get("stdin"))
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    exit_code = main(["--warm", "--config", str(config_path)])
+
+    assert exit_code == 0
+    assert captured_stdin == [subprocess.DEVNULL]
+
+
 def test_warm_timeout_is_reported_not_raised(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     config_path = tmp_path / "config.toml"
     config_path.write_text(

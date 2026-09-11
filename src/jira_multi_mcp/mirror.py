@@ -131,6 +131,7 @@ class MultiSiteProxyTool(Tool):
             with anyio.fail_after(self.timeout):
                 result = await client.call_tool_mcp(self.name, args)
         except TimeoutError as exc:
+            self._manager.mark_timeout(site.name, f"{self.name} timed out after {self.timeout}s")
             raise ToolError(
                 f"[site={site.name}] {self.name} timed out after {self.timeout}s. Child log: {log_path}"
             ) from exc
@@ -147,12 +148,23 @@ class MultiSiteProxyTool(Tool):
                 f"[site={site.name}] {self.name} failed: {redacted}. Child log: {log_path}"
             ) from exc
 
+        # The child answered -- whether the tool itself errored or not, the
+        # round trip completed, so any earlier consecutive-timeout streak is
+        # over.
+        self._manager.mark_success(site.name)
+
         if result.is_error:
             text = "\n".join(
                 block.text for block in result.content if isinstance(block, mcp_types.TextContent)
             )
+            text = self._manager.redact(text)
             hint = ""
-            if site.read_only and self.annotations is not None and self.annotations.read_only_hint is False:
+            # Most upstream write tools set NO readOnlyHint at all (verified
+            # against mcp-atlassian 0.23.1: 23 of 25), so treating that as
+            # "known read-only" left the hint dead for nearly every write
+            # tool. Only a tool the child explicitly marked readOnlyHint=True
+            # is exempt.
+            if site.read_only and (self.annotations is None or self.annotations.read_only_hint is not True):
                 hint = f" (site '{site.name}' is configured read_only = true)"
             raise ToolError(f"[site={site.name}] {text}{hint}")
 

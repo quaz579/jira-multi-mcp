@@ -24,7 +24,13 @@ from jira_multi_mcp.tools_meta import CURATED_TOOLS, WRAPPER_OWNED_TOOLS
 from jira_multi_mcp.wrapper_tools import build_jira_sites_tool
 from tests.fakes.fake_child import make_fake_child
 
-_ALLOWLIST = CURATED_TOOLS | {"jira_boom", "jira_slow", "jira_write_blocked"}
+_ALLOWLIST = CURATED_TOOLS | {
+    "jira_boom",
+    "jira_slow",
+    "jira_write_blocked",
+    "jira_destructive_only",
+    "jira_get_issue_or_404",
+}
 _TIMEOUT = 1.0
 
 _Rig = tuple[Client[ClientTransport], ChildManager, SiteRegistry]
@@ -169,6 +175,81 @@ async def test_read_only_hint_is_absent_for_a_non_read_only_site(rig: _Rig) -> N
     assert "read_only" not in _text(result)
 
 
+async def test_read_only_hint_is_appended_for_a_write_tool_with_no_annotations(rig: _Rig) -> None:
+    """The real-world case: 23 of 25 upstream write tools (mcp-atlassian
+    0.23.1) set no annotations at all, so `annotations` is None, not a
+    readOnlyHint of False -- the hint must still fire for these."""
+    client, _, _ = rig
+    result = await client.call_tool_mcp(
+        "jira_add_comment", {"issue_key": "BETA-1", "body": "hi", "site": "beta"}
+    )
+    assert result.is_error is True
+    assert "[site=beta]" in _text(result)
+    assert "read_only = true" in _text(result)
+
+
+async def test_read_only_hint_is_appended_for_a_destructive_only_tool(rig: _Rig) -> None:
+    """A tool that sets only destructiveHint leaves read_only_hint at its
+    default None (never False) -- must not be mistaken for "known read-only"."""
+    client, _, _ = rig
+    result = await client.call_tool_mcp("jira_destructive_only", {"issue_key": "BETA-1", "site": "beta"})
+    assert result.is_error is True
+    assert "read_only = true" in _text(result)
+
+
+async def test_read_only_hint_is_absent_for_a_declared_read_only_tool(rig: _Rig) -> None:
+    """A tool the child explicitly marked readOnlyHint=True (e.g. real
+    jira_get_issue) failing for an unrelated reason (not-found) must not get
+    the read-only-site hint tacked on."""
+    client, _, _ = rig
+    result = await client.call_tool_mcp(
+        "jira_get_issue_or_404", {"issue_key": "BETA-99999999", "site": "beta"}
+    )
+    assert result.is_error is True
+    assert "does not exist" in _text(result)
+    assert "read_only" not in _text(result)
+
+
+async def test_child_is_error_text_is_redacted(tmp_path: Path) -> None:
+    """A child's `isError` body reaching the model unredacted (as opposed to
+    the exception path in the `except` branch above) would leak a credential
+    the child happened to echo back -- e.g. in a malformed-auth error body."""
+    secret = "zz-unique-secret-zz"
+    registry = SiteRegistry(
+        [
+            SiteConfig(
+                name="acme",
+                url="https://acme.atlassian.net",
+                key_prefixes=("ACME",),
+                username="bgrossman@jumpmind.com",
+                api_token=Secret(secret),
+            )
+        ]
+    )
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(),
+        tmp_path,
+        transport_factory=lambda site, up: FastMCPTransport(make_fake_child(site.name, leak_secret=secret)),
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        tools = await manager.discover_tools()
+        mirrored = build_mirrored_tools(
+            tools, manager, registry, _ALLOWLIST | {"jira_leaky"}, timeout=_TIMEOUT
+        )
+        parent = FastMCP("test-parent")
+        for tool in mirrored:
+            parent.add_tool(tool)
+        async with Client(FastMCPTransport(parent)) as client:
+            result = await client.call_tool_mcp("jira_leaky", {"site": "acme"})
+            assert result.is_error is True
+            text = _text(result)
+            assert secret not in text
+            assert "***" in text
+
+
 async def test_timeout_message_names_site_tool_and_log_path(rig: _Rig) -> None:
     client, manager, _ = rig
     result = await client.call_tool_mcp("jira_slow", {"site": "acme"})
@@ -279,6 +360,12 @@ class _DeadChildManager:
     def mark_failed(self, site_name: str, reason: str) -> None:
         self.marked_failed.append(site_name)
 
+    def mark_timeout(self, site_name: str, reason: str) -> None:
+        pass
+
+    def mark_success(self, site_name: str) -> None:
+        pass
+
 
 async def test_non_timeout_child_failure_is_shaped_like_a_site_error(tmp_path: Path) -> None:
     registry = SiteRegistry([_site("acme", "ACME")])
@@ -335,6 +422,55 @@ async def test_connection_level_failure_marks_the_site_failed(tmp_path: Path) ->
         await tool.run({"issue_key": "ACME-1"})
 
     assert manager.marked_failed == ["acme"]
+
+
+class _HangingClient:
+    async def call_tool_mcp(self, name: str, arguments: dict[str, object]) -> mcp_types.CallToolResult:
+        await anyio.sleep(3600)
+        raise AssertionError("unreachable")
+
+
+class _HangingChildManagerSpy:
+    """Stands in for a manager whose child never answers -- exercises the
+    `except TimeoutError` branch in isolation, independent of `_DeadChildManager`
+    (which models a BROKEN connection, a different failure shape)."""
+
+    def __init__(self, log_path: Path) -> None:
+        self._log_path = log_path
+        self.timeouts: list[str] = []
+
+    async def client_for(self, site_name: str) -> _HangingClient:
+        return _HangingClient()
+
+    def log_path(self, site_name: str) -> Path:
+        return self._log_path
+
+    def redact(self, text: str) -> str:
+        return text
+
+    def mark_failed(self, site_name: str, reason: str) -> None:
+        pass
+
+    def mark_timeout(self, site_name: str, reason: str) -> None:
+        self.timeouts.append(site_name)
+
+    def mark_success(self, site_name: str) -> None:
+        pass
+
+
+async def test_call_timeout_records_a_mark_timeout_call(tmp_path: Path) -> None:
+    registry = SiteRegistry([_site("acme", "ACME")])
+    manager = _HangingChildManagerSpy(tmp_path / "acme.log")
+    mcp_tool = mcp_types.Tool(
+        name="jira_get_issue",
+        input_schema={"type": "object", "properties": {"issue_key": {"type": "string"}}},
+    )
+    tool = MultiSiteProxyTool.from_mcp_tool(manager, registry, mcp_tool, timeout=0.01)  # type: ignore[arg-type]
+
+    with pytest.raises(ToolError, match="timed out"):
+        await tool.run({"issue_key": "ACME-1"})
+
+    assert manager.timeouts == ["acme"]
 
 
 async def test_generic_application_failure_does_not_mark_the_site_failed(tmp_path: Path) -> None:

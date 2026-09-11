@@ -166,6 +166,13 @@ class ChildHandle:
     fastmcp_server_version: str | None = None
     last_error: str | None = None
     last_error_at: float | None = None
+    timeouts: int = 0
+
+
+# A single slow call against an otherwise-healthy child shouldn't take the
+# whole site down; only a run of these in a row (no successful call in
+# between) is treated as evidence the child itself is stuck.
+_MAX_CONSECUTIVE_TIMEOUTS = 3
 
 
 class ChildManager:
@@ -244,33 +251,50 @@ class ChildManager:
         handle = self._handles[site.name]
         transport: ClientTransport | None = None
         entered = False
+        timed_out = False
         try:
-            transport = self._transport_factory(site, self._upstream)
-            client: Client[ClientTransport] = Client(transport)
-            with anyio.fail_after(connect_timeout):
+            with anyio.move_on_after(connect_timeout) as scope:
+                transport = self._transport_factory(site, self._upstream)
+                client: Client[ClientTransport] = Client(transport)
+                # Assigned BEFORE the session is entered (not after): a
+                # cancellation landing mid-connect is already handled by
+                # fastmcp's own `Client._connect()` (its CancelledError
+                # handler closes the transport regardless of whether we ever
+                # held a reference), so this reorder isn't what prevents that
+                # orphan -- server.py's cancel-before-close signal ordering
+                # is (see its module docstring). This is defensive in a
+                # different way: a handle that failed or aborted after the
+                # transport/process was created stays reachable by
+                # `ChildManager.aclose()` instead of only a handle that fully
+                # connected. `Client.close()` on a never-entered client is a
+                # safe no-op (verified empirically), so this costs nothing on
+                # the ordinary failure paths below. Losing the reference here
+                # (the M2r1 HIGH finding) is also exactly what let a child
+                # whose probe fails after connecting leak for the rest of the
+                # process's life.
+                handle.client = client
                 await stack.enter_async_context(client)
                 entered = True
-                # Keep the reference as soon as the session is entered, even
-                # if the liveness probe below fails: the child process is
-                # already running at this point, and only ChildManager.aclose()
-                # (via this handle's client) will ever ask it to stop. Losing
-                # the reference here is exactly the M2r1 HIGH finding: a child
-                # whose probe fails after connecting used to leak for the rest
-                # of the process's life.
-                handle.client = client
                 await self._probe_liveness(client)
-        except TimeoutError:
+            # `move_on_after` (not `fail_after`) so a plain `TimeoutError` an
+            # underlying library raises for its own OS-level reason (e.g. a
+            # real ETIMEDOUT that happens to fire before our deadline) isn't
+            # mistaken for OUR deadline expiring: only `cancelled_caught`
+            # means this cancel scope's own timer fired.
+            timed_out = scope.cancelled_caught
+        except Exception as exc:  # noqa: BLE001 - isolate one site's failure from the rest
             handle.state = "failed"
-            handle.error = f"connect timed out after {connect_timeout}s"
+            handle.error = self.redact(f"{exc.__class__.__name__}: {exc}")
             _logger.warning(
                 "site '%s' failed to start: %s (see %s)", site.name, handle.error, handle.log_path
             )
             if not entered:
                 _close_leaked_log_file(transport)
             return
-        except Exception as exc:  # noqa: BLE001 - isolate one site's failure from the rest
+
+        if timed_out:
             handle.state = "failed"
-            handle.error = self.redact(f"{exc.__class__.__name__}: {exc}")
+            handle.error = f"connect timed out after {connect_timeout}s"
             _logger.warning(
                 "site '%s' failed to start: %s (see %s)", site.name, handle.error, handle.log_path
             )
@@ -302,7 +326,33 @@ class ChildManager:
         handle.last_error_at = time.time()
         _logger.warning("site '%s' marked failed after a call: %s", site_name, redacted)
 
-    async def probe_upstream_version(self) -> str | None:
+    def mark_timeout(self, site_name: str, reason: str) -> None:
+        """Records a per-call timeout (distinct from ``mark_failed``'s
+        connection-level failure): the child's pipe is presumably still
+        alive, it just didn't answer in time. Surfaced as ``timeouts`` in
+        ``jira_sites``; flips to ``failed`` only after
+        ``_MAX_CONSECUTIVE_TIMEOUTS`` in a row."""
+        handle = self._handles.get(site_name)
+        if handle is None:
+            return
+        redacted = self.redact(reason)
+        handle.timeouts += 1
+        handle.last_error = redacted
+        handle.last_error_at = time.time()
+        _logger.warning("site '%s' call timed out (%d consecutive): %s", site_name, handle.timeouts, redacted)
+        if handle.timeouts >= _MAX_CONSECUTIVE_TIMEOUTS:
+            handle.state = "failed"
+            handle.error = redacted
+
+    def mark_success(self, site_name: str) -> None:
+        """Resets the consecutive-timeout counter after a call that actually
+        completed a round trip -- whether the tool itself errored or not,
+        either way the child answered, so it isn't stuck."""
+        handle = self._handles.get(site_name)
+        if handle is not None:
+            handle.timeouts = 0
+
+    async def probe_upstream_version(self, *, timeout: float = 30.0) -> str | None:
         """Runs the shared ``upstream.command --version`` once at startup.
 
         Every site launches the same command, so this is one call, not one
@@ -310,13 +360,25 @@ class ChildManager:
         child's FastMCP ``serverInfo.version`` (that's the bundled fastmcp
         library version, not mcp-atlassian's -- see ``ChildHandle.fastmcp_server_version``).
         Run off the event loop thread since this shells out synchronously;
-        never raises -- a probe failure must not block startup.
+        never raises -- a probe failure must not block startup. ``stdin`` is
+        ``DEVNULL``: an upstream that doesn't recognize ``--version`` could
+        otherwise start serving MCP on inherited fd 0 -- the live stdio pipe
+        this process itself uses to talk to Claude Code -- and eat its
+        ``initialize`` request. Caller passes a ``timeout`` bounded by the
+        connect budget so a hanging probe can't itself blow past it.
         """
         command = [*self._upstream.command, "--version"]
         env = minimal_env(self._upstream.env_passthrough)
         try:
             completed = await anyio.to_thread.run_sync(
-                lambda: subprocess.run(command, capture_output=True, text=True, timeout=30, env=env)
+                lambda: subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                    env=env,
+                    stdin=subprocess.DEVNULL,
+                )
             )
         except Exception as exc:  # noqa: BLE001 - a version probe must never block startup
             _logger.warning("upstream_version unavailable: %s: %s", exc.__class__.__name__, exc)
@@ -338,7 +400,9 @@ class ChildManager:
         handle = self._handles.get(site_name)
         if handle is None or handle.state != "healthy" or handle.client is None:
             reason = handle.error if handle is not None and handle.error else "not configured"
-            raise ToolError(f"Site '{site_name}' is unavailable: {reason}. Run 'jira-multi-mcp --check'.")
+            raise ToolError(
+                f"[site={site_name}] site is unavailable: {reason}. Run 'jira-multi-mcp --check'."
+            )
         return handle.client
 
     async def discover_tools(self) -> list[mcp_types.Tool]:
@@ -377,6 +441,7 @@ class ChildManager:
                     "error": handle.error,
                     "last_error": handle.last_error,
                     "last_error_at": handle.last_error_at,
+                    "timeouts": handle.timeouts,
                     "log_path": str(handle.log_path),
                     "fastmcp_server_version": handle.fastmcp_server_version,
                     "discovery_source": handle.site.name == self._discovery_source,

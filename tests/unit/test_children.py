@@ -3,9 +3,12 @@ selection, and health reporting -- all against in-process fake children."""
 
 from __future__ import annotations
 
+import contextlib
 import os
+import subprocess
 import sys
 import time
+from collections.abc import AsyncIterator
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -228,6 +231,56 @@ async def test_aclose_kills_a_real_child_process(tmp_path: Path) -> None:
             pytest.fail(f"child pid {pid} was still alive 5s after ChildManager.aclose()")
 
 
+async def test_cancelling_a_stuck_handshake_still_kills_the_spawned_child(tmp_path: Path) -> None:
+    """Characterization test, not a regression test: this passes whether or
+    not `handle.client` is assigned before or after `enter_async_context`,
+    because fastmcp's own `Client._connect()` has a `CancelledError` handler
+    that closes the transport on a cancelled connect regardless (verified
+    empirically). It's still worth pinning explicitly -- `server.py`'s
+    cancel-before-close shutdown ordering (see its module docstring) depends
+    on this exact behavior to unblock a child stuck mid-handshake, and this
+    proves it against a REAL subprocess that never speaks MCP, so the
+    handshake hangs until cancelled."""
+    pid_file = tmp_path / "pid.txt"
+    script = (
+        "import os, time\n"
+        f"with open({str(pid_file)!r}, 'w') as f:\n"
+        "    f.write(str(os.getpid()))\n"
+        "time.sleep(60)\n"
+    )
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = _make_manager(
+        registry,
+        tmp_path,
+        lambda site, up: StdioTransport(command=sys.executable, args=["-c", script], keep_alive=True),
+    )
+
+    async with AsyncExitStack() as stack:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(manager.start_all, stack, 30.0)
+            deadline = time.monotonic() + 5.0
+            while not pid_file.exists() and time.monotonic() < deadline:
+                await anyio.sleep(0.02)
+            assert pid_file.exists(), "child never started"
+            pid = int(pid_file.read_text().strip())
+            os.kill(pid, 0)  # still alive
+
+            # Simulates a shutdown signal landing mid-connect.
+            tg.cancel_scope.cancel()
+
+        await manager.aclose()
+
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            await anyio.sleep(0.05)
+        else:
+            pytest.fail(f"child pid {pid} was still alive 5s after cancel+aclose (orphaned)")
+
+
 async def test_probe_failure_after_connect_keeps_the_client_for_later_close(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -276,7 +329,36 @@ async def test_connect_failure_error_is_redacted(tmp_path: Path) -> None:
         assert "***" in str(health["acme"]["error"])
 
 
-async def test_connect_timeout_error_is_a_clear_message_not_bare_exception_repr(tmp_path: Path) -> None:
+class _HangingTransport(ClientTransport):
+    """Never yields a session -- stands in for a real connect that hangs past
+    the deadline, so ``_start_one``'s cancel scope is the thing that actually
+    fires (``scope.cancelled_caught``), not merely a ``TimeoutError`` raised
+    for some unrelated reason."""
+
+    @contextlib.asynccontextmanager
+    async def connect_session(  # type: ignore[override]
+        self, *, transport_options: object = None, **session_kwargs: object
+    ) -> AsyncIterator[object]:
+        await anyio.sleep_forever()
+        yield None  # pragma: no cover - unreachable, connect_session never yields
+
+
+async def test_a_real_hang_past_the_deadline_reports_our_own_timeout_message(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = _make_manager(registry, tmp_path, lambda site, up: _HangingTransport())
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=0.2)
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["error"] == "connect timed out after 0.2s"
+
+
+async def test_a_bare_timeouterror_raised_by_the_factory_is_not_relabeled_as_our_deadline(
+    tmp_path: Path,
+) -> None:
+    """A plain ``TimeoutError`` an underlying library raises for its own
+    reason (e.g. a real OS-level ETIMEDOUT) is not the same thing as OUR
+    connect deadline expiring -- it must go through the generic
+    "failed to start" path, not be mislabeled "connect timed out after Xs"."""
     registry = SiteRegistry([_cloud_site("acme", "ACME")])
 
     def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
@@ -286,7 +368,10 @@ async def test_connect_timeout_error_is_a_clear_message_not_bare_exception_repr(
     async with AsyncExitStack() as stack:
         await manager.start_all(stack, connect_timeout=5)
         health = {h["name"]: h for h in manager.health()}
-        assert health["acme"]["error"] == "connect timed out after 5s"
+        # Not "connect timed out after 5s" (our own deadline message) -- this
+        # exception was never near the deadline; it just isn't the thing that
+        # message means.
+        assert health["acme"]["error"] == "TimeoutError: "
 
 
 async def test_mark_failed_redacts_the_reason_and_records_a_timestamp(tmp_path: Path) -> None:
@@ -302,6 +387,38 @@ async def test_mark_failed_redacts_the_reason_and_records_a_timestamp(tmp_path: 
         assert health["acme"]["last_error_at"] is not None
 
 
+async def test_mark_timeout_increments_and_flips_to_failed_after_three(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+
+        manager.mark_timeout("acme", "jira_get_issue timed out after 1s")
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["timeouts"] == 1
+        assert health["acme"]["state"] == "healthy"
+
+        manager.mark_timeout("acme", "jira_get_issue timed out after 1s")
+        manager.mark_timeout("acme", "jira_get_issue timed out after 1s")
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["timeouts"] == 3
+        assert health["acme"]["state"] == "failed"
+
+
+async def test_mark_success_resets_the_timeout_counter(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+
+        manager.mark_timeout("acme", "timed out")
+        manager.mark_timeout("acme", "timed out")
+        manager.mark_success("acme")
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["timeouts"] == 0
+        assert health["acme"]["state"] == "healthy"
+
+
 async def test_probe_upstream_version_captures_stdout(tmp_path: Path) -> None:
     registry = SiteRegistry([_cloud_site("acme", "ACME")])
     upstream = UpstreamConfig(command=(sys.executable, "-c", "import sys; print(sys.argv[-1])"))
@@ -311,6 +428,32 @@ async def test_probe_upstream_version_captures_stdout(tmp_path: Path) -> None:
 
     assert version == "--version"
     assert manager.upstream_version() == "--version"
+
+
+async def test_probe_upstream_version_stdin_is_devnull(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An upstream that doesn't recognize `--version` could start serving MCP
+    on inherited stdin -- the live pipe this process itself uses to talk to
+    Claude Code -- and eat its `initialize` request. A real-subprocess
+    behavioral check is unreliable here (pytest's own default capturing
+    already redirects fd 0 for any child, regardless of this code's own
+    ``stdin=`` kwarg), so this asserts the kwarg directly; also proved end to
+    end in the adversarial-loop real run."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = ChildManager(registry, UpstreamConfig(), Defaults(), tmp_path)
+    captured_stdin: list[object] = []
+
+    def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        captured_stdin.append(kwargs.get("stdin"))
+        return subprocess.CompletedProcess(command, 0, stdout="1.0.0", stderr="")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    version = await manager.probe_upstream_version(timeout=5)
+
+    assert version == "1.0.0"
+    assert captured_stdin == [subprocess.DEVNULL]
 
 
 async def test_probe_upstream_version_handles_a_missing_command(tmp_path: Path) -> None:

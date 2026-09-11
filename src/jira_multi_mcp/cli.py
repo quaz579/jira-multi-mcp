@@ -217,6 +217,7 @@ def _cmd_warm(config: AppConfig, *, refresh: bool) -> int:
             text=True,
             timeout=config.defaults.call_timeout_seconds,
             env=_warm_env(config),
+            stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired as exc:
         sys.stderr.write(

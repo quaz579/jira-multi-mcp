@@ -13,9 +13,10 @@ from mcp_types import ToolAnnotations
 
 _READ_ONLY = ToolAnnotations(read_only_hint=True)
 _WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=True)
+_DESTRUCTIVE_ONLY = ToolAnnotations(destructive_hint=True)
 
 
-def make_fake_child(site_name: str) -> FastMCP:
+def make_fake_child(site_name: str, *, leak_secret: str | None = None) -> FastMCP:
     mcp: FastMCP = FastMCP(f"fake-{site_name}")
 
     @mcp.tool(annotations=_READ_ONLY)
@@ -62,5 +63,36 @@ def make_fake_child(site_name: str) -> FastMCP:
     @mcp.tool(tags={"write"}, annotations=_WRITE)
     def jira_write_blocked(issue_key: str) -> str:
         raise ToolError("write not permitted")
+
+    # Most real upstream write tools (23 of 25 in mcp-atlassian 0.23.1, e.g.
+    # add_comment/update_issue/delete_issue) set NO annotations at all, so
+    # `annotations` arrives at the mirror as None, not a hint of False.
+    @mcp.tool(tags={"write"})
+    def jira_add_comment(issue_key: str, body: str) -> str:
+        raise ToolError("write not permitted")
+
+    # A tool that sets only destructiveHint (read_only_hint left unset/None,
+    # never False) -- must still get the read-only hint appended.
+    @mcp.tool(tags={"write"}, annotations=_DESTRUCTIVE_ONLY)
+    def jira_destructive_only(issue_key: str) -> str:
+        raise ToolError("write not permitted")
+
+    # Mirrors upstream's real jira_get_issue: readOnlyHint=True, raises a
+    # normal "not found" error unrelated to read-only enforcement -- the hint
+    # must NOT be appended here even on a read_only site.
+    @mcp.tool(annotations=_READ_ONLY)
+    def jira_get_issue_or_404(issue_key: str) -> dict[str, Any]:
+        if issue_key.endswith("99999999"):
+            raise ToolError(f"Issue '{issue_key}' does not exist")
+        return {"site": site_name, "issue_key": issue_key}
+
+    # Simulates a child echoing a credential back in an error body (e.g. a
+    # misconfigured upstream logging its own auth header) -- proves the
+    # mirror redacts a child `isError` payload, not just its own exception path.
+    if leak_secret is not None:
+
+        @mcp.tool
+        def jira_leaky() -> str:
+            raise ToolError(f"upstream request failed near token {leak_secret}")
 
     return mcp
