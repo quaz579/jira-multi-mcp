@@ -13,7 +13,7 @@ api_token_env  = "JIRA_API_TOKEN"
 # A literal token also works ("api_token = \"...\""), but jira-multi-mcp logs
 # an INFO line each time suggesting api_token_env instead. Never set both.
 
-# "curated" (~35 hand-picked tools: issues, search, comments, transitions,
+# "curated" (37 hand-picked tools: issues, search, comments, transitions,
 # users, links, worklog, project basics) or "all" (every jira_-prefixed tool
 # upstream exposes).
 toolset_preset = "curated"
@@ -24,6 +24,13 @@ connect_timeout_seconds = 90
 # the server's reported Content-Length and the actual streamed byte count).
 # 100 MiB default.
 attachment_max_bytes    = 104857600
+# How long (seconds) a failed site stays marked "failed" before the next
+# call that needs it -- or jira_sites -- tries to reconnect it. Default 30.
+# recovery_cooldown_seconds = 30
+# Upper bound (seconds) on how long one jira_sites call waits for recovery
+# to settle before returning; a slower recovery keeps running in the
+# background and is picked up by a later call. Default 8.
+# health_recovery_budget_seconds = 8
 
 [upstream]
 # Re-resolved from PyPI on every launch (small latency, always current).
@@ -53,11 +60,19 @@ key_prefixes = ["JUMP"]
 # personal_token / personal_token_env (Jira Server/Data Center — mutually
 # exclusive with api_token*), read_only, enabled_tools = ["jira_get_issue", ...]
 # (must be a subset of the effective allowlist for toolset_preset).
+read_only    = true
 
 [[sites]]
 name         = "valiram"
 url          = "https://valiram.atlassian.net"
 key_prefixes = ["VJAP"]
+# Restricts which projects THIS SITE'S upstream child will search/browse at
+# all (its JIRA_PROJECTS_FILTER env var) -- separate from a tool call's own
+# projects_filter argument, which only affects routing. Entries are project
+# keys, normalized to uppercase; a numeric project id is never a valid entry
+# here (unlike upstream's JQL, which does accept one).
+projects_filter = ["VJAP"]
+# enabled_tools = ["jira_get_issue", "jira_search", "jira_add_comment"]
 
 # Example Server/Data Center site (personal access token, no username needed):
 # [[sites]]
