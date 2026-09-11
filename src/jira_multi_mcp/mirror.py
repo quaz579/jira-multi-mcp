@@ -10,6 +10,7 @@ from typing import Any, ClassVar
 
 import anyio
 import mcp_types
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.base import Tool, ToolResult
 from mcp import MCPError
@@ -148,18 +149,51 @@ class MultiSiteProxyTool(Tool):
         # checking against `projects_filter` -- that check stays
         # wrapper-tool-only.
         enforce_site_policy(site, self.name, is_write=False, issue_key=None)
-        client = await self._manager.client_for(site.name)
 
         assert self.timeout is not None, f"mirrored tool '{self.name}' was built without a timeout"
         log_path = self._manager.log_path(site.name)
         try:
+            # `client_for` runs INSIDE this scope, not before it: a failed
+            # site's recovery (closing the old client, connecting a new one,
+            # probing liveness) can itself take several seconds, and that
+            # time must count against this call's own `call_timeout_seconds`
+            # budget rather than running for free ahead of it -- otherwise a
+            # caller's effective timeout was `call_timeout_seconds +
+            # recovery time`, up to `connect_timeout_seconds` more (see
+            # `children.ChildManager.client_for`'s docstring).
+            # `generation` (captured only once `client_for` has actually
+            # returned a client) lets `mark_timeout`/`mark_failed` below
+            # no-op if a recovery has ALREADY replaced this handle's client
+            # by the time this call fails -- otherwise a slow, stale
+            # in-flight call could clobber a newer, healthy client's state.
+            # Stays `None` if `client_for` itself is what the timeout/failure
+            # hit (recovery still in flight, no client obtained yet) -- in
+            # that case `_attempt_recovery` has already recorded its own,
+            # more specific failure reason, so `run` must NOT also call
+            # `mark_timeout`/`mark_failed` here: doing so would overwrite
+            # that reason and, for a timeout, inflate the site's consecutive-
+            # timeout counter for a call that was never actually made.
+            generation: int | None = None
             with anyio.fail_after(self.timeout):
+                client = await self._manager.client_for(site.name)
+                generation = self._manager.generation(site.name)
                 result = await client.call_tool_mcp(self.name, args)
         except TimeoutError as exc:
-            self._manager.mark_timeout(site.name, f"{self.name} timed out after {self.timeout}s")
+            if generation is not None:
+                self._manager.mark_timeout(
+                    site.name, f"{self.name} timed out after {self.timeout}s", generation=generation
+                )
             raise ToolError(
                 f"[site={site.name}] {self.name} timed out after {self.timeout}s. Child log: {log_path}"
             ) from exc
+        except ToolError:
+            # `client_for` (or the recovery attempt it triggers) can raise
+            # its own already-well-shaped `ToolError` directly -- "site is
+            # unavailable: ..." or "is recovering; retry shortly". Re-raise
+            # as-is rather than double-wrapping it in the generic-failure
+            # shape below (which would otherwise render as
+            # "... failed: ToolError: [site=x] ...").
+            raise
         except Exception as exc:
             # The child died or the connection otherwise broke mid-call (not a
             # timeout, not a tool-level error the child reported normally) --
@@ -167,7 +201,7 @@ class MultiSiteProxyTool(Tool):
             # of letting a raw MCPError/connection exception escape unshaped.
             reason = f"{exc.__class__.__name__}: {exc}"
             if _is_connection_failure(exc):
-                self._manager.mark_failed(site.name, reason)
+                self._manager.mark_failed(site.name, reason, generation=generation)
             redacted = self._manager.redact(reason)
             raise ToolError(
                 f"[site={site.name}] {self.name} failed: {redacted}. Child log: {log_path}"
@@ -228,3 +262,113 @@ def build_mirrored_tools(
             _logger.warning("tool '%s' is allowlisted but no healthy child advertised it", name)
 
     return mirrored
+
+
+class LateMirror:
+    """Mirrors newly-discovered tools onto the already-running server AFTER
+    startup -- the one case that can't wait for a restart: every configured
+    site failed at startup, so ``discover_tools()`` returned nothing and
+    ``build_mirrored_tools`` mirrored zero tools. From there, ``client_for``
+    -- the only other path that ever drives a failed site's recovery -- is
+    never reached again either (nothing calls a tool that doesn't exist), so
+    without this the server would serve `jira_sites` and the attachment
+    tools forever with no way back.
+
+    ``wrapper_tools.build_jira_sites_tool`` calls ``after_recovery`` on
+    every ``jira_sites`` invocation, right after
+    ``ChildManager.recover_failed_sites()``. A no-op once something has
+    already been mirrored, whether that happened at startup or via a
+    previous call here.
+    """
+
+    def __init__(
+        self,
+        mcp: FastMCP,
+        manager: ChildManager,
+        registry: SiteRegistry,
+        allowlist: frozenset[str] | None,
+        timeout: float,
+        *,
+        already_mirrored: bool = False,
+    ) -> None:
+        self._mcp = mcp
+        self._manager = manager
+        self._registry = registry
+        self._allowlist = allowlist
+        self._timeout = timeout
+        # `already_mirrored=True` when the caller already added tools from
+        # this SAME discovery pipeline once (the ordinary startup path in
+        # `server.serve`) -- without this, the first `jira_sites` call after
+        # a successful startup would immediately re-discover and re-add every
+        # already-mirrored tool a second time. `mcp.add_tool` would NOT raise
+        # on that (fastmcp 4.0.3's default `on_duplicate="warn"` replaces the
+        # existing tool and just logs a warning), but it's still pointless
+        # rediscovery-and-replace work and log spam on every single call.
+        self._mirrored = already_mirrored
+        # Guards against two concurrent `jira_sites` calls both observing
+        # `_mirrored=False` and both running a whole `discover_tools()` +
+        # rebuild for nothing -- not (as an earlier version of this comment
+        # claimed) to stop `mcp.add_tool` from crashing on a duplicate name;
+        # it wouldn't (see above).
+        self._lock = anyio.Lock()
+
+    async def after_recovery(self, ctx: Context) -> str | None:
+        """Returns a note for ``jira_sites`` to surface only when tools WERE
+        newly mirrored just now but the connected client couldn't be told
+        its tool list changed (it may need a manual re-list); ``None`` in
+        every other case, including "nothing to do".
+
+        Uses try-lock semantics (``acquire_nowait``), consistent with
+        ``ChildManager._maybe_recover``: this runs inside `jira_sites`'s own
+        call budget (its caller wraps this call in the SAME
+        ``anyio.move_on_after(health_recovery_budget_seconds)`` scope it
+        already used for recovery -- see ``wrapper_tools.build_jira_sites_tool``),
+        so a second, concurrent caller queuing behind the lock would burn its
+        own budget waiting on someone else's discovery instead of getting a
+        fast, clear answer -- it just returns ``None`` and the NEXT
+        `jira_sites` call retries. ``discover_tools()`` itself is ALSO bounded
+        by ``self._timeout`` (the M4a MEDIUM 2 finding, call_timeout_seconds
+        by default) as an inner, independent backstop -- without that, one
+        slow/hanging child's ``list_tools()`` could stall this call for as
+        long as THAT takes even on a caller that isn't going through
+        `jira_sites`'s own budget at all. Whichever of the two is smaller is
+        what actually bounds a `jira_sites` call in practice.
+        """
+        if self._mirrored:
+            return None
+        try:
+            self._lock.acquire_nowait()
+        except anyio.WouldBlock:
+            return None
+        try:
+            if self._mirrored:
+                return None
+            with anyio.move_on_after(self._timeout) as scope:
+                tools = await self._manager.discover_tools()
+            if scope.cancelled_caught:
+                _logger.warning(
+                    "late-mirror discover_tools() timed out after %ss; leaving unmirrored "
+                    "for a later jira_sites call to retry",
+                    self._timeout,
+                )
+                return None
+            mirrored = build_mirrored_tools(
+                tools, self._manager, self._registry, self._allowlist, self._timeout
+            )
+            if not mirrored:
+                # Nothing healthy enough yet to mirror anything real --
+                # leave `_mirrored` false so a later call can retry.
+                return None
+            for tool in mirrored:
+                self._mcp.add_tool(tool)
+            self._mirrored = True
+        finally:
+            self._lock.release()
+        try:
+            await ctx.session.send_tool_list_changed()
+        except Exception:  # noqa: BLE001 - best-effort; an older/simpler client may not support this
+            return (
+                "tools were mirrored after recovery, but the connected client could not be "
+                "notified of the change -- it may need to re-list tools to see them"
+            )
+        return None
