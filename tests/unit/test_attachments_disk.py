@@ -165,7 +165,9 @@ async def test_streamed_body_exceeding_max_bytes_with_no_content_length_leaves_n
     assert downloaded == []
     assert entries[0]["status"] == "failed"
     assert "max_bytes" in entries[0]["reason"]
+    assert "while streaming" in entries[0]["reason"]
     assert not (tmp_path / "big.bin").exists()
+    assert list(tmp_path.iterdir()) == []  # no leftover .part scratch file either
 
 
 @respx.mock
@@ -221,3 +223,83 @@ async def test_attachment_ids_selection_downloads_only_the_matching_id(
 
     assert entries == []
     assert [d.filename for d in downloaded] == ["a.txt"]
+
+
+@respx.mock
+@pytest.mark.parametrize("bad_name", ["", ".", "..", "\x00\x01\x02"])
+async def test_unsafe_filename_is_a_failed_entry_not_a_crash(
+    http_client: httpx.AsyncClient, tmp_path: Path, bad_name: str
+) -> None:
+    _mock_list([_attachment("1", bad_name)])
+
+    downloaded, entries = await _client(http_client).download("ACME-1", tmp_path)
+
+    assert downloaded == []
+    assert len(entries) == 1
+    assert entries[0]["status"] == "failed"
+    assert entries[0]["reason"] == "unsafe or empty filename"
+
+
+@respx.mock
+async def test_intra_batch_same_name_with_overwrite_lands_both_files(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    _mock_list([_attachment("1", "notes.txt"), _attachment("2", "notes.txt")])
+    _mock_content("1", b"first")
+    _mock_content("2", b"second")
+
+    downloaded, entries = await _client(http_client).download("ACME-1", tmp_path, overwrite=True)
+
+    assert entries == []
+    assert len(downloaded) == 2
+    paths = {Path(d.path) for d in downloaded}
+    assert len(paths) == 2  # two distinct files, not one overwriting the other
+    contents = {path.read_bytes() for path in paths}
+    assert contents == {b"first", b"second"}
+
+
+@respx.mock
+async def test_mid_stream_failure_with_overwrite_leaves_original_file_intact(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    (tmp_path / "notes.txt").write_bytes(b"original-untouched")
+    _mock_list([_attachment("1", "notes.txt")])
+    _mock_content("1", b"x" * 5000, chunked=True)
+
+    downloaded, entries = await _client(http_client, max_bytes=100).download(
+        "ACME-1", tmp_path, overwrite=True
+    )
+
+    assert downloaded == []
+    assert entries[0]["status"] == "failed"
+    assert (tmp_path / "notes.txt").read_bytes() == b"original-untouched"
+    assert [p.name for p in tmp_path.iterdir()] == ["notes.txt"]  # no leftover .part
+
+
+@respx.mock
+async def test_unmatched_attachment_id_is_a_failed_entry_and_creates_no_directory(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    _mock_list([_attachment("1", "a.txt")])
+    target = tmp_path / "fresh-nonexistent-dir"
+
+    downloaded, entries = await _client(http_client).download("ACME-1", target, attachment_ids=["999"])
+
+    assert downloaded == []
+    assert len(entries) == 1
+    assert entries[0]["status"] == "failed"
+    assert "999" in entries[0]["reason"]
+    assert "ACME-1" in entries[0]["reason"]
+    assert not target.exists()
+
+
+@respx.mock
+async def test_unmatched_filename_is_a_failed_entry(http_client: httpx.AsyncClient, tmp_path: Path) -> None:
+    _mock_list([_attachment("1", "a.txt")])
+
+    downloaded, entries = await _client(http_client).download("ACME-1", tmp_path, filenames=["nope.txt"])
+
+    assert downloaded == []
+    assert len(entries) == 1
+    assert entries[0]["status"] == "failed"
+    assert "nope.txt" in entries[0]["reason"]

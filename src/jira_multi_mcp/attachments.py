@@ -11,8 +11,10 @@ from __future__ import annotations
 
 import logging
 import mimetypes
+import os
 import re
 from collections.abc import Callable, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -46,8 +48,14 @@ class AttachmentMeta:
 
 @dataclass(frozen=True)
 class DownloadedFile:
+    """``filename`` is the name actually written under ``target_dir`` -- it
+    may differ from ``original_filename`` when a same-named collision (either
+    on disk already, or against another attachment selected in the same
+    call) forced the id-suffixed fallback name."""
+
     attachment_id: str
     filename: str
+    original_filename: str
     path: str
     size: int
     mime_type: str
@@ -126,15 +134,31 @@ class JiraAttachmentClient:
     ) -> tuple[list[DownloadedFile], list[dict[str, str]]]:
         self._require_cloud("jira_download_attachments")
         attachments = await self.list_attachments(issue_key)
-        selected = self._select(attachments, filenames, attachment_ids)
-
-        resolved_dir = target_dir.expanduser().resolve()
-        resolved_dir.mkdir(parents=True, exist_ok=True)
+        selected, unmatched = self._select(attachments, filenames, attachment_ids, issue_key)
 
         downloaded: list[DownloadedFile] = []
-        entries: list[_DownloadEntry] = []
+        entries: list[_DownloadEntry] = list(unmatched)
+        if not selected:
+            # Nothing to write -- in particular, a selector that matched
+            # nothing must not create an otherwise-empty target_dir.
+            return downloaded, [entry.as_dict() for entry in entries]
+
+        resolved_dir = target_dir.expanduser().resolve()
+        try:
+            resolved_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ToolError(
+                self._redact(
+                    f"[site={self._site.name}] jira_download_attachments: could not create "
+                    f"target_dir '{resolved_dir}': {exc.__class__.__name__}: {exc}"
+                )
+            ) from exc
+
+        used_names: set[str] = set()
         for attachment in selected:
-            result = await self._download_one(attachment, resolved_dir, overwrite=overwrite)
+            result = await self._download_one(
+                attachment, resolved_dir, overwrite=overwrite, used_names=used_names
+            )
             if isinstance(result, DownloadedFile):
                 downloaded.append(result)
             else:
@@ -143,11 +167,17 @@ class JiraAttachmentClient:
 
     async def upload(self, issue_key: str, paths: Sequence[Path]) -> list[AttachmentMeta]:
         self._require_cloud("jira_upload_attachments")
-        opened = [open(path, "rb") for path in paths]
-        try:
+        with ExitStack() as stack:
+            try:
+                handles = [stack.enter_context(open(path, "rb")) for path in paths]
+            except OSError as exc:
+                raise ToolError(
+                    f"[site={self._site.name}] jira_upload_attachments: could not open "
+                    f"'{exc.filename}': {exc.__class__.__name__}: {exc}"
+                ) from exc
             files = [
                 ("file", (path.name, fh, mimetypes.guess_type(path.name)[0] or "application/octet-stream"))
-                for path, fh in zip(paths, opened, strict=True)
+                for path, fh in zip(paths, handles, strict=True)
             ]
             path_str = f"/issue/{issue_key}/attachments"
             response = await self._http.post(
@@ -155,9 +185,6 @@ class JiraAttachmentClient:
                 files=files,
                 headers={"X-Atlassian-Token": "no-check"},
             )
-        finally:
-            for fh in opened:
-                fh.close()
         await self._raise_for_status(response, "POST", path_str)
         return [self._parse_attachment(raw) for raw in response.json()]
 
@@ -166,15 +193,50 @@ class JiraAttachmentClient:
         attachments: Sequence[AttachmentMeta],
         filenames: Sequence[str] | None,
         attachment_ids: Sequence[str] | None,
-    ) -> list[AttachmentMeta]:
+        issue_key: str,
+    ) -> tuple[list[AttachmentMeta], list[_DownloadEntry]]:
         if filenames is None and attachment_ids is None:
-            return list(attachments)
+            return list(attachments), []
         filename_set = set(filenames) if filenames is not None else set()
         id_set = set(attachment_ids) if attachment_ids is not None else set()
-        return [a for a in attachments if a.filename in filename_set or a.id in id_set]
+        selected = [a for a in attachments if a.filename in filename_set or a.id in id_set]
+
+        matched_filenames = {a.filename for a in selected}
+        matched_ids = {a.id for a in selected}
+        unmatched = [
+            _DownloadEntry(name, f"no attachment with filename '{name}' on {issue_key}", "failed")
+            for name in sorted(filename_set - matched_filenames)
+        ] + [
+            _DownloadEntry(att_id, f"no attachment with id '{att_id}' on {issue_key}", "failed")
+            for att_id in sorted(id_set - matched_ids)
+        ]
+        return selected, unmatched
+
+    def _pick_dest_name(
+        self, safe: str, attachment_id: str, target_dir: Path, used_names: set[str], *, overwrite: bool
+    ) -> str | None:
+        """Chooses the basename this attachment writes to, or ``None`` if
+        both it and its id-suffixed fallback are already taken.
+
+        ``used_names`` (names already claimed by an earlier attachment in
+        THIS SAME ``download()`` call) always forces the fallback name,
+        regardless of ``overwrite`` -- ``overwrite`` is about a file that
+        pre-dates this call, not about two attachments selected together
+        that happen to share a name, which must never collide with each
+        other either way.
+        """
+        if safe not in used_names and (overwrite or not (target_dir / safe).exists()):
+            return safe
+        stem, suffix = Path(safe).stem, Path(safe).suffix
+        candidate = f"{stem}-{attachment_id}{suffix}"
+        if candidate in used_names:
+            return None
+        if not overwrite and (target_dir / candidate).exists():
+            return None
+        return candidate
 
     async def _download_one(
-        self, attachment: AttachmentMeta, target_dir: Path, *, overwrite: bool
+        self, attachment: AttachmentMeta, target_dir: Path, *, overwrite: bool, used_names: set[str]
     ) -> DownloadedFile | _DownloadEntry:
         safe = _safe_filename(attachment.filename)
         if not safe:
@@ -182,72 +244,115 @@ class JiraAttachmentClient:
         if not attachment.content_url:
             return _DownloadEntry(attachment.filename, "attachment has no content URL", "failed")
 
-        dest = target_dir / safe
-        if dest.exists() and not overwrite:
-            fallback = target_dir / f"{dest.stem}-{attachment.id}{dest.suffix}"
-            if fallback.exists():
-                return _DownloadEntry(
-                    attachment.filename,
-                    f"both '{dest.name}' and '{fallback.name}' already exist",
-                    "skipped",
-                )
-            dest = fallback
+        dest_name = self._pick_dest_name(safe, attachment.id, target_dir, used_names, overwrite=overwrite)
+        if dest_name is None:
+            fallback_name = f"{Path(safe).stem}-{attachment.id}{Path(safe).suffix}"
+            return _DownloadEntry(
+                attachment.filename, f"both '{safe}' and '{fallback_name}' already exist", "skipped"
+            )
+        dest = target_dir / dest_name
+        # Streamed into a per-attachment scratch name first, never straight
+        # into `dest`: `overwrite=True` must not truncate an existing file
+        # before the download is known to have fully succeeded, and the
+        # attachment id keeps this unique across concurrent calls targeting
+        # the same dest.
+        part = target_dir / f"{dest.name}.{attachment.id}.part"
 
-        # Cloud's attachment `content` URL 302s to a pre-signed media-CDN URL
-        # on a different host; httpx drops the Authorization header on that
-        # cross-host redirect. That's correct, not a bug -- the redirect
-        # target is pre-signed and needs no auth of ours. Never "fix" this
-        # into replaying our Basic auth cross-host, which would leak it to
-        # whatever host Jira sends us to.
-        async with self._http.stream("GET", attachment.content_url, follow_redirects=True) as response:
-            try:
-                await self._raise_for_status(response, "GET", attachment.content_url)
-            except ToolError as exc:
-                return _DownloadEntry(attachment.filename, str(exc), "failed")
+        try:
+            # Cloud's attachment `content` URL 302s to a pre-signed media-CDN
+            # URL on a different host; httpx drops the Authorization header
+            # on that cross-host redirect. That's correct, not a bug -- the
+            # redirect target is pre-signed and needs no auth of ours. Never
+            # "fix" this into replaying our Basic auth cross-host, which
+            # would leak it to whatever host Jira sends us to.
+            async with self._http.stream("GET", attachment.content_url, follow_redirects=True) as response:
+                try:
+                    await self._raise_for_status(response, "GET", attachment.content_url)
+                except ToolError as exc:
+                    return _DownloadEntry(attachment.filename, str(exc), "failed")
 
-            content_length = response.headers.get("content-length")
-            if content_length is not None and int(content_length) > self._max_bytes:
-                return _DownloadEntry(
-                    attachment.filename,
-                    f"reported size {content_length} bytes exceeds max_bytes {self._max_bytes}",
-                    "failed",
-                )
+                declared_size = self._parse_content_length(response.headers.get("content-length"))
+                if declared_size is not None and declared_size > self._max_bytes:
+                    return _DownloadEntry(
+                        attachment.filename,
+                        f"reported size {declared_size} bytes exceeds max_bytes {self._max_bytes}",
+                        "failed",
+                    )
 
-            mode = "wb" if overwrite else "xb"
-            try:
-                handle = open(dest, mode)
-            except FileExistsError:
-                return _DownloadEntry(attachment.filename, f"'{dest.name}' already exists", "skipped")
+                try:
+                    handle = open(part, "wb")
+                except OSError as exc:
+                    return _DownloadEntry(
+                        attachment.filename,
+                        f"could not create temp file: {exc.__class__.__name__}: {exc}",
+                        "failed",
+                    )
 
-            written = 0
-            try:
-                async for chunk in response.aiter_bytes(65536):
-                    written += len(chunk)
-                    if written > self._max_bytes:
-                        raise _AttachmentTooLarge
-                    handle.write(chunk)
-            except _AttachmentTooLarge:
-                handle.close()
-                dest.unlink(missing_ok=True)
-                return _DownloadEntry(
-                    attachment.filename,
-                    f"exceeded max_bytes {self._max_bytes} while streaming",
-                    "failed",
-                )
-            except BaseException:
-                handle.close()
-                dest.unlink(missing_ok=True)
-                raise
+                written = 0
+                try:
+                    async for chunk in response.aiter_bytes(65536):
+                        written += len(chunk)
+                        if written > self._max_bytes:
+                            raise _AttachmentTooLarge
+                        handle.write(chunk)
+                except _AttachmentTooLarge:
+                    handle.close()
+                    part.unlink(missing_ok=True)
+                    return _DownloadEntry(
+                        attachment.filename,
+                        f"exceeded max_bytes {self._max_bytes} while streaming",
+                        "failed",
+                    )
+                except BaseException:
+                    handle.close()
+                    part.unlink(missing_ok=True)
+                    raise
+                else:
+                    handle.close()
+        except httpx.HTTPError as exc:
+            # A transport-level failure (connect/read timeout, dropped
+            # connection, ...), not a Jira-returned error status -- shape it
+            # the same way rather than letting it escape as a raw httpx
+            # exception. `dest` was never touched (only `part` may exist,
+            # cleaned up by the streaming loop above or, if the failure was
+            # before opening `part`, never created).
+            part.unlink(missing_ok=True)
+            return _DownloadEntry(attachment.filename, f"{exc.__class__.__name__}: {exc}", "failed")
+
+        try:
+            if overwrite:
+                os.replace(part, dest)
             else:
-                handle.close()
+                try:
+                    os.link(part, dest)
+                except FileExistsError:
+                    return _DownloadEntry(attachment.filename, f"'{dest.name}' already exists", "skipped")
+        finally:
+            # `os.replace` already consumed `part`'s name; `os.link` leaves it
+            # behind as a redundant second name to the same content -- either
+            # way, cleaned up unconditionally (a no-op if already gone).
+            part.unlink(missing_ok=True)
 
+        used_names.add(dest.name)
         return DownloadedFile(
             attachment_id=attachment.id,
-            filename=attachment.filename,
+            filename=dest.name,
+            original_filename=attachment.filename,
             path=str(dest),
             size=written,
             mime_type=attachment.mime_type,
         )
+
+    @staticmethod
+    def _parse_content_length(raw: str | None) -> int | None:
+        if raw is None:
+            return None
+        try:
+            return int(raw)
+        except ValueError:
+            # A malformed Content-Length is treated as absent rather than
+            # crashing the download -- the streamed byte count still caps it.
+            return None
 
     def _parse_attachment(self, raw: dict[str, Any]) -> AttachmentMeta:
         author = raw.get("author") or {}
