@@ -275,10 +275,13 @@ def test_stdin_eof_still_detected_after_the_client_already_wrote_bytes(tmp_path:
 def test_stdin_watcher_does_not_busy_spin_the_cpu_during_a_hanging_connect(tmp_path: Path) -> None:
     """The HIGH finding: a real MCP client writes its `initialize` request
     immediately on spawn and keeps stdin open while a slow/hanging upstream
-    connect is in flight. `poller.poll(250)` is level-triggered on those
-    queued-but-unread bytes, so without a sleep between polls the watcher
-    thread pins a full CPU core for the entire startup window (measured
-    ~1 CPU-second per wall second before this fix; ~0.02-0.05 after)."""
+    connect is in flight. Registering `POLLIN` (level-triggered on those
+    queued-but-unread bytes) made every `poll()` call return instantly for
+    the entire startup window, busy-spinning a full CPU core (measured ~1
+    CPU-second per wall second). Registering only `POLLHUP` lets the kernel
+    block the full interval instead (measured ~0.0 CPU-seconds over a 7s
+    window with the fix; matches the fix with a POLLIN+sleep fallback,
+    ~0.5 CPU-seconds over 8s, comfortably)."""
     pid_file = tmp_path / "child.pid"
     upstream_script = _write_hanging_upstream_script(tmp_path)
     config_path = _write_config(tmp_path, command=[sys.executable, str(upstream_script), str(pid_file)])
@@ -311,7 +314,7 @@ def test_stdin_watcher_does_not_busy_spin_the_cpu_during_a_hanging_connect(tmp_p
         cpu_at_3s = _cpu_seconds(proc.pid)
 
         delta = cpu_at_3s - cpu_at_1s
-        assert delta < 1.0, (
+        assert delta < 0.3, (
             f"parent burned {delta:.2f} CPU-seconds over a 2s window with a hung connect and "
             "stdin's 'initialize' bytes still queued -- stdin-EOF watcher busy-spin regression"
         )

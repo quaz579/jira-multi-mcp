@@ -284,27 +284,23 @@ def _stdin_hit_eof_blocking(stop_event: threading.Event) -> bool:
     """Runs in a background thread for the whole startup window: True only
     if fd 0's write end closed (the client gave up); False if told to stop.
 
-    Uses ``select.poll()``, not ``select.select()``: a real MCP client
-    writes its ``initialize`` request immediately on spawn, so fd 0 is
-    typically POLLIN-readable within milliseconds regardless of whether the
-    client later abandons the connection -- `select()` can't tell "data
-    queued" from "write end closed", but `poll()`'s POLLHUP is set purely by
-    the write end closing, independent of whatever bytes are still sitting
-    unread in the pipe (verified empirically on macOS with an unread
-    ``initialize``-sized payload still buffered). Never calls ``os.read``:
-    those queued bytes belong to ``run_stdio_async``'s eventual real reader,
-    not to this watcher.
-
-    A bare ``poll()`` loop would busy-spin a full CPU core for the whole
-    startup window: POLLIN is level-triggered, so once the client's
-    ``initialize`` bytes are queued, every immediate re-poll returns instantly
-    with the same POLLIN-no-HUP result (measured ~1 CPU-second per wall
-    second). Waiting out the rest of the interval on ``stop_event`` between
-    polls fixes that while still noticing both a real HUP and ``stop_event``
-    being set within one interval.
+    Registers ONLY ``POLLHUP``, never ``POLLIN``: a real MCP client writes
+    its ``initialize`` request immediately on spawn, so fd 0 typically has
+    unread bytes queued within milliseconds regardless of whether the client
+    later abandons the connection. ``POLLIN`` is level-triggered on those
+    queued bytes, so registering it made every ``poll()`` call return
+    instantly for the rest of the startup window -- busy-spinning a full CPU
+    core (measured ~1 CPU-second per wall second). Registering ``POLLHUP``
+    alone lets the kernel block the full ``poll()`` timeout with those bytes
+    still sitting there, and still wakes immediately the moment the write end
+    actually closes -- confirmed empirically on macOS, with an unread
+    ``initialize``-sized payload still buffered, that queued-and-unread data
+    doesn't count as HUP and a subsequent close is still reported instantly.
+    Never calls ``os.read``: those queued bytes belong to
+    ``run_stdio_async``'s eventual real reader, not to this watcher.
     """
     poller = select.poll()
-    poller.register(0, select.POLLIN)
+    poller.register(0, select.POLLHUP)
     while not stop_event.is_set():
         for _fd, revents in poller.poll(_STDIN_WATCH_POLL_MS):
             if revents & (select.POLLHUP | select.POLLERR):
@@ -313,12 +309,6 @@ def _stdin_hit_eof_blocking(stop_event: threading.Event) -> bool:
                 # fd 0 isn't pollable at all (e.g. redirected from something
                 # unusual) -- not this watcher's problem to diagnose.
                 return False
-            # POLLIN with no HUP/ERR: the client's own bytes are queued,
-            # untouched, for the real reader to pick up once startup ends.
-            # Wait out the rest of the interval instead of re-polling
-            # immediately -- interruptible so `stop_event.set()` is still
-            # noticed promptly.
-            stop_event.wait(_STDIN_WATCH_POLL_MS / 1000)
     return False
 
 
