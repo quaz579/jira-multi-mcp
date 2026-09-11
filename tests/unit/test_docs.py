@@ -72,3 +72,14 @@ def test_config_example_toml_parses_and_loads(monkeypatch: pytest.MonkeyPatch) -
     config = load_config(sources=[TomlFileConfigSource(CONFIG_EXAMPLE), EnvOverlaySource({})])
     assert {site.name for site in config.sites} == {"jumpmind", "dtlr", "valiram"}
     assert all(site.api_token is not None for site in config.sites)
+    # Both commented-out recovery keys must be real Defaults fields on the
+    # loader currently on main -- catches config.example.toml drifting from
+    # the actual schema after a merge (M4a introduced both).
+    assert config.defaults.recovery_cooldown_seconds == 30.0
+    assert config.defaults.health_recovery_budget_seconds == 8.0
+
+
+def test_readme_documents_recovery_settings() -> None:
+    text = README.read_text()
+    assert "recovery_cooldown_seconds" in text
+    assert "health_recovery_budget_seconds" in text
