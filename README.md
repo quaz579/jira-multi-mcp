@@ -223,7 +223,9 @@ to a child. The attachment tools and `jira_delete_comment` below all talk to
 Jira Cloud REST v3 (`httpx`) directly and are **Cloud-only** — a Server/Data
 Center site (`personal_token`) gets a clear refusal instead; `jira_sites` has
 no such restriction and reports on every configured site regardless of auth
-mode.
+mode. Each of these four also echoes back a normalized `issue_key`
+(stripped, uppercased) rather than the raw argument, so e.g. an input of
+`" acme-1 "` comes back as `"ACME-1"`.
 
 **`jira_sites()`** — no arguments. Per-site health: `name`, `host`,
 `key_prefixes`, `read_only`, `enabled_tools_restricted`, `state` (`healthy`,
@@ -291,7 +293,9 @@ deletes one comment. **Irreversible — there is no undo.** Upstream has no
 delete-comment tool at all (only `jira_add_comment`/`jira_edit_comment`), so
 this is a direct REST call like the attachment tools above. `comment_id`
 must be the numeric comment id (digits only); anything else — a slash, a
-query string, letters — is refused before any request is made.
+query string, letters — is refused before any request is made. On success,
+returns `{site, issue_key, comment_id, deleted: true}` — `issue_key` is
+echoed normalized (stripped, uppercased), not the raw argument.
 
 | Argument | Required | Notes |
 |---|---|---|

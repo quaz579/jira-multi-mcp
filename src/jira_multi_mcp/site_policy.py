@@ -57,12 +57,13 @@ def enforce_site_policy(site: SiteConfig, tool_name: str, *, is_write: bool, iss
             # Jira also accepts a numeric issue id (e.g. "81498") in place of
             # a key -- ISSUE_KEY_RE never matches one, so without this the
             # projects_filter check below would simply be skipped, letting a
-            # numeric id bypass the restriction entirely. Refuse outright
-            # rather than resolving it (that would need an extra Jira call
-            # just to find out what project it belongs to).
+            # numeric id (or any other malformed value) bypass the
+            # restriction entirely. Refuse outright rather than resolving it
+            # (that would need an extra Jira call just to find out what
+            # project it belongs to).
             raise ToolError(
                 f"[site={site.name}] {tool_name}: projects_filter is configured for this site; "
-                f"use the issue key (e.g. PROJ-123), not a numeric id ('{issue_key}')"
+                f"use a project issue key (e.g. PROJ-123); got '{issue_key}'"
             )
         project = match.group(1)
         # `site.projects_filter` is normalized to uppercase at config load

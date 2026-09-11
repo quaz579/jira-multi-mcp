@@ -235,7 +235,7 @@ async def test_delete_comment_round_trip(
         assert delete_result.is_error is False, _text_content(delete_result)
         assert delete_result.structured_content == {
             "site": site.name,
-            "issue_key": issue_key,
+            "issue_key": issue_key.strip().upper(),
             "comment_id": comment_id,
             "deleted": True,
         }

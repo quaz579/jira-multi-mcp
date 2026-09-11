@@ -22,7 +22,8 @@ _logger = logging.getLogger(__name__)
 
 # A project-key argument may carry an issue key by mistake (e.g. "ACME-1");
 # strip a trailing issue-number suffix rather than fail the whole call.
-_TRAILING_ISSUE_NUMBER_RE = re.compile(r"(-\d+)+$")
+# `[0-9]`, not `\d`, to match ISSUE_KEY_RE's ASCII-only digit shape (tools_meta.py).
+_TRAILING_ISSUE_NUMBER_RE = re.compile(r"(-[0-9]+)+$")
 
 
 class SiteRegistry:

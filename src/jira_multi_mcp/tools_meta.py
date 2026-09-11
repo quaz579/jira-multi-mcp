@@ -38,7 +38,10 @@ PROJECTS_FILTER_ARGS: tuple[str, ...] = ("projects_filter",)
 # though they can contain text that looks like an issue key.
 NEVER_PARSED: frozenset[str] = frozenset({"jql"})
 
-ISSUE_KEY_RE = re.compile(r"^([A-Z][A-Z0-9_]*)-\d+(?:-\d+)*$")
+# `[0-9]`, not `\d` -- Python's `\d` also matches non-ASCII decimal digits
+# (Arabic-indic, fullwidth, etc.), which would otherwise reach the REST URL
+# percent-encoded instead of being refused as an invalid key.
+ISSUE_KEY_RE = re.compile(r"^([A-Z][A-Z0-9_]*)-[0-9]+(?:-[0-9]+)*$")
 
 # Shape of a bare project key (also used to validate a configured key_prefix).
 # A single letter is a valid Jira project key upstream, so this allows one.

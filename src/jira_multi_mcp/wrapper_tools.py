@@ -25,6 +25,12 @@ from jira_multi_mcp.registry import SiteRegistry, SiteResolution, resolve_site
 from jira_multi_mcp.site_policy import enforce_site_policy
 from jira_multi_mcp.tools_meta import COMMENT_ID_RE, ISSUE_KEY_RE
 
+# Comfortably above any real Jira key (longest observed project keys are a
+# handful of characters) but small enough to make a pathological input (e.g.
+# thousands of digits) a cheap, obvious rejection rather than a large string
+# threaded through logging/URL-building.
+_MAX_ISSUE_KEY_LEN = 255
+
 
 def _shape_entry(entry: dict[str, str]) -> dict[str, str]:
     """Passes a `_DownloadEntry.as_dict()` result through to the tool result,
@@ -75,10 +81,14 @@ def _validate_issue_key(issue_key: str, site_name: str, tool_name: str) -> str:
     argument, so a lowercase key like ``acme-1`` keeps working instead of
     being rejected."""
     candidate = issue_key.strip().upper()
-    if not ISSUE_KEY_RE.fullmatch(candidate):
+    # ISSUE_KEY_RE has no upper bound on the digit run, so a bare length cap
+    # is the only thing stopping e.g. "CAP-" + "9" * 5000 -- a well-shaped
+    # but absurd key -- from reaching the REST path.
+    if len(candidate) > _MAX_ISSUE_KEY_LEN or not ISSUE_KEY_RE.fullmatch(candidate):
+        shown = issue_key if len(issue_key) <= 80 else f"{issue_key[:80]}...({len(issue_key)} chars)"
         raise ToolError(
             f"[site={site_name}] {tool_name}: 'issue_key' must be a Jira issue key like "
-            f"PROJ-123, got {issue_key!r}"
+            f"PROJ-123, got {shown!r}"
         )
     return candidate
 

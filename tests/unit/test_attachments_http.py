@@ -318,6 +318,30 @@ async def test_transport_error_during_list_is_shaped_as_a_tool_error(http_client
 
 
 @respx.mock
+async def test_transport_error_with_no_message_still_shows_exception_class(
+    http_client: httpx.AsyncClient,
+) -> None:
+    """A bare `httpx.ConnectError()` stringifies to "" -- without a fallback
+    the shaped message would read "ConnectError: " with nothing after the
+    colon, looking like a truncated message rather than one that never
+    existed."""
+    site = _cloud_site()
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("")
+
+    respx.get("https://acme.atlassian.net/rest/api/3/issue/ACME-1", params={"fields": "attachment"}).mock(
+        side_effect=boom
+    )
+
+    with pytest.raises(ToolError) as exc_info:
+        await _client(site, http_client).list_attachments("ACME-1")
+
+    message = str(exc_info.value)
+    assert "ConnectError: (no detail)" in message
+
+
+@respx.mock
 async def test_transport_error_during_upload_post_is_shaped_as_a_tool_error(
     http_client: httpx.AsyncClient, tmp_path: Path
 ) -> None:

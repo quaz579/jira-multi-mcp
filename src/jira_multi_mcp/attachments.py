@@ -152,7 +152,12 @@ class JiraAttachmentClient:
         return f"{self._site.url}/rest/api/3"
 
     def _redact_exc(self, exc: BaseException) -> str:
-        return self._redact(f"{exc.__class__.__name__}: {exc}")
+        # Some httpx transport errors (e.g. a bare `httpx.ConnectError()`)
+        # stringify to "" -- without a fallback that reads as "ClassName: "
+        # with nothing after the colon, which looks like the message got
+        # truncated rather than never having existed.
+        detail = str(exc) or "(no detail)"
+        return self._redact(f"{exc.__class__.__name__}: {detail}")
 
     def _shape_transport_error(self, exc: httpx.HTTPError | httpx.InvalidURL, tool_name: str) -> ToolError:
         """Gives a transport-level failure (connect/read timeout, dropped

@@ -71,3 +71,12 @@ def test_issue_key_regex_allows_a_single_letter_project_prefix() -> None:
     match = ISSUE_KEY_RE.match("X-1")
     assert match is not None
     assert match.group(1) == "X"
+
+
+def test_issue_key_regex_rejects_non_ascii_digits() -> None:
+    # Python's `\d` also matches non-ASCII decimal digits (Arabic-Indic,
+    # fullwidth, N'Ko, ...); ISSUE_KEY_RE uses `[0-9]` specifically to
+    # exclude them.
+    assert not ISSUE_KEY_RE.fullmatch("CAP-١")
+    assert not ISSUE_KEY_RE.fullmatch("CAP-１")
+    assert not ISSUE_KEY_RE.fullmatch("CAP-߁")
