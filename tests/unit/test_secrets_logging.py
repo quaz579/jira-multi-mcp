@@ -335,3 +335,18 @@ def test_child_logger_record_redacted_via_parents_non_propagating_handler(tmp_pa
     output = stream.getvalue()
     assert TOKEN not in output
     assert "***" in output
+
+
+def test_httpx_and_httpcore_stay_above_debug_even_when_verbose(tmp_path: Path) -> None:
+    """httpcore's DEBUG level logs each request's full URL -- for the
+    attachment download's cross-host redirect that's a pre-signed CDN URL
+    carrying a `token=` query parameter. `--verbose` must not lower these
+    two loggers to DEBUG even though it does exactly that for everything
+    else, or that token reaches server.log."""
+    config = load_config(sources=[TomlFileConfigSource(_write_config(tmp_path)), EnvOverlaySource({})])
+
+    configure_logging(config, verbose=True)
+
+    assert logging.getLogger("httpx").level == logging.INFO
+    assert logging.getLogger("httpcore").level == logging.INFO
+    assert logging.getLogger("jira_multi_mcp").level == logging.DEBUG

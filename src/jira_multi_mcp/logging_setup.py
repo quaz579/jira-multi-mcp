@@ -171,9 +171,15 @@ def configure_logging(config: AppConfig | None, *, verbose: bool = False) -> log
     except OSError:
         package_logger.warning("could not open log file under %s; file logging disabled", log_dir)
 
-    if not verbose:
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # httpcore's DEBUG level logs each request/response line including the
+    # full URL -- for the attachment download's cross-host redirect that's a
+    # pre-signed media-CDN URL carrying a `token=` query parameter. Capped at
+    # INFO even under --verbose (which raises everything else, including
+    # jira_multi_mcp itself, to DEBUG) so that token never reaches
+    # server.log; --verbose still surfaces httpx/httpcore's own INFO-level
+    # traffic, just not the request-line DEBUG dump.
+    logging.getLogger("httpx").setLevel(logging.WARNING if not verbose else logging.INFO)
+    logging.getLogger("httpcore").setLevel(logging.WARNING if not verbose else logging.INFO)
 
     for logger_name in _REDACTED_LOGGER_NAMES:
         attach_redaction(logger_name)
