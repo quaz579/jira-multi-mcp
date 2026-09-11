@@ -13,7 +13,7 @@ from jira_multi_mcp.sources import EnvOverlaySource, TomlFileConfigSource
 
 MINIMAL_TOML = """
 [defaults]
-username = "bgrossman@jumpmind.com"
+username = "you@example.com"
 api_token = "file-token"
 
 [[sites]]
@@ -41,7 +41,7 @@ def test_toml_round_trip(tmp_path: Path) -> None:
     assert site.name == "acme"
     assert site.url == "https://acme.atlassian.net"
     assert site.key_prefixes == ("ACME", "ACMEOPS")
-    assert site.username == "bgrossman@jumpmind.com"
+    assert site.username == "you@example.com"
     assert site.api_token is not None
     assert site.api_token.get_secret_value() == "file-token"
     assert site.auth_mode == "cloud"
@@ -88,7 +88,7 @@ def test_site_overrides_default_token(tmp_path: Path) -> None:
 def test_api_token_env_resolves_from_environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     content = """
 [defaults]
-username = "bgrossman@jumpmind.com"
+username = "you@example.com"
 api_token_env = "TEST_JIRA_TOKEN"
 
 [[sites]]
@@ -106,7 +106,7 @@ key_prefixes = ["ACME"]
 def test_api_token_env_missing_var_names_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     content = """
 [defaults]
-username = "bgrossman@jumpmind.com"
+username = "you@example.com"
 api_token_env = "TEST_JIRA_TOKEN_MISSING"
 
 [[sites]]
@@ -122,7 +122,7 @@ key_prefixes = ["ACME"]
 def test_duplicate_prefix_across_sites_names_both_sites(tmp_path: Path) -> None:
     content = """
 [defaults]
-username = "bgrossman@jumpmind.com"
+username = "you@example.com"
 api_token = "file-token"
 
 [[sites]]
@@ -152,7 +152,7 @@ def test_bad_site_name_rejected(tmp_path: Path) -> None:
 def test_cloud_and_dc_auth_are_mutually_exclusive(tmp_path: Path) -> None:
     content = """
 [defaults]
-username = "bgrossman@jumpmind.com"
+username = "you@example.com"
 
 [[sites]]
 name = "acme"
@@ -284,7 +284,7 @@ def test_upstream_env_passthrough_as_bare_string_is_rejected(tmp_path: Path) -> 
 def test_defaults_reject_both_cloud_and_dc_auth(tmp_path: Path) -> None:
     content = """
 [defaults]
-username = "bgrossman@jumpmind.com"
+username = "you@example.com"
 api_token = "cloud-token"
 personal_token = "dc-token"
 
@@ -300,7 +300,7 @@ key_prefixes = ["ACME"]
 def test_api_token_env_set_but_empty_is_an_error(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     content = """
 [defaults]
-username = "bgrossman@jumpmind.com"
+username = "you@example.com"
 api_token_env = "TEST_JIRA_TOKEN_EMPTY"
 
 [[sites]]
@@ -330,7 +330,7 @@ def test_env_overlay_can_still_add_a_complete_new_site(tmp_path: Path) -> None:
         "JIRA_MULTI_SITE_BETA_URL": "https://beta.atlassian.net",
         "JIRA_MULTI_SITE_BETA_KEY_PREFIXES": "BETA",
         "JIRA_MULTI_SITE_BETA_API_TOKEN": "beta-token",
-        "JIRA_MULTI_SITE_BETA_USERNAME": "bgrossman@jumpmind.com",
+        "JIRA_MULTI_SITE_BETA_USERNAME": "you@example.com",
     }
     config = load_config(sources=[TomlFileConfigSource(path), EnvOverlaySource(environ)])
     assert {s.name for s in config.sites} == {"acme", "beta"}

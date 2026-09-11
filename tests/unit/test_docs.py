@@ -70,7 +70,7 @@ def test_config_example_toml_parses_and_loads(monkeypatch: pytest.MonkeyPatch) -
     # a placeholder so load_config can resolve it without a real credential.
     monkeypatch.setenv("JIRA_API_TOKEN", "placeholder-token-for-test-docs")
     config = load_config(sources=[TomlFileConfigSource(CONFIG_EXAMPLE), EnvOverlaySource({})])
-    assert {site.name for site in config.sites} == {"jumpmind", "dtlr", "valiram"}
+    assert {site.name for site in config.sites} == {"acme", "beta", "gamma"}
     assert all(site.api_token is not None for site in config.sites)
     # Both commented-out recovery keys must be real Defaults fields on the
     # loader currently on main -- catches config.example.toml drifting from

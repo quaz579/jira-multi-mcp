@@ -1,7 +1,7 @@
 # jira-multi-mcp
 
 One MCP server that talks to several Jira Cloud sites at once. Ask Claude Code
-to "look at JUMP-2274" or "get JMC-13447" and it reaches the right site
+to "look at BETA-2274" or "get ACME-13447" and it reaches the right site
 automatically, with no `site` argument needed. It also downloads and uploads
 attachments straight to disk, instead of the base64-in-chat-context upstream
 gives you.
@@ -17,9 +17,9 @@ Claude Code ──stdio──▶ jira-multi-mcp (parent)
                           │    jira_download_attachments, jira_upload_attachments,
                           │    jira_delete_comment
                           │
-                          ├─▶ child "jumpmind": uvx mcp-atlassian   (JMC, JMCH, JMI)
-                          ├─▶ child "dtlr":     uvx mcp-atlassian   (JUMP)
-                          └─▶ child "valiram":  uvx mcp-atlassian   (VJAP)
+                          ├─▶ child "acme":  uvx mcp-atlassian   (ACME, ACMEH, ACMI)
+                          ├─▶ child "beta":  uvx mcp-atlassian   (BETA)
+                          └─▶ child "gamma": uvx mcp-atlassian   (GAM)
 
   site resolution: explicit `site` arg ▶ else the only configured site ▶ else
   the project-key prefix found in issue_key / issue_keys / epic_key / parent /
@@ -130,8 +130,8 @@ transport supports it, or — if that notification can't be sent — the
 
 Each entry needs a unique `name` (lowercase letters/digits, then any run of
 lowercase letters/digits/`_`/`-`; it can't start with `_` or `-`), an
-`https://` `url`, and `key_prefixes` — the project-key prefixes (e.g. `JMC`,
-`JUMP`) used to route a bare `JMC-1234` to the right site with no `site`
+`https://` `url`, and `key_prefixes` — the project-key prefixes (e.g. `ACME`,
+`BETA`) used to route a bare `ACME-1234` to the right site with no `site`
 argument. **Every prefix across every site must be globally unique** — that's
 a load-time error otherwise.
 
@@ -150,9 +150,9 @@ Server/Data Center site (`personal_token_env`, no `username` needed).
 A `JIRA_MULTI_SITE_<NAME>_<FIELD>` variable overrides one field of a site
 already defined in the TOML file. `<NAME>` is matched case-insensitively — it's
 lowercased before comparing against the (already-lowercase) site name — so
-`JIRA_MULTI_SITE_JUMPMIND_API_TOKEN_ENV` and
-`JIRA_MULTI_SITE_jumpmind_API_TOKEN_ENV` both target the site named
-`jumpmind`. A site name containing `-` can only be reached via the TOML file
+`JIRA_MULTI_SITE_ACME_API_TOKEN_ENV` and
+`JIRA_MULTI_SITE_acme_API_TOKEN_ENV` both target the site named
+`acme`. A site name containing `-` can only be reached via the TOML file
 (environment variable names can't contain a dash). A variable that would introduce a
 **new** site the TOML file never defined is ignored (with a warning) unless
 it supplies at least `_URL` and `_KEY_PREFIXES` — a stray/typo'd variable
@@ -178,7 +178,7 @@ For a tool call with no explicit `site`: first, if only one site is
 configured, that's the answer. Otherwise `jira-multi-mcp` looks for a
 project-key prefix in the call's own arguments — `issue_key`, `issue_keys`,
 `epic_key`, `parent`, `inward_issue_key`, `outward_issue_key`,
-`issue_ids_or_keys` (an issue key, e.g. `JMC-1234`), and `project_key`,
+`issue_ids_or_keys` (an issue key, e.g. `ACME-1234`), and `project_key`,
 `target_project_key` (a bare project key). **`jql` is never parsed** for
 routing, even though free-text JQL often contains something that looks like
 an issue key — `jira_search` (and any other JQL-only call) always needs an

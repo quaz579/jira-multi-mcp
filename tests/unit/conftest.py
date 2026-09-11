@@ -1,4 +1,4 @@
-"""Shared test fixtures: isolate every test from Ben's real config/state dirs."""
+"""Shared test fixtures: isolate every test from the developer's real config/state dirs."""
 
 from __future__ import annotations
 

@@ -15,7 +15,7 @@ def _site(name: str, *prefixes: str) -> SiteConfig:
         name=name,
         url=f"https://{name}.atlassian.net",
         key_prefixes=prefixes,
-        username="bgrossman@jumpmind.com",
+        username="you@example.com",
         api_token=Secret("token"),
     )
 
@@ -27,7 +27,7 @@ def multi_site_registry() -> SiteRegistry:
             _site("acme", "ACME", "ACMEOPS"),
             _site("beta", "BETA"),
             _site("jm", "JM"),
-            _site("jmc", "JMC"),
+            _site("jmz", "JMZ"),
         ]
     )
 
@@ -63,8 +63,8 @@ def test_multi_segment_issue_key(multi_site_registry: SiteRegistry) -> None:
 def test_prefix_exact_match_not_startswith(multi_site_registry: SiteRegistry) -> None:
     result = resolve_site(multi_site_registry, {"issue_key": "JM-1"}, tool_name="x")
     assert result.site.name == "jm"
-    result = resolve_site(multi_site_registry, {"issue_key": "JMC-1"}, tool_name="x")
-    assert result.site.name == "jmc"
+    result = resolve_site(multi_site_registry, {"issue_key": "JMZ-1"}, tool_name="x")
+    assert result.site.name == "jmz"
 
 
 def test_empty_and_none_values_are_skipped(multi_site_registry: SiteRegistry) -> None:
@@ -151,7 +151,7 @@ def test_zero_keys_is_ambiguous_with_prefix_table(multi_site_registry: SiteRegis
 
 
 def test_prefix_table_format(multi_site_registry: SiteRegistry) -> None:
-    assert multi_site_registry.prefix_table() == "acme: ACME, ACMEOPS | beta: BETA | jm: JM | jmc: JMC"
+    assert multi_site_registry.prefix_table() == "acme: ACME, ACMEOPS | beta: BETA | jm: JM | jmz: JMZ"
 
 
 def test_project_key_with_issue_number_suffix_is_stripped(multi_site_registry: SiteRegistry) -> None:

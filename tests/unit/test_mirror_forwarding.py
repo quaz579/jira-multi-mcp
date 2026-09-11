@@ -52,7 +52,7 @@ def _site(name: str, *prefixes: str, read_only: bool = False) -> SiteConfig:
         name=name,
         url=f"https://{name}.atlassian.net",
         key_prefixes=prefixes,
-        username="bgrossman@jumpmind.com",
+        username="you@example.com",
         api_token=Secret("token"),
         read_only=read_only,
     )
@@ -208,7 +208,7 @@ async def test_enabled_tools_restriction_is_enforced_by_the_wrapper_even_if_the_
                 name="acme",
                 url="https://acme.atlassian.net",
                 key_prefixes=("ACME",),
-                username="bgrossman@jumpmind.com",
+                username="you@example.com",
                 api_token=Secret("token"),
                 enabled_tools=frozenset({"jira_get_issue"}),
             )
@@ -304,7 +304,7 @@ async def test_child_is_error_text_is_redacted(tmp_path: Path) -> None:
                 name="acme",
                 url="https://acme.atlassian.net",
                 key_prefixes=("ACME",),
-                username="bgrossman@jumpmind.com",
+                username="you@example.com",
                 api_token=Secret(secret),
             )
         ]

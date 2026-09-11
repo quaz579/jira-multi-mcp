@@ -47,7 +47,7 @@ def _write_config(tmp_path: Path, *, command: list[str]) -> Path:
     config_path.write_text(
         f"""
         [defaults]
-        username = "bgrossman@jumpmind.com"
+        username = "you@example.com"
         api_token = "test-token"
         connect_timeout_seconds = 30
         call_timeout_seconds = 5

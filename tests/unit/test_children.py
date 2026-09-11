@@ -36,7 +36,7 @@ def _cloud_site(name: str, *prefixes: str, **overrides: object) -> SiteConfig:
         "name": name,
         "url": f"https://{name}.atlassian.net",
         "key_prefixes": prefixes,
-        "username": "bgrossman@jumpmind.com",
+        "username": "you@example.com",
         "api_token": Secret("token-value"),
     }
     fields.update(overrides)
@@ -117,7 +117,7 @@ def test_cloud_auth_env_vars() -> None:
     site = _cloud_site("acme", "ACME")
     env = build_child_env(site, UpstreamConfig(), Defaults())
     assert env["JIRA_URL"] == "https://acme.atlassian.net"
-    assert env["JIRA_USERNAME"] == "bgrossman@jumpmind.com"
+    assert env["JIRA_USERNAME"] == "you@example.com"
     assert env["JIRA_API_TOKEN"] == "token-value"
     assert "JIRA_PERSONAL_TOKEN" not in env
 
