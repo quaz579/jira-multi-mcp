@@ -44,6 +44,13 @@ ISSUE_KEY_RE = re.compile(r"^([A-Z][A-Z0-9_]*)-\d+(?:-\d+)*$")
 # A single letter is a valid Jira project key upstream, so this allows one.
 PROJECT_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
+# Jira REST comment ids are purely numeric. Shared by wrapper_tools's
+# argument validator and JiraAttachmentClient's own defense-in-depth check,
+# so the two can never drift apart -- always used with `.fullmatch()`, never
+# `.match()` (`$` alone matches before a trailing newline, which `.match()`
+# would let through as if it were a bare digit string).
+COMMENT_ID_RE = re.compile(r"^[0-9]+$")
+
 _ROUTABLE_ARGS = frozenset(ISSUE_KEY_ARGS) | frozenset(PROJECT_KEY_ARGS) | frozenset(PROJECTS_FILTER_ARGS)
 assert not (NEVER_PARSED & _ROUTABLE_ARGS), "NEVER_PARSED must never overlap a routable argument name"
 

@@ -104,6 +104,85 @@ async def test_jira_list_attachments_ambiguous_without_site_is_a_tool_error(
     assert result.is_error is True
 
 
+@pytest.mark.parametrize(
+    "bad_issue_key",
+    [
+        "ACME-1#x",
+        "ACME-1?x=1",
+        "ACME-1/comment/1/../../../ACME-2",
+        "not-a-key",
+        "",
+    ],
+)
+async def test_jira_list_attachments_rejects_invalid_issue_key_before_http(bad_issue_key: str) -> None:
+    """A SINGLE configured site -- `resolve_site` short-circuits to "only
+    configured site" without ever regex-checking `issue_key`, and there's no
+    `projects_filter` configured to trip `enforce_site_policy`'s own key
+    check either, so `_validate_issue_key` is the only thing standing
+    between a malicious `issue_key` and the REST path built from it."""
+    _registry, parent = _server_for(_site("acme", "ACME"))
+
+    with respx.mock:
+        route = respx.get(url__regex=r"https://acme\.atlassian\.net/rest/api/3/issue/.*")
+        async with Client(FastMCPTransport(parent)) as c:
+            result = await c.call_tool_mcp("jira_list_attachments", {"issue_key": bad_issue_key})
+
+        assert result.is_error is True
+        text = result.content[0].text
+        assert "issue_key" in text
+        assert not route.called
+
+
+@respx.mock
+async def test_jira_list_attachments_normalizes_a_lowercase_padded_issue_key() -> None:
+    _registry, parent = _server_for(_site("acme", "ACME"))
+    respx.get("https://acme.atlassian.net/rest/api/3/issue/ACME-1", params={"fields": "attachment"}).mock(
+        return_value=httpx.Response(200, json={"fields": {"attachment": []}})
+    )
+
+    async with Client(FastMCPTransport(parent)) as c:
+        result = await c.call_tool_mcp("jira_list_attachments", {"issue_key": " acme-1 "})
+
+    assert result.is_error is False
+    assert result.structured_content["issue_key"] == "ACME-1"
+
+
+async def test_jira_upload_attachments_rejects_invalid_issue_key_before_any_http_call(tmp_path: Path) -> None:
+    _registry, parent = _server_for(_site("acme", "ACME"))
+    upload_path = tmp_path / "file.txt"
+    upload_path.write_text("hello")
+
+    with respx.mock:
+        route = respx.post(url__regex=r"https://acme\.atlassian\.net/rest/api/3/issue/.*")
+        async with Client(FastMCPTransport(parent)) as c:
+            result = await c.call_tool_mcp(
+                "jira_upload_attachments",
+                {"issue_key": "ACME-1/../../ACME-2", "paths": [str(upload_path)]},
+            )
+
+        assert result.is_error is True
+        text = result.content[0].text
+        assert "issue_key" in text
+        assert not route.called
+
+
+async def test_jira_download_attachments_rejects_invalid_issue_key_before_http(tmp_path: Path) -> None:
+    _registry, parent = _server_for(_site("acme", "ACME"))
+
+    with respx.mock:
+        route = respx.get(url__regex=r"https://acme\.atlassian\.net/rest/api/3/issue/.*")
+        async with Client(FastMCPTransport(parent)) as c:
+            result = await c.call_tool_mcp(
+                "jira_download_attachments",
+                {"issue_key": "ACME-1?x=1", "target_dir": str(tmp_path)},
+            )
+
+        assert result.is_error is True
+        text = result.content[0].text
+        assert "issue_key" in text
+        assert not route.called
+
+
 async def test_jira_download_attachments_annotations_reflect_its_local_write_side_effect(
     client: Client[FastMCPTransport],
 ) -> None:

@@ -227,6 +227,7 @@ async def test_delete_comment_round_trip(
     added = json.loads(_text_content(add_result))
     comment_id = str(added["id"])
 
+    deleted = False
     try:
         delete_result = await live_client.call_tool_mcp(
             "jira_delete_comment", {"issue_key": issue_key, "comment_id": comment_id}
@@ -238,6 +239,7 @@ async def test_delete_comment_round_trip(
             "comment_id": comment_id,
             "deleted": True,
         }
+        deleted = True
 
         second_delete_result = await live_client.call_tool_mcp(
             "jira_delete_comment", {"issue_key": issue_key, "comment_id": comment_id}
@@ -245,9 +247,11 @@ async def test_delete_comment_round_trip(
         assert second_delete_result.is_error is True
         assert "404" in _text_content(second_delete_result)
     finally:
-        # Best-effort cleanup if the first delete above never ran (an
-        # assertion before it failed) -- harmless 404 if it already
-        # succeeded, same pattern as the attachment round trip's cleanup.
-        await live_client.call_tool_mcp(
-            "jira_delete_comment", {"issue_key": issue_key, "comment_id": comment_id}
-        )
+        # Best-effort cleanup only if the first delete above never ran (an
+        # assertion before it failed) -- once it succeeded, the second delete
+        # above already proved the comment is gone with a real 404, so a
+        # third delete here would just be redundant noise against the live site.
+        if not deleted:
+            await live_client.call_tool_mcp(
+                "jira_delete_comment", {"issue_key": issue_key, "comment_id": comment_id}
+            )

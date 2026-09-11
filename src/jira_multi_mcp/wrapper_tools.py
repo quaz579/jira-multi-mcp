@@ -7,7 +7,6 @@ upstream child -- see that module's docstring for why.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +23,7 @@ from jira_multi_mcp.mirror import LateMirror
 from jira_multi_mcp.model import Defaults
 from jira_multi_mcp.registry import SiteRegistry, SiteResolution, resolve_site
 from jira_multi_mcp.site_policy import enforce_site_policy
+from jira_multi_mcp.tools_meta import COMMENT_ID_RE, ISSUE_KEY_RE
 
 
 def _shape_entry(entry: dict[str, str]) -> dict[str, str]:
@@ -48,19 +48,39 @@ def _resolve_or_raise(
         raise ToolError(str(exc)) from exc
 
 
-_COMMENT_ID_RE = re.compile(r"^[0-9]+$")
-
-
 def _validate_comment_id(comment_id: str, site_name: str) -> str:
     """Jira's DELETE endpoint takes ``comment_id`` straight into the URL
-    path, so an unvalidated value (a slash, ``..``, a query string) would
-    reshape the request rather than simply fail as an unknown comment id."""
-    if not _COMMENT_ID_RE.match(comment_id):
+    path, so an unvalidated value (a slash, ``..``, a query string, or a
+    trailing newline) would reshape the request rather than simply fail as
+    an unknown comment id."""
+    if not COMMENT_ID_RE.fullmatch(comment_id):
         raise ToolError(
             f"[site={site_name}] jira_delete_comment: 'comment_id' must be a Jira comment id "
             f"(digits only), got {comment_id!r}"
         )
     return comment_id
+
+
+def _validate_issue_key(issue_key: str, site_name: str, tool_name: str) -> str:
+    """Every wrapper-owned REST tool takes ``issue_key`` straight into the
+    URL path, so an unvalidated value (a slash, a fragment, ``..``, a query
+    string) would reshape the request onto a different endpoint or a
+    different issue entirely rather than simply fail as an unknown key --
+    site resolution alone does not guard this: an explicit ``site`` argument
+    skips routing altogether, and a site with no ``projects_filter``
+    configured never runs ``enforce_site_policy``'s own key check either.
+
+    Returns the normalized (stripped, uppercased) key -- callers must use
+    THIS value for both the client call and the returned dict, not the raw
+    argument, so a lowercase key like ``acme-1`` keeps working instead of
+    being rejected."""
+    candidate = issue_key.strip().upper()
+    if not ISSUE_KEY_RE.fullmatch(candidate):
+        raise ToolError(
+            f"[site={site_name}] {tool_name}: 'issue_key' must be a Jira issue key like "
+            f"PROJ-123, got {issue_key!r}"
+        )
+    return candidate
 
 
 def build_jira_sites_tool(
@@ -147,11 +167,12 @@ def build_attachment_tools(
     async def jira_list_attachments(issue_key: str, site: str | None = None) -> dict[str, Any]:
         resolution = _resolve_or_raise(registry, issue_key, site, "jira_list_attachments")
         enforce_site_policy(resolution.site, "jira_list_attachments", is_write=False, issue_key=issue_key)
+        validated_key = _validate_issue_key(issue_key, resolution.site.name, "jira_list_attachments")
         client = attachment_clients.get(resolution.site.name)
-        attachments = await client.list_attachments(issue_key)
+        attachments = await client.list_attachments(validated_key)
         return {
             "site": resolution.site.name,
-            "issue_key": issue_key,
+            "issue_key": validated_key,
             "attachments": [
                 {
                     "id": a.id,
@@ -175,9 +196,10 @@ def build_attachment_tools(
     ) -> dict[str, Any]:
         resolution = _resolve_or_raise(registry, issue_key, site, "jira_download_attachments")
         enforce_site_policy(resolution.site, "jira_download_attachments", is_write=False, issue_key=issue_key)
+        validated_key = _validate_issue_key(issue_key, resolution.site.name, "jira_download_attachments")
         client = attachment_clients.get(resolution.site.name)
         downloaded, entries = await client.download(
-            issue_key,
+            validated_key,
             Path(target_dir),
             filenames=filenames,
             attachment_ids=attachment_ids,
@@ -185,7 +207,7 @@ def build_attachment_tools(
         )
         return {
             "site": resolution.site.name,
-            "issue_key": issue_key,
+            "issue_key": validated_key,
             "target_dir": str(Path(target_dir).expanduser().resolve()),
             "downloaded": [
                 {
@@ -207,6 +229,7 @@ def build_attachment_tools(
     ) -> dict[str, Any]:
         resolution = _resolve_or_raise(registry, issue_key, site, "jira_upload_attachments")
         enforce_site_policy(resolution.site, "jira_upload_attachments", is_write=True, issue_key=issue_key)
+        validated_key = _validate_issue_key(issue_key, resolution.site.name, "jira_upload_attachments")
         resolved_paths = []
         for raw_path in paths:
             candidate = Path(raw_path).expanduser()
@@ -217,10 +240,10 @@ def build_attachment_tools(
                 )
             resolved_paths.append(candidate)
         client = attachment_clients.get(resolution.site.name)
-        uploaded = await client.upload(issue_key, resolved_paths)
+        uploaded = await client.upload(validated_key, resolved_paths)
         return {
             "site": resolution.site.name,
-            "issue_key": issue_key,
+            "issue_key": validated_key,
             "uploaded": [
                 {"id": a.id, "filename": a.filename, "size": a.size, "mime_type": a.mime_type}
                 for a in uploaded
@@ -233,7 +256,8 @@ def build_attachment_tools(
             name="jira_list_attachments",
             description=(
                 "Lists an issue's attachments: id, filename, size, mime_type, created, author. "
-                "Read-only; does not fetch content -- use jira_download_attachments for that."
+                "Read-only; does not fetch content -- use jira_download_attachments for that. "
+                "issue_key must be a Jira issue key like PROJ-123 (case-insensitive)."
             ),
             annotations=mcp_types.ToolAnnotations(read_only_hint=True),
         ),
@@ -247,7 +271,8 @@ def build_attachment_tools(
                 "to download every attachment (an empty list for either is refused -- omit the "
                 "argument instead). Jira Cloud sites only. Use an absolute target_dir "
                 "-- a relative one resolves against the server process's own working directory, "
-                "not yours (the resolved path is echoed back in the result either way)."
+                "not yours (the resolved path is echoed back in the result either way). "
+                "issue_key must be a Jira issue key like PROJ-123 (case-insensitive)."
             ),
             # Not read-only despite reading from Jira: it writes to a
             # caller-supplied local path (target_dir), which is exactly the
@@ -268,7 +293,8 @@ def build_attachment_tools(
                 "Uploads one or more local files as new attachments on an issue. Each path must "
                 "already exist as a regular file; use absolute paths -- a relative one resolves "
                 "against the server process's own working directory, not yours. Write operation: "
-                "refused with a clear error on a site configured read_only = true."
+                "refused with a clear error on a site configured read_only = true. issue_key must "
+                "be a Jira issue key like PROJ-123 (case-insensitive)."
             ),
             annotations=mcp_types.ToolAnnotations(read_only_hint=False),
         ),
@@ -284,12 +310,13 @@ def build_comment_tools(registry: SiteRegistry, attachment_clients: AttachmentCl
     async def jira_delete_comment(issue_key: str, comment_id: str, site: str | None = None) -> dict[str, Any]:
         resolution = _resolve_or_raise(registry, issue_key, site, "jira_delete_comment")
         enforce_site_policy(resolution.site, "jira_delete_comment", is_write=True, issue_key=issue_key)
+        validated_key = _validate_issue_key(issue_key, resolution.site.name, "jira_delete_comment")
         validated_id = _validate_comment_id(comment_id, resolution.site.name)
         client = attachment_clients.get(resolution.site.name)
-        await client.delete_comment(issue_key, validated_id)
+        await client.delete_comment(validated_key, validated_id)
         return {
             "site": resolution.site.name,
-            "issue_key": issue_key,
+            "issue_key": validated_key,
             "comment_id": validated_id,
             "deleted": True,
         }
@@ -302,7 +329,9 @@ def build_comment_tools(registry: SiteRegistry, attachment_clients: AttachmentCl
                 "Permanently deletes ONE comment from an issue. Irreversible -- there is no undo "
                 "and no upstream equivalent (mcp-atlassian only supports add/edit). site is "
                 "inferred from issue_key's prefix if omitted. Write operation: refused with a "
-                "clear error on a site configured read_only = true. Jira Cloud sites only."
+                "clear error on a site configured read_only = true. Jira Cloud sites only. "
+                "issue_key must be a Jira issue key like PROJ-123 (case-insensitive); comment_id "
+                "must be digits only."
             ),
             # Not idempotent: a second call with the same arguments errors
             # (comment already gone) rather than repeating the same result.

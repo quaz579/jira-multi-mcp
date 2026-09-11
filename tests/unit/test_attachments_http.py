@@ -221,7 +221,7 @@ async def test_403_error_carries_jira_messages_and_not_the_token(http_client: ht
         await _client(site, http_client).list_attachments("ACME-1")
 
     message = str(exc_info.value)
-    assert "403" in message
+    assert message.startswith("[site=acme] jira_list_attachments: Jira returned 403")
     assert "You do not have permission to view this issue." in message
     assert _SECRET_TOKEN not in message
 
@@ -236,8 +236,9 @@ async def test_404_issue_raises_tool_error_with_jira_message(http_client: httpx.
     with pytest.raises(ToolError) as exc_info:
         await _client(site, http_client).list_attachments("ACME-99999")
 
-    assert "404" in str(exc_info.value)
-    assert "Issue does not exist" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert message.startswith("[site=acme] jira_list_attachments: Jira returned 404")
+    assert "Issue does not exist" in message
 
 
 @respx.mock
@@ -378,7 +379,7 @@ async def test_delete_comment_403_carries_jira_messages_and_not_the_token(
         await _client(site, http_client).delete_comment("ACME-1", "10050")
 
     message = str(exc_info.value)
-    assert "403" in message
+    assert message.startswith("[site=acme] jira_delete_comment: Jira returned 403")
     assert "You do not have permission to delete this comment." in message
     assert _SECRET_TOKEN not in message
 
@@ -393,8 +394,9 @@ async def test_delete_comment_404_raises_tool_error_with_jira_message(http_clien
     with pytest.raises(ToolError) as exc_info:
         await _client(site, http_client).delete_comment("ACME-1", "99999")
 
-    assert "404" in str(exc_info.value)
-    assert "Comment does not exist" in str(exc_info.value)
+    message = str(exc_info.value)
+    assert message.startswith("[site=acme] jira_delete_comment: Jira returned 404")
+    assert "Comment does not exist" in message
 
 
 @respx.mock
@@ -421,3 +423,85 @@ async def test_dc_site_refuses_delete_comment(http_client: httpx.AsyncClient) ->
     site = _dc_site()
     with pytest.raises(ToolError, match="Jira Cloud sites only in this version"):
         await _client(site, http_client).delete_comment("ONPREM-1", "10050")
+
+
+# Belt-and-braces: `wrapper_tools._validate_issue_key`/`_validate_comment_id`
+# already refuse these before the client is ever called, but a future caller
+# that skips that layer must not be able to build a request from an
+# unvalidated `issue_key`/`comment_id` either -- these call `JiraAttachmentClient`
+# directly, the way such a caller would.
+
+
+async def test_list_attachments_rejects_invalid_issue_key_without_the_wrapper(
+    http_client: httpx.AsyncClient,
+) -> None:
+    site = _cloud_site()
+    with respx.mock:
+        route = respx.get(url__regex=r"https://acme\.atlassian\.net/rest/api/3/issue/.*")
+        with pytest.raises(ToolError) as exc_info:
+            await _client(site, http_client).list_attachments("ACME-1#x")
+        assert not route.called
+    assert "[site=acme] jira_list_attachments:" in str(exc_info.value)
+    assert "issue_key" in str(exc_info.value)
+
+
+async def test_upload_rejects_invalid_issue_key_without_the_wrapper(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    site = _cloud_site()
+    upload_path = tmp_path / "notes.txt"
+    upload_path.write_text("hello")
+    with respx.mock:
+        route = respx.post(url__regex=r"https://acme\.atlassian\.net/rest/api/3/issue/.*")
+        with pytest.raises(ToolError) as exc_info:
+            await _client(site, http_client).upload("ACME-1/../../ACME-2", [upload_path])
+        assert not route.called
+    assert "[site=acme] jira_upload_attachments:" in str(exc_info.value)
+    assert "issue_key" in str(exc_info.value)
+
+
+async def test_delete_comment_rejects_invalid_issue_key_without_the_wrapper(
+    http_client: httpx.AsyncClient,
+) -> None:
+    site = _cloud_site()
+    with respx.mock:
+        route = respx.delete(url__regex=r"https://acme\.atlassian\.net/rest/api/3/issue/.*")
+        with pytest.raises(ToolError) as exc_info:
+            await _client(site, http_client).delete_comment("ACME-1?x=1", "10050")
+        assert not route.called
+    assert "[site=acme] jira_delete_comment:" in str(exc_info.value)
+    assert "issue_key" in str(exc_info.value)
+
+
+async def test_delete_comment_rejects_invalid_comment_id_without_the_wrapper(
+    http_client: httpx.AsyncClient,
+) -> None:
+    site = _cloud_site()
+    with respx.mock:
+        route = respx.delete(url__regex=r"https://acme\.atlassian\.net/rest/api/3/issue/ACME-1/comment/.*")
+        with pytest.raises(ToolError) as exc_info:
+            await _client(site, http_client).delete_comment("ACME-1", "10050\n")
+        assert not route.called
+    assert "[site=acme] jira_delete_comment:" in str(exc_info.value)
+    assert "comment_id" in str(exc_info.value)
+
+
+async def test_delete_comment_invalid_url_is_shaped_as_a_tool_error() -> None:
+    """A real ``httpx.InvalidURL`` can't occur once ``issue_key``/``comment_id``
+    pass this client's own ``_path_segment`` checks -- this proves the
+    transport-error handling still SHAPES one if it somehow did, rather than
+    letting it escape unshaped (``httpx.InvalidURL`` is NOT an
+    ``httpx.HTTPError`` subclass, so a plain ``except httpx.HTTPError``
+    doesn't catch it -- the exact gap this closes)."""
+
+    class _RaisingTransport(httpx.AsyncBaseTransport):
+        async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+            raise httpx.InvalidURL("bad url")
+
+    site = _cloud_site()
+    async with httpx.AsyncClient(transport=_RaisingTransport()) as http:
+        client = _client(site, http)
+        with pytest.raises(ToolError) as exc_info:
+            await client.delete_comment("ACME-1", "10050")
+
+    assert str(exc_info.value).startswith("[site=acme] jira_delete_comment:")

@@ -61,12 +61,12 @@ BASELINE_TOOLSET_TAGS: frozenset[str] = frozenset(
 
 # CURATED_TOOLS already includes "jira_download_attachments" (the one
 # wrapper-owned tool with a real upstream counterpart -- it's deliberately
-# shadowed, see tools_meta.WRAPPER_OWNED_TOOLS). The other three
+# shadowed, see tools_meta.WRAPPER_OWNED_TOOLS). The other four
 # wrapper-owned tools (jira_sites, jira_list_attachments,
-# jira_upload_attachments) have no upstream equivalent at all, so checking
-# whether they're "still present upstream" would be meaningless -- the
-# missing-tool check below is scoped to CURATED_TOOLS for exactly this
-# reason, not the full CURATED_TOOLS | WRAPPER_OWNED_TOOLS union.
+# jira_upload_attachments, jira_delete_comment) have no upstream equivalent
+# at all, so checking whether they're "still present upstream" would be
+# meaningless -- the missing-tool check below is scoped to CURATED_TOOLS for
+# exactly this reason, not the full CURATED_TOOLS | WRAPPER_OWNED_TOOLS union.
 
 
 @dataclass(frozen=True)

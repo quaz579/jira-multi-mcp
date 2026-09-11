@@ -1,6 +1,6 @@
 ---
 name: jira-multi
-description: Look up, search, or update Jira issues across several Jira Cloud sites through the jira-multi-mcp server, download or upload attachments straight to disk, and delete a comment. Use for requests like "look at JUMP-2274", "get JMC-13447", "what's the status of VJAP-979", "download the screenshots on JMC-13447", "attach this file to JUMP-2274", "add a comment to JMC-13447", or "delete that comment I just added to JMC-13447" — anything naming a Jira issue key or asking to search/browse Jira.
+description: Look up, search, or update Jira issues across several Jira Cloud sites through the jira-multi-mcp server, download or upload attachments straight to disk, and delete a comment. Use for requests like "look at JUMP-2274", "get JMC-13447", "what's the status of VJAP-979", "download the screenshots on JMC-13447", "attach this file to JUMP-2274", "add a comment to JMC-13447", or "delete that comment I just added to PROJ-123" — anything naming a Jira issue key or asking to search/browse Jira.
 ---
 
 # jira-multi-mcp
