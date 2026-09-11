@@ -458,16 +458,19 @@ class _DeadChildManager:
     async def client_for(self, site_name: str) -> _DeadChildClient:
         return _DeadChildClient(self._exc)
 
+    def generation(self, site_name: str) -> int:
+        return 0
+
     def log_path(self, site_name: str) -> Path:
         return self._log_path
 
     def redact(self, text: str) -> str:
         return text.replace(self._secret, "***") if self._secret else text
 
-    def mark_failed(self, site_name: str, reason: str) -> None:
+    def mark_failed(self, site_name: str, reason: str, *, generation: int | None = None) -> None:
         self.marked_failed.append(site_name)
 
-    def mark_timeout(self, site_name: str, reason: str) -> None:
+    def mark_timeout(self, site_name: str, reason: str, *, generation: int | None = None) -> None:
         pass
 
     def mark_success(self, site_name: str) -> None:
@@ -549,16 +552,19 @@ class _HangingChildManagerSpy:
     async def client_for(self, site_name: str) -> _HangingClient:
         return _HangingClient()
 
+    def generation(self, site_name: str) -> int:
+        return 0
+
     def log_path(self, site_name: str) -> Path:
         return self._log_path
 
     def redact(self, text: str) -> str:
         return text
 
-    def mark_failed(self, site_name: str, reason: str) -> None:
+    def mark_failed(self, site_name: str, reason: str, *, generation: int | None = None) -> None:
         pass
 
-    def mark_timeout(self, site_name: str, reason: str) -> None:
+    def mark_timeout(self, site_name: str, reason: str, *, generation: int | None = None) -> None:
         self.timeouts.append(site_name)
 
     def mark_success(self, site_name: str) -> None:
@@ -594,16 +600,19 @@ class _SlowClientForManagerSpy:
         await anyio.sleep(3600)
         raise AssertionError("unreachable")
 
+    def generation(self, site_name: str) -> int:
+        return 0
+
     def log_path(self, site_name: str) -> Path:
         return self._log_path
 
     def redact(self, text: str) -> str:
         return text
 
-    def mark_failed(self, site_name: str, reason: str) -> None:
+    def mark_failed(self, site_name: str, reason: str, *, generation: int | None = None) -> None:
         pass
 
-    def mark_timeout(self, site_name: str, reason: str) -> None:
+    def mark_timeout(self, site_name: str, reason: str, *, generation: int | None = None) -> None:
         self.timeouts.append(site_name)
 
     def mark_success(self, site_name: str) -> None:
@@ -642,16 +651,19 @@ class _RecoveringChildManagerSpy:
     async def client_for(self, site_name: str) -> _HangingClient:
         raise ToolError(self._message)
 
+    def generation(self, site_name: str) -> int:
+        return 0
+
     def log_path(self, site_name: str) -> Path:
         return self._log_path
 
     def redact(self, text: str) -> str:
         return text
 
-    def mark_failed(self, site_name: str, reason: str) -> None:
+    def mark_failed(self, site_name: str, reason: str, *, generation: int | None = None) -> None:
         pass
 
-    def mark_timeout(self, site_name: str, reason: str) -> None:
+    def mark_timeout(self, site_name: str, reason: str, *, generation: int | None = None) -> None:
         pass
 
     def mark_success(self, site_name: str) -> None:

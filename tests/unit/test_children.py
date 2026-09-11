@@ -521,6 +521,62 @@ async def test_mark_success_resets_the_timeout_counter(tmp_path: Path) -> None:
         assert health["acme"]["state"] == "healthy"
 
 
+async def test_mark_failed_with_a_stale_generation_is_a_no_op(tmp_path: Path) -> None:
+    """A slow, still-in-flight call captured `generation` before a recovery
+    already replaced the client it was using -- its eventual `mark_failed`
+    must not clobber the NEWER client's healthy state (the LOW finding)."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05),
+        tmp_path,
+        transport_factory=lambda site, up: FastMCPTransport(make_fake_child(site.name)),
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        stale_generation = manager.generation("acme")
+        assert stale_generation == 1
+
+        manager.mark_failed("acme", "simulated pipe break")
+        await anyio.sleep(0.1)  # past the (default) cooldown
+        await manager.client_for("acme")  # recovers -> generation bumps to 2
+
+        assert manager.generation("acme") == 2
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "healthy"
+
+        # The stale call's verdict, arriving late, must not un-heal the site.
+        manager.mark_failed("acme", "a stale call's late verdict", generation=stale_generation)
+
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "healthy"
+
+
+async def test_mark_timeout_with_a_stale_generation_is_a_no_op(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05),
+        tmp_path,
+        transport_factory=lambda site, up: FastMCPTransport(make_fake_child(site.name)),
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        stale_generation = manager.generation("acme")
+
+        manager.mark_failed("acme", "simulated pipe break")
+        await anyio.sleep(0.1)
+        await manager.client_for("acme")  # recovers -> a newer generation
+
+        manager.mark_timeout("acme", "a stale call's late timeout", generation=stale_generation)
+
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["timeouts"] == 0
+        assert health["acme"]["state"] == "healthy"
+
+
 async def test_probe_upstream_version_captures_stdout(tmp_path: Path) -> None:
     registry = SiteRegistry([_cloud_site("acme", "ACME")])
     upstream = UpstreamConfig(command=(sys.executable, "-c", "import sys; print(sys.argv[-1])"))
@@ -662,8 +718,14 @@ async def test_client_for_stays_failed_and_updates_next_retry_at_when_recovery_k
     )
     async with AsyncExitStack() as stack:
         await manager.start_all(stack, connect_timeout=5)
-        first_retry_at = manager._handles["acme"].next_retry_at  # noqa: SLF001 - whitebox on our own fake
-        assert first_retry_at is not None
+        # Both read via `health()`, not the raw handle: `next_retry_at` is
+        # stored internally on the monotonic clock and only converted to an
+        # epoch-seconds estimate inside `health()` (see `ChildHandle`'s
+        # docstring), so comparing a raw-handle read against a `health()`
+        # read would be comparing two different clocks.
+        first_health = {h["name"]: h for h in manager.health()}
+        first_retry_at = first_health["acme"]["next_retry_at"]
+        assert isinstance(first_retry_at, float)
 
         await anyio.sleep(0.1)
         with pytest.raises(ToolError):

@@ -160,11 +160,22 @@ class MultiSiteProxyTool(Tool):
             # caller's effective timeout was `call_timeout_seconds +
             # recovery time`, up to `connect_timeout_seconds` more (see
             # `children.ChildManager.client_for`'s docstring).
+            # `generation` (captured only once `client_for` has actually
+            # returned a client) lets `mark_timeout`/`mark_failed` below
+            # no-op if a recovery has ALREADY replaced this handle's client
+            # by the time this call fails -- otherwise a slow, stale
+            # in-flight call could clobber a newer, healthy client's state.
+            # `None` (never set, if `client_for` itself is what failed)
+            # means "unconditional", matching the pre-generation behavior.
+            generation: int | None = None
             with anyio.fail_after(self.timeout):
                 client = await self._manager.client_for(site.name)
+                generation = self._manager.generation(site.name)
                 result = await client.call_tool_mcp(self.name, args)
         except TimeoutError as exc:
-            self._manager.mark_timeout(site.name, f"{self.name} timed out after {self.timeout}s")
+            self._manager.mark_timeout(
+                site.name, f"{self.name} timed out after {self.timeout}s", generation=generation
+            )
             raise ToolError(
                 f"[site={site.name}] {self.name} timed out after {self.timeout}s. Child log: {log_path}"
             ) from exc
@@ -183,7 +194,7 @@ class MultiSiteProxyTool(Tool):
             # of letting a raw MCPError/connection exception escape unshaped.
             reason = f"{exc.__class__.__name__}: {exc}"
             if _is_connection_failure(exc):
-                self._manager.mark_failed(site.name, reason)
+                self._manager.mark_failed(site.name, reason, generation=generation)
             redacted = self._manager.redact(reason)
             raise ToolError(
                 f"[site={site.name}] {self.name} failed: {redacted}. Child log: {log_path}"

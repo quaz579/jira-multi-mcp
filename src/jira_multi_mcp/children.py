@@ -184,17 +184,28 @@ class ChildHandle:
     last_error: str | None = None
     last_error_at: float | None = None
     timeouts: int = 0
-    # Recovery bookkeeping (M4): ``next_retry_at`` is the earliest time
-    # ``client_for`` will attempt to restart this child once it's `failed`;
-    # ``recovery_attempts`` is a lifetime counter (never reset on success --
-    # it answers "how many restarts did this site ever need", not "how many
-    # since it last went healthy"). ``recovery_lock`` serializes concurrent
-    # callers hitting `client_for` for the same site the instant the cooldown
-    # expires, so two tool calls racing in that window don't both restart the
-    # child.
-    next_retry_at: float | None = None
+    # Recovery bookkeeping (M4): ``next_retry_at_monotonic`` is the earliest
+    # time (``time.monotonic()`` clock) ``client_for`` will attempt to
+    # restart this child once it's `failed` -- monotonic, not wall-clock,
+    # so a system clock step (NTP adjustment, DST, manual change) during the
+    # cooldown can't make it resolve early or never; ``health()`` converts
+    # it to an epoch-seconds estimate for ``jira_sites``, the only place
+    # that needs a wall-clock value. ``recovery_attempts`` is a lifetime
+    # counter (never reset on success -- it answers "how many restarts did
+    # this site ever need", not "how many since it last went healthy").
+    # ``recovery_lock`` serializes concurrent callers hitting `client_for`
+    # for the same site the instant the cooldown expires, so two tool calls
+    # racing in that window don't both restart the child.
+    next_retry_at_monotonic: float | None = None
     recovery_attempts: int = 0
     recovery_lock: anyio.Lock = field(default_factory=anyio.Lock)
+    # Bumped every time a NEW `Client` is assigned to this handle (initial
+    # connect or any recovery restart) -- lets a caller that captured the
+    # generation before a slow/stuck call notice a newer client has since
+    # replaced it, so its eventual `mark_failed`/`mark_timeout` (see those
+    # methods' `generation` parameter) doesn't clobber the newer client's
+    # state with a stale in-flight call's verdict.
+    generation: int = 0
 
 
 # A single slow call against an otherwise-healthy child shouldn't take the
@@ -321,6 +332,7 @@ class ChildManager:
                 # whose probe fails after connecting leak for the rest of the
                 # process's life.
                 handle.client = client
+                handle.generation += 1
                 await stack.enter_async_context(client)
                 await self._probe_liveness(client)
             # `move_on_after` (not `fail_after`) so a plain `TimeoutError` an
@@ -332,7 +344,7 @@ class ChildManager:
         except Exception as exc:  # noqa: BLE001 - isolate one site's failure from the rest
             handle.state = "failed"
             handle.error = self.redact(f"{exc.__class__.__name__}: {exc}")
-            handle.next_retry_at = time.time() + self._defaults.recovery_cooldown_seconds
+            handle.next_retry_at_monotonic = time.monotonic() + self._defaults.recovery_cooldown_seconds
             _logger.warning(
                 "site '%s' failed to start: %s (see %s)", site.name, handle.error, handle.log_path
             )
@@ -341,7 +353,7 @@ class ChildManager:
         if timed_out:
             handle.state = "failed"
             handle.error = f"connect timed out after {connect_timeout}s"
-            handle.next_retry_at = time.time() + self._defaults.recovery_cooldown_seconds
+            handle.next_retry_at_monotonic = time.monotonic() + self._defaults.recovery_cooldown_seconds
             _logger.warning(
                 "site '%s' failed to start: %s (see %s)", site.name, handle.error, handle.log_path
             )
@@ -355,33 +367,55 @@ class ChildManager:
             "site '%s' healthy: child fastmcp serverInfo.version=%s", site.name, handle.fastmcp_server_version
         )
 
-    def mark_failed(self, site_name: str, reason: str) -> None:
+    def generation(self, site_name: str) -> int:
+        """The handle's current client generation, for a caller to capture
+        right after ``client_for`` returns and pass back into
+        ``mark_failed``/``mark_timeout`` -- see ``ChildHandle.generation``.
+        ``-1`` for an unconfigured site (never equals a real generation, so
+        a stale check against it is always a no-op)."""
+        handle = self._handles.get(site_name)
+        return handle.generation if handle is not None else -1
+
+    def mark_failed(self, site_name: str, reason: str, *, generation: int | None = None) -> None:
         """Records a call-time connection failure discovered by the mirror
         (e.g. the child's pipe broke mid-session) so ``jira_sites`` reflects
         it instead of continuing to show a stale ``healthy``. Does not itself
         restart or reconnect the child -- it only stops ``client_for`` handing
         the dead client out again and records when/why. ``client_for`` is
         what actually retries, once ``recovery_cooldown_seconds`` has
-        elapsed (see ``_maybe_recover``)."""
+        elapsed (see ``_maybe_recover``).
+
+        ``generation``, when given, is the value ``self.generation(site_name)``
+        returned right after the caller's own ``client_for`` call. If the
+        handle has since moved to a newer generation (a recovery already
+        replaced the client this call was using), this is a stale verdict
+        from a client nobody's using anymore -- a no-op instead of clobbering
+        the newer client's state.
+        """
         handle = self._handles.get(site_name)
         if handle is None:
+            return
+        if generation is not None and generation != handle.generation:
             return
         handle.state = "failed"
         redacted = self.redact(reason)
         handle.error = redacted
         handle.last_error = redacted
         handle.last_error_at = time.time()
-        handle.next_retry_at = time.time() + self._defaults.recovery_cooldown_seconds
+        handle.next_retry_at_monotonic = time.monotonic() + self._defaults.recovery_cooldown_seconds
         _logger.warning("site '%s' marked failed after a call: %s", site_name, redacted)
 
-    def mark_timeout(self, site_name: str, reason: str) -> None:
+    def mark_timeout(self, site_name: str, reason: str, *, generation: int | None = None) -> None:
         """Records a per-call timeout (distinct from ``mark_failed``'s
         connection-level failure): the child's pipe is presumably still
         alive, it just didn't answer in time. Surfaced as ``timeouts`` in
         ``jira_sites``; flips to ``failed`` only after
-        ``_MAX_CONSECUTIVE_TIMEOUTS`` in a row."""
+        ``_MAX_CONSECUTIVE_TIMEOUTS`` in a row. ``generation`` is the same
+        staleness guard as ``mark_failed``'s."""
         handle = self._handles.get(site_name)
         if handle is None:
+            return
+        if generation is not None and generation != handle.generation:
             return
         redacted = self.redact(reason)
         handle.timeouts += 1
@@ -391,12 +425,14 @@ class ChildManager:
         if handle.timeouts >= _MAX_CONSECUTIVE_TIMEOUTS:
             handle.state = "failed"
             handle.error = redacted
-            handle.next_retry_at = time.time() + self._defaults.recovery_cooldown_seconds
+            handle.next_retry_at_monotonic = time.monotonic() + self._defaults.recovery_cooldown_seconds
 
     def mark_success(self, site_name: str) -> None:
         """Resets the consecutive-timeout counter after a call that actually
         completed a round trip -- whether the tool itself errored or not,
-        either way the child answered, so it isn't stuck."""
+        either way the child answered, so it isn't stuck. Ungated by
+        generation: a success means the client that was used is still fine,
+        regardless of whether a newer generation exists by now."""
         handle = self._handles.get(site_name)
         if handle is not None:
             handle.timeouts = 0
@@ -449,6 +485,9 @@ class ChildManager:
         return version
 
     def upstream_version(self) -> str | None:
+        """The one version probed at startup by ``probe_upstream_version``
+        (never re-probed on recovery: a restarted child is the same pinned
+        ``upstream.command``, so its version can't have changed mid-process)."""
         return self._upstream_version
 
     async def client_for(self, site_name: str) -> Client[ClientTransport]:
@@ -492,7 +531,7 @@ class ChildManager:
         lock would burn its own call budget waiting on someone else's
         restart instead of getting a fast, clear answer.
         """
-        if handle.next_retry_at is not None and time.time() < handle.next_retry_at:
+        if handle.next_retry_at_monotonic is not None and time.monotonic() < handle.next_retry_at_monotonic:
             return
         try:
             handle.recovery_lock.acquire_nowait()
@@ -504,7 +543,10 @@ class ChildManager:
             # failure) a recovery attempt before this one got here.
             if handle.state != "failed":
                 return
-            if handle.next_retry_at is not None and time.time() < handle.next_retry_at:
+            if (
+                handle.next_retry_at_monotonic is not None
+                and time.monotonic() < handle.next_retry_at_monotonic
+            ):
                 return
             await self._attempt_recovery(handle)
         finally:
@@ -551,6 +593,7 @@ class ChildManager:
                 transport = self._transport_factory(site, self._upstream)
                 client: Client[ClientTransport] = Client(transport)
                 handle.client = client
+                handle.generation += 1
                 await client.__aenter__()  # type: ignore[no-untyped-call]
                 await self._probe_liveness(client)
             timed_out = scope.cancelled_caught
@@ -568,7 +611,7 @@ class ChildManager:
         handle.error = None
         handle.timeouts = 0
         handle.connected_at = time.time()
-        handle.next_retry_at = None
+        handle.next_retry_at_monotonic = None
         info = client.server_info
         handle.fastmcp_server_version = info.version if info is not None else None
         _logger.info(
@@ -582,7 +625,7 @@ class ChildManager:
         handle.error = reason
         handle.last_error = reason
         handle.last_error_at = time.time()
-        handle.next_retry_at = time.time() + self._defaults.recovery_cooldown_seconds
+        handle.next_retry_at_monotonic = time.monotonic() + self._defaults.recovery_cooldown_seconds
         _logger.warning("site '%s' recovery attempt failed: %s", handle.site.name, reason)
 
     async def discover_tools(self) -> list[mcp_types.Tool]:
@@ -611,6 +654,15 @@ class ChildManager:
     def health(self) -> list[dict[str, object]]:
         result = []
         for handle in self._handles.values():
+            next_retry_at: float | None = None
+            if handle.next_retry_at_monotonic is not None:
+                # `next_retry_at_monotonic` is on the monotonic clock (see
+                # ChildHandle's docstring); `jira_sites` wants a wall-clock
+                # value a human/model can read, so convert via the current
+                # offset between the two clocks. An estimate, not a stored
+                # wall-clock time: fine for "roughly when will this retry",
+                # the only thing this field is for.
+                next_retry_at = time.time() + (handle.next_retry_at_monotonic - time.monotonic())
             result.append(
                 {
                     "name": handle.site.name,
@@ -624,7 +676,7 @@ class ChildManager:
                     "last_error_at": handle.last_error_at,
                     "timeouts": handle.timeouts,
                     "recovery_attempts": handle.recovery_attempts,
-                    "next_retry_at": handle.next_retry_at,
+                    "next_retry_at": next_retry_at,
                     "log_path": str(handle.log_path),
                     "fastmcp_server_version": handle.fastmcp_server_version,
                     "discovery_source": handle.site.name == self._discovery_source,
