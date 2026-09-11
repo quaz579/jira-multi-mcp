@@ -44,7 +44,8 @@ def test_check_all_sites_pass(tmp_path: Path, capsys: pytest.CaptureFixture[str]
         return_value=Response(200, json={"displayName": "Ben Grossman", "accountId": "acc-beta"})
     )
 
-    exit_code = main(["--check", "--config", str(_write_config(tmp_path))])
+    config_path = _write_config(tmp_path)
+    exit_code = main(["--check", "--config", str(config_path)])
 
     assert exit_code == 0
     captured = capsys.readouterr()
@@ -53,6 +54,11 @@ def test_check_all_sites_pass(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     assert "Ben Grossman" in captured.out
     assert TOKEN not in captured.out
     assert TOKEN not in captured.err
+    # Regression: the SOURCE column and each site's resolved provenance
+    # (both sites here come from the same config file) must render.
+    assert "SOURCE" in captured.out
+    acme_line = next(line for line in captured.out.splitlines() if line.startswith("acme"))
+    assert str(config_path) in acme_line
 
 
 @respx.mock
