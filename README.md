@@ -8,8 +8,36 @@ routed by issue-key prefix, and adds attachment download/upload tools that
 write straight to disk instead of returning base64.
 
 Status: pre-alpha, under construction. This repo currently ships config
-loading, the site registry, and a CLI (`--check`, `--print-config`, `--warm`);
-`serve` (the actual MCP server) lands in a later milestone.
+loading, the site registry, a CLI (`--check`, `--print-config`, `--warm`), the
+running `serve` MCP server (child processes mirrored behind a `site`
+selector), and the attachment tools described below.
+
+## Attachment tools
+
+Attachments are implemented directly against Jira Cloud REST v3 (not
+forwarded to an upstream child), because upstream `mcp-atlassian` only
+returns attachment content as base64 in-band. Jira Cloud sites only in this
+version — a `personal_token` (Server/Data Center) site gets a clear refusal
+instead.
+
+- `jira_list_attachments(issue_key, site?)` — `id`, `filename`, `size`,
+  `mime_type`, `created`, `author` for every attachment on the issue.
+- `jira_download_attachments(issue_key, target_dir, site?, filenames?, attachment_ids?, overwrite?)`
+  — writes attachments to `target_dir` and returns their paths (read the file
+  from disk afterward; prefer this over any base64 tool). Omit
+  `filenames`/`attachment_ids` to download everything. An existing file is
+  never silently overwritten: a same-named download falls back to
+  `{name}-{attachment_id}{ext}`, and if that also exists it's reported under
+  `skipped` rather than written (`overwrite=true` to replace in place
+  instead). Anything selected but not written lands in `skipped` (name
+  collision) or `failed` (rejected by Jira, over `defaults.attachment_max_bytes`,
+  or an unsafe filename).
+- `jira_upload_attachments(issue_key, paths, site?)` — uploads local files
+  (each must already exist as a regular file) and returns the created
+  attachments' `id`/`filename`/`size`/`mime_type`.
+
+`site` is optional on all three and inferred from `issue_key`'s project
+prefix the same way every mirrored tool resolves it.
 
 ## Configuration
 

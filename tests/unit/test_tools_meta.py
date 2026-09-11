@@ -18,12 +18,16 @@ def test_curated_tools_are_all_jira_prefixed() -> None:
     assert all(name.startswith("jira_") for name in CURATED_TOOLS)
 
 
+_WRAPPER_ONLY_TOOLS = frozenset({"jira_sites", "jira_list_attachments", "jira_upload_attachments"})
+
+
 def test_wrapper_owned_tools_shadowing_an_upstream_tool_are_curated() -> None:
-    # "jira_sites" is wrapper-only and was never an upstream tool name, so it
-    # isn't (and shouldn't be) in CURATED_TOOLS; every WRAPPER_OWNED_TOOLS
-    # entry that DOES shadow a real upstream tool must still be curated.
-    assert (WRAPPER_OWNED_TOOLS - {"jira_sites"}) <= CURATED_TOOLS
-    assert "jira_sites" not in CURATED_TOOLS
+    # jira_sites/jira_list_attachments/jira_upload_attachments are wrapper-only
+    # and were never upstream tool names, so they aren't (and shouldn't be) in
+    # CURATED_TOOLS; every WRAPPER_OWNED_TOOLS entry that DOES shadow a real
+    # upstream tool (currently just jira_download_attachments) must still be curated.
+    assert (WRAPPER_OWNED_TOOLS - _WRAPPER_ONLY_TOOLS) <= CURATED_TOOLS
+    assert _WRAPPER_ONLY_TOOLS.isdisjoint(CURATED_TOOLS)
 
 
 def test_jql_is_never_a_routing_argument() -> None:

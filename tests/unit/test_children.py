@@ -54,6 +54,16 @@ def test_enabled_tools_is_curated_minus_wrapper_owned_by_default() -> None:
     assert "jira_download_attachments" not in names
 
 
+def test_enabled_tools_excludes_all_wrapper_owned_attachment_names() -> None:
+    site = _cloud_site("acme", "ACME")
+    env = build_child_env(site, UpstreamConfig(), Defaults(toolset_preset="curated"))
+    names = set(env["ENABLED_TOOLS"].split(","))
+    assert names.isdisjoint(WRAPPER_OWNED_TOOLS)
+    assert "jira_list_attachments" not in names
+    assert "jira_upload_attachments" not in names
+    assert "jira_download_attachments" not in names
+
+
 def test_enabled_tools_omitted_for_all_preset_with_no_site_override() -> None:
     site = _cloud_site("acme", "ACME")
     env = build_child_env(site, UpstreamConfig(), Defaults(toolset_preset="all"))

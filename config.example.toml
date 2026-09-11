@@ -20,6 +20,9 @@ toolset_preset = "curated"
 
 call_timeout_seconds    = 120
 connect_timeout_seconds = 90
+# Per-file cap enforced by jira_download_attachments (checked against both
+# the server's reported Content-Length and the actual streamed byte count).
+# 100 MiB default.
 attachment_max_bytes    = 104857600
 
 [upstream]

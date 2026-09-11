@@ -15,13 +15,14 @@ from fastmcp import Client, FastMCP
 from fastmcp.client.transports import ClientTransport, FastMCPTransport
 from fastmcp.exceptions import ToolError
 
+from jira_multi_mcp.attachments import AttachmentClientRegistry
 from jira_multi_mcp.children import ChildManager
 from jira_multi_mcp.mirror import MultiSiteProxyTool, build_mirrored_tools
 from jira_multi_mcp.model import Defaults, SiteConfig, UpstreamConfig
 from jira_multi_mcp.registry import SiteRegistry
 from jira_multi_mcp.secrets import Secret
 from jira_multi_mcp.tools_meta import CURATED_TOOLS, WRAPPER_OWNED_TOOLS
-from jira_multi_mcp.wrapper_tools import build_jira_sites_tool
+from jira_multi_mcp.wrapper_tools import build_attachment_tools, build_jira_sites_tool
 from tests.fakes.fake_child import make_fake_child
 
 _ALLOWLIST = CURATED_TOOLS | {
@@ -97,6 +98,42 @@ async def test_download_attachments_is_shadowed_from_the_parent(rig: _Rig) -> No
     assert "jira_sites" in names  # the wrapper's own tool, not mirrored from a child
     # No *mirrored* (child-shadowing) wrapper-owned tool should ever leak through.
     assert (WRAPPER_OWNED_TOOLS - {"jira_sites"}).isdisjoint(names)
+
+
+async def test_upstream_download_is_shadowed(tmp_path: Path) -> None:
+    """The fake child advertises its own (base64) ``jira_download_attachments``;
+    the parent must expose exactly one tool by that name -- ours, distinguished
+    by its ``target_dir`` parameter that the upstream tool's schema never had."""
+    registry = SiteRegistry([_site("acme", "ACME")])
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(),
+        tmp_path,
+        transport_factory=lambda site, up: FastMCPTransport(make_fake_child(site.name)),
+    )
+    attachment_clients = AttachmentClientRegistry(registry.sites, Defaults(), redact=manager.redact)
+
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        tools = await manager.discover_tools()
+        mirrored = build_mirrored_tools(tools, manager, registry, _ALLOWLIST, timeout=_TIMEOUT)
+
+        parent = FastMCP("test-parent")
+        parent.add_tool(build_jira_sites_tool(manager))
+        for attachment_tool in build_attachment_tools(registry, attachment_clients):
+            parent.add_tool(attachment_tool)
+        for tool in mirrored:
+            parent.add_tool(tool)
+
+        async with Client(FastMCPTransport(parent)) as client:
+            listed = await client.list_tools()
+            download_tools = [t for t in listed if t.name == "jira_download_attachments"]
+            assert len(download_tools) == 1
+            assert "target_dir" in download_tools[0].input_schema["properties"]
+            names = {t.name for t in listed}
+            assert "jira_list_attachments" in names
+            assert "jira_upload_attachments" in names
 
 
 async def test_site_is_stripped_before_forwarding_to_the_child(rig: _Rig) -> None:
