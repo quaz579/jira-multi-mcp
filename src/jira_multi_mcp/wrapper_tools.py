@@ -10,12 +10,14 @@ from pathlib import Path
 from typing import Any
 
 import mcp_types
+from fastmcp import Context
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.base import Tool
 
 from jira_multi_mcp.attachments import AttachmentClientRegistry
 from jira_multi_mcp.children import ChildManager
 from jira_multi_mcp.errors import SiteResolutionError
+from jira_multi_mcp.mirror import LateMirror
 from jira_multi_mcp.registry import SiteRegistry, SiteResolution, resolve_site
 from jira_multi_mcp.site_policy import enforce_site_policy
 
@@ -42,26 +44,43 @@ def _resolve_or_raise(
         raise ToolError(str(exc)) from exc
 
 
-def build_jira_sites_tool(manager: ChildManager) -> Tool:
+def build_jira_sites_tool(manager: ChildManager, *, late_mirror: LateMirror | None = None) -> Tool:
     """Per-site health, never credentials: name, host, prefixes, read_only,
     state, error, last_error/last_error_at, log path, the FastMCP library
     version each child reports, and whether that site was the tool-discovery
     source. Also carries the ONE shared ``upstream_version`` (mcp-atlassian's
     own version, probed once at startup -- every site launches the same
     command) and, when no configured site is currently healthy, a top-level
-    ``note`` explaining that no child could be reached."""
+    ``note`` explaining that no child could be reached.
 
-    async def jira_sites() -> dict[str, Any]:
+    Also drives recovery: every call attempts ``ChildManager.recover_failed_sites()``
+    first (a no-op for a site still within its cooldown, or already
+    healthy), then, if ``late_mirror`` is given, ``LateMirror.after_recovery``
+    -- the only way a server that started with EVERY site down ever gets a
+    chance to mirror real tools once one comes back (see ``LateMirror``'s
+    docstring). Both are no-ops once nothing is failed / tools are already
+    mirrored, so a healthy server pays only the cost of ``manager.health()``.
+    """
+
+    async def jira_sites(ctx: Context) -> dict[str, Any]:
+        await manager.recover_failed_sites()
+        recovery_note: str | None = None
+        if late_mirror is not None:
+            recovery_note = await late_mirror.after_recovery(ctx)
+
         sites = manager.health()
         payload: dict[str, Any] = {
             "sites": sites,
             "upstream_version": manager.upstream_version(),
         }
+        notes: list[str] = []
         healthy = [site for site in sites if site["state"] == "healthy"]
         if not healthy:
-            payload["note"] = (
+            notes.append(
                 "no configured site is currently healthy; tool discovery could not run "
-                "against any child. See each site's 'error'/'log_path' above."
+                "against any child. Recovery is attempted automatically on every jira_sites "
+                "call once a failed site's cooldown has elapsed -- see each site's "
+                "'error'/'next_retry_at' above."
             )
         elif all(site["read_only"] or site["enabled_tools_restricted"] for site in healthy):
             # Distinct from the no-healthy-site case above: every child IS
@@ -69,11 +88,15 @@ def build_jira_sites_tool(manager: ChildManager) -> Tool:
             # write tool -- so a write tool call fails with a bare "Unknown
             # tool" (fastmcp has no catch-all to shape that into a clearer
             # error) rather than the usual "[site=x] ... read_only" hint.
-            payload["note"] = (
+            notes.append(
                 "every healthy site is read_only or has enabled_tools configured; write tools "
                 "are not mirrored, so calling one by name fails with a bare 'Unknown tool' rather "
                 "than a [site=] error. See each site's 'read_only'/'enabled_tools_restricted' above."
             )
+        if recovery_note is not None:
+            notes.append(recovery_note)
+        if notes:
+            payload["note"] = " ".join(notes)
         return payload
 
     return Tool.from_function(jira_sites, name="jira_sites")

@@ -515,6 +515,37 @@ class ChildManager:
             )
         return handle.client
 
+    async def recover_failed_sites(self) -> list[str]:
+        """Attempts recovery for every currently ``failed`` site past its
+        cooldown, concurrently. Returns the names that are ``healthy``
+        afterward (whether they needed recovering just now or already were).
+
+        Exists because ``client_for`` -- the only other path that ever calls
+        ``_maybe_recover`` -- is only reached by a mirrored tool call, and if
+        EVERY configured site failed at startup, zero tools were ever
+        mirrored (see ``discover_tools``): nothing would ever call
+        ``client_for`` again, so a site could sit `failed` forever with no
+        way back to `healthy` even once whatever was wrong with it clears
+        up. ``jira_sites`` calls this on every invocation specifically to
+        give that dead end a way out (see ``wrapper_tools.build_jira_sites_tool``).
+        """
+        failed = [h for h in self._handles.values() if h.state == "failed"]
+
+        async def _recover_one(handle: ChildHandle) -> None:
+            try:
+                await self._maybe_recover(handle)
+            except ToolError:
+                # Another caller already holds this site's recovery lock
+                # (see `_maybe_recover`) -- not this method's problem; that
+                # caller's own attempt will settle the state.
+                pass
+
+        async with anyio.create_task_group() as tg:
+            for handle in failed:
+                tg.start_soon(_recover_one, handle)
+
+        return [h.site.name for h in self._handles.values() if h.state == "healthy"]
+
     async def _maybe_recover(self, handle: ChildHandle) -> None:
         """Re-probes a ``failed`` site once ``recovery_cooldown_seconds`` has
         elapsed since its last failure, restarting the child if so.

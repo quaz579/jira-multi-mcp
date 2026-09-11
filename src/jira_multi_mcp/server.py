@@ -25,7 +25,7 @@ from jira_multi_mcp.attachments import AttachmentClientRegistry
 from jira_multi_mcp.children import ChildManager
 from jira_multi_mcp.errors import JiraMultiError
 from jira_multi_mcp.logging_setup import attach_redaction, configure_logging, resolve_log_dir
-from jira_multi_mcp.mirror import build_mirrored_tools
+from jira_multi_mcp.mirror import LateMirror, build_mirrored_tools
 from jira_multi_mcp.model import AppConfig
 from jira_multi_mcp.registry import SiteRegistry
 from jira_multi_mcp.tools_meta import CURATED_TOOLS
@@ -146,7 +146,22 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
                         else:
                             raise
                     else:
-                        mcp.add_tool(build_jira_sites_tool(manager))
+                        # Passed to `jira_sites` so a server that started
+                        # with EVERY site down still has a way to mirror
+                        # real tools once one recovers -- `discover_tools`
+                        # only ran once, above, against whichever sites were
+                        # already healthy by then (see `LateMirror`'s
+                        # docstring for why nothing else would ever retry
+                        # discovery on this server's behalf).
+                        late_mirror = LateMirror(
+                            mcp,
+                            manager,
+                            registry,
+                            allowlist,
+                            config.defaults.call_timeout_seconds,
+                            already_mirrored=bool(mirrored),
+                        )
+                        mcp.add_tool(build_jira_sites_tool(manager, late_mirror=late_mirror))
                         for attachment_tool in build_attachment_tools(registry, attachment_clients):
                             mcp.add_tool(attachment_tool)
                         for tool in mirrored:

@@ -10,6 +10,7 @@ from typing import Any, ClassVar
 
 import anyio
 import mcp_types
+from fastmcp import Context, FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.base import Tool, ToolResult
 from mcp import MCPError
@@ -261,3 +262,79 @@ def build_mirrored_tools(
             _logger.warning("tool '%s' is allowlisted but no healthy child advertised it", name)
 
     return mirrored
+
+
+class LateMirror:
+    """Mirrors newly-discovered tools onto the already-running server AFTER
+    startup -- the one case that can't wait for a restart: every configured
+    site failed at startup, so ``discover_tools()`` returned nothing and
+    ``build_mirrored_tools`` mirrored zero tools. From there, ``client_for``
+    -- the only other path that ever drives a failed site's recovery -- is
+    never reached again either (nothing calls a tool that doesn't exist), so
+    without this the server would serve `jira_sites` and the attachment
+    tools forever with no way back.
+
+    ``wrapper_tools.build_jira_sites_tool`` calls ``after_recovery`` on
+    every ``jira_sites`` invocation, right after
+    ``ChildManager.recover_failed_sites()``. A no-op once something has
+    already been mirrored, whether that happened at startup or via a
+    previous call here.
+    """
+
+    def __init__(
+        self,
+        mcp: FastMCP,
+        manager: ChildManager,
+        registry: SiteRegistry,
+        allowlist: frozenset[str] | None,
+        timeout: float,
+        *,
+        already_mirrored: bool = False,
+    ) -> None:
+        self._mcp = mcp
+        self._manager = manager
+        self._registry = registry
+        self._allowlist = allowlist
+        self._timeout = timeout
+        # `already_mirrored=True` when the caller already added tools from
+        # this SAME discovery pipeline once (the ordinary startup path in
+        # `server.serve`) -- without this, the first `jira_sites` call after
+        # a successful startup would immediately re-discover and try to
+        # `mcp.add_tool` every already-mirrored tool a second time, which
+        # raises (fastmcp's default `on_duplicate="error"`).
+        self._mirrored = already_mirrored
+        # Double-checked, not just an early-return flag check: `mcp.add_tool`
+        # raises on a duplicate name (fastmcp's default `on_duplicate`), so
+        # two concurrent `jira_sites` calls both observing `_mirrored=False`
+        # and both mirroring would have the second one crash.
+        self._lock = anyio.Lock()
+
+    async def after_recovery(self, ctx: Context) -> str | None:
+        """Returns a note for ``jira_sites`` to surface only when tools WERE
+        newly mirrored just now but the connected client couldn't be told
+        its tool list changed (it may need a manual re-list); ``None`` in
+        every other case, including "nothing to do"."""
+        if self._mirrored:
+            return None
+        async with self._lock:
+            if self._mirrored:
+                return None
+            tools = await self._manager.discover_tools()
+            mirrored = build_mirrored_tools(
+                tools, self._manager, self._registry, self._allowlist, self._timeout
+            )
+            if not mirrored:
+                # Nothing healthy enough yet to mirror anything real --
+                # leave `_mirrored` false so a later call can retry.
+                return None
+            for tool in mirrored:
+                self._mcp.add_tool(tool)
+            self._mirrored = True
+        try:
+            await ctx.session.send_tool_list_changed()
+        except Exception:  # noqa: BLE001 - best-effort; an older/simpler client may not support this
+            return (
+                "tools were mirrored after recovery, but the connected client could not be "
+                "notified of the change -- it may need to re-list tools to see them"
+            )
+        return None

@@ -17,7 +17,7 @@ from fastmcp.exceptions import ToolError
 
 from jira_multi_mcp.attachments import AttachmentClientRegistry
 from jira_multi_mcp.children import ChildManager
-from jira_multi_mcp.mirror import MultiSiteProxyTool, build_mirrored_tools
+from jira_multi_mcp.mirror import LateMirror, MultiSiteProxyTool, build_mirrored_tools
 from jira_multi_mcp.model import Defaults, SiteConfig, UpstreamConfig
 from jira_multi_mcp.registry import SiteRegistry
 from jira_multi_mcp.secrets import Secret
@@ -416,6 +416,74 @@ async def test_jira_sites_note_when_no_site_is_healthy(tmp_path: Path) -> None:
             assert "note" in payload
             assert "no configured site is currently healthy" in payload["note"]
     assert tools == []
+
+
+async def test_jira_sites_mirrors_real_tools_after_every_site_recovers_from_startup_failure(
+    tmp_path: Path,
+) -> None:
+    """The coordinator-added MEDIUM finding: if EVERY site fails at startup,
+    `discover_tools()` returns nothing and zero tools are ever mirrored --
+    and since a mirrored tool call is the only other thing that ever drives
+    a failed site's recovery (`ChildManager.client_for`), nothing would ever
+    call it again either. `jira_sites` must both recover sites itself
+    (`recover_failed_sites`) and, the first time one succeeds, register real
+    mirrored tools onto the already-running server (`LateMirror`)."""
+    registry = SiteRegistry([_site("acme", "ACME")])
+    attempts = {"count": 0}
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("simulated connect failure")  # the startup attempt
+        return FastMCPTransport(make_fake_child(site.name))  # every later (recovery) attempt
+
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05),
+        tmp_path,
+        transport_factory=factory,
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        tools = await manager.discover_tools()
+        mirrored = build_mirrored_tools(tools, manager, registry, _ALLOWLIST, timeout=_TIMEOUT)
+        assert mirrored == []  # the every-site-failed starting condition
+
+        parent = FastMCP("test-parent")
+        late_mirror = LateMirror(
+            parent, manager, registry, _ALLOWLIST, _TIMEOUT, already_mirrored=bool(mirrored)
+        )
+        parent.add_tool(build_jira_sites_tool(manager, late_mirror=late_mirror))
+
+        async with Client(FastMCPTransport(parent)) as client:
+            names_before = {t.name for t in await client.list_tools()}
+            assert names_before == {"jira_sites"}
+
+            await anyio.sleep(0.1)  # past the cooldown
+            result = await client.call_tool_mcp("jira_sites", {})
+            assert not result.is_error
+            assert attempts["count"] == 2  # exactly one recovery attempt
+
+            # The real Client used here DOES support tools/list_changed
+            # (fastmcp negotiates that capability for it), so LateMirror's
+            # notification must have actually succeeded -- no "could not be
+            # notified" fallback note, proving `send_tool_list_changed`
+            # itself worked rather than silently failing every time.
+            payload = result.structured_content
+            assert "note" not in (payload or {})
+
+            names_after = {t.name for t in await client.list_tools()}
+            assert names_after > names_before  # real tools now mirrored, not just jira_sites
+            assert "jira_get_issue" in names_after
+
+            # A second call must be a no-op: no new factory call (already
+            # healthy), and no duplicate-add crash (fastmcp's default
+            # on_duplicate="error" would raise if LateMirror mirrored twice).
+            result_again = await client.call_tool_mcp("jira_sites", {})
+            assert not result_again.is_error
+            assert attempts["count"] == 2
+            assert {t.name for t in await client.list_tools()} == names_after
 
 
 async def test_discover_tools_prefers_unrestricted_site_over_read_only(
