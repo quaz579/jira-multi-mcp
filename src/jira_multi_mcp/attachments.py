@@ -357,31 +357,51 @@ class JiraAttachmentClient:
             )
         part = Path(part_name)
 
+        # `handle` takes ownership of `fd` from this line on: every exit
+        # below -- a shaped `_DownloadEntry`, an `httpx.HTTPError`, or a
+        # `BaseException` (e.g. task cancellation) -- runs through the
+        # `finally` blocks, so the fd is always closed and `part` is always
+        # removed unless `_finalize` actually publishes it. Previously
+        # `os.fdopen(fd, ...)` didn't happen until deep inside the response
+        # handling, so a non-2xx status, an over-cap `Content-Length`, or an
+        # error raised just setting up the stream left the raw `mkstemp` fd
+        # open with nothing left to close it.
         try:
-            # Cloud's attachment `content` URL 302s to a pre-signed media-CDN
-            # URL on a different host; httpx drops the Authorization header
-            # on that cross-host redirect. That's correct, not a bug -- the
-            # redirect target is pre-signed and needs no auth of ours. Never
-            # "fix" this into replaying our Basic auth cross-host, which
-            # would leak it to whatever host Jira sends us to.
-            async with self._http.stream("GET", attachment.content_url, follow_redirects=True) as response:
-                try:
-                    await self._raise_for_status(response, "GET", attachment.content_url)
-                except ToolError as exc:
-                    part.unlink(missing_ok=True)
-                    return _DownloadEntry(attachment.filename, str(exc), "failed")
+            handle = os.fdopen(fd, "wb")
+        except OSError as exc:
+            os.close(fd)
+            part.unlink(missing_ok=True)
+            return _DownloadEntry(
+                attachment.filename, f"could not open temp file: {exc.__class__.__name__}: {exc}", "failed"
+            )
 
-                declared_size = self._parse_content_length(response.headers.get("content-length"))
-                if declared_size is not None and declared_size > self._max_bytes:
-                    part.unlink(missing_ok=True)
-                    return _DownloadEntry(
-                        attachment.filename,
-                        f"reported size {declared_size} bytes exceeds max_bytes {self._max_bytes}",
-                        "failed",
-                    )
+        published = False
+        try:
+            written = 0
+            try:
+                # Cloud's attachment `content` URL 302s to a pre-signed
+                # media-CDN URL on a different host; httpx drops the
+                # Authorization header on that cross-host redirect. That's
+                # correct, not a bug -- the redirect target is pre-signed and
+                # needs no auth of ours. Never "fix" this into replaying our
+                # Basic auth cross-host, which would leak it to whatever host
+                # Jira sends us to.
+                async with self._http.stream(
+                    "GET", attachment.content_url, follow_redirects=True
+                ) as response:
+                    try:
+                        await self._raise_for_status(response, "GET", attachment.content_url)
+                    except ToolError as exc:
+                        return _DownloadEntry(attachment.filename, str(exc), "failed")
 
-                written = 0
-                with os.fdopen(fd, "wb") as handle:
+                    declared_size = self._parse_content_length(response.headers.get("content-length"))
+                    if declared_size is not None and declared_size > self._max_bytes:
+                        return _DownloadEntry(
+                            attachment.filename,
+                            f"reported size {declared_size} bytes exceeds max_bytes {self._max_bytes}",
+                            "failed",
+                        )
+
                     try:
                         async for chunk in response.aiter_bytes(65536):
                             written += len(chunk)
@@ -389,29 +409,30 @@ class JiraAttachmentClient:
                                 raise _AttachmentTooLarge
                             handle.write(chunk)
                     except _AttachmentTooLarge:
-                        part.unlink(missing_ok=True)
                         return _DownloadEntry(
                             attachment.filename,
                             f"exceeded max_bytes {self._max_bytes} while streaming",
                             "failed",
                         )
-                    except BaseException:
-                        # Covers cancellation too (e.g. the caller's timeout
-                        # firing mid-stream): the partial file must never be
-                        # left behind under its scratch name.
-                        part.unlink(missing_ok=True)
-                        raise
-        except httpx.HTTPError as exc:
-            # A transport-level failure (connect/read timeout, dropped
-            # connection, a mid-stream ReadError, ...), not a Jira-returned
-            # error status -- shape it the same way rather than letting it
-            # escape as a raw httpx exception. `dest` was never touched (only
-            # `part` may exist, cleaned up above or, if the failure was
-            # before `part` was even created, never created).
-            part.unlink(missing_ok=True)
-            return _DownloadEntry(attachment.filename, f"{exc.__class__.__name__}: {exc}", "failed")
+            except httpx.HTTPError as exc:
+                # A transport-level failure (connect/read timeout, dropped
+                # connection, a mid-stream ReadError, ...) or an error raised
+                # while just setting up the stream, before a single byte was
+                # ever written -- not a Jira-returned error status. `dest`
+                # was never touched either way.
+                return _DownloadEntry(
+                    attachment.filename, self._redact(f"{exc.__class__.__name__}: {exc}"), "failed"
+                )
+            finally:
+                handle.close()
 
-        return self._finalize(attachment, part, dest, overwrite=overwrite, written=written)
+            result = self._finalize(attachment, part, dest, overwrite=overwrite, written=written)
+            if isinstance(result, DownloadedFile):
+                published = True
+            return result
+        finally:
+            if not published:
+                part.unlink(missing_ok=True)
 
     def _finalize(
         self, attachment: AttachmentMeta, part: Path, dest: Path, *, overwrite: bool, written: int
@@ -464,15 +485,43 @@ class JiraAttachmentClient:
     def _copy_part_to_dest(part: Path, dest: Path) -> None:
         """Used when ``os.link`` isn't supported at all between ``part`` and
         ``dest`` (different filesystems, or a filesystem/OS that never
-        supports hard links) -- copies the streamed bytes into a freshly
-        created ``dest`` instead. Still ``O_EXCL``, so a same-named file that
+        supports hard links).
+
+        Copies through a second temp file in ``dest``'s own directory and
+        publishes THAT via ``os.link``, so a failure partway through the
+        copy never leaves a truncated file under ``dest``'s final name.
+        Only if that second link also can't be made (the same
+        unsupported-hard-link errnos) does this fall back to writing
+        ``dest`` directly -- still ``O_EXCL``, so a same-named file that
         appeared on disk after ``_pick_dest_name`` checked (but before this
-        runs) still isn't silently clobbered: it raises ``FileExistsError``,
-        which the caller in ``_finalize`` turns into the same "already
-        exists" skipped entry as the ordinary ``os.link`` collision case."""
-        fd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        with os.fdopen(fd, "wb") as dest_handle, open(part, "rb") as part_handle:
-            shutil.copyfileobj(part_handle, dest_handle)
+        runs) still isn't silently clobbered, raising ``FileExistsError``
+        the same as the ordinary ``os.link`` collision case -- and removes
+        ``dest`` again if that direct write itself fails partway, rather
+        than leaving a partial download under the delivered filename.
+
+        ``tempfile.mkstemp`` creates its file with mode 0o600; the O_EXCL
+        fallback below matches that explicitly, since plain ``os.open``
+        would otherwise default to 0o777 (0o755 after umask).
+        """
+        fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=f".{dest.name}.", suffix=".copy")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "wb") as tmp_handle, open(part, "rb") as part_handle:
+                shutil.copyfileobj(part_handle, tmp_handle)
+            try:
+                os.link(tmp, dest)
+            except OSError as exc:
+                if exc.errno not in _LINK_UNSUPPORTED_ERRNOS:
+                    raise
+                dfd = os.open(dest, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+                try:
+                    with os.fdopen(dfd, "wb") as dest_handle, open(tmp, "rb") as tmp_handle2:
+                        shutil.copyfileobj(tmp_handle2, dest_handle)
+                except BaseException:
+                    dest.unlink(missing_ok=True)
+                    raise
+        finally:
+            tmp.unlink(missing_ok=True)
 
     @staticmethod
     def _parse_content_length(raw: str | None) -> int | None:

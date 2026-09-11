@@ -6,8 +6,11 @@ from __future__ import annotations
 
 import errno
 import os
+import shutil
+import stat
 from collections.abc import AsyncGenerator, AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import anyio
 import httpx
@@ -20,6 +23,15 @@ from jira_multi_mcp.model import SiteConfig
 from jira_multi_mcp.secrets import Secret
 
 _ISSUE_URL = "https://acme.atlassian.net/rest/api/3/issue/ACME-1"
+
+
+def _open_fd_count() -> int:
+    """Portable-enough open-fd count for a leak-delta assertion: `/dev/fd` on
+    macOS, `/proc/self/fd` on Linux (where `/dev/fd` may not exist)."""
+    try:
+        return len(os.listdir("/dev/fd"))
+    except OSError:
+        return len(os.listdir("/proc/self/fd"))
 
 
 def _site() -> SiteConfig:
@@ -149,12 +161,16 @@ async def test_content_length_over_max_bytes_aborts_before_writing(
         return_value=httpx.Response(200, content=b"x" * 20, headers={"content-length": "999999"})
     )
 
+    before = _open_fd_count()
     downloaded, entries = await _client(http_client, max_bytes=100).download("ACME-1", tmp_path)
+    after = _open_fd_count()
 
     assert downloaded == []
     assert entries[0]["status"] == "failed"
     assert "max_bytes" in entries[0]["reason"]
     assert not (tmp_path / "big.bin").exists()
+    assert list(tmp_path.iterdir()) == []  # no leftover .part scratch file
+    assert after == before  # the mkstemp fd was closed, not just orphaned
 
 
 @respx.mock
@@ -412,13 +428,70 @@ async def test_mid_stream_read_error_is_a_shaped_failed_entry_with_no_partial_fi
         return_value=httpx.Response(200, content=broken_body())
     )
 
+    before = _open_fd_count()
     downloaded, entries = await _client(http_client).download("ACME-1", tmp_path)
+    after = _open_fd_count()
 
     assert downloaded == []
     assert len(entries) == 1
     assert entries[0]["status"] == "failed"
     assert "ReadError" in entries[0]["reason"]
     assert list(tmp_path.iterdir()) == []  # no partial file, no leftover .part
+    assert after == before  # the mkstemp fd was closed, not just orphaned
+
+
+@respx.mock
+async def test_repeated_404_downloads_leak_no_file_descriptors(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """A non-2xx content response must close (not just orphan) the `mkstemp`
+    fd -- regression coverage for the fd that used to stay open on every
+    early exit between `mkstemp` and the old, deeply-nested `os.fdopen`."""
+    attachments = [_attachment(str(i), f"missing-{i}.bin") for i in range(30)]
+    _mock_list(attachments)
+    for i in range(30):
+        respx.get(f"https://acme.atlassian.net/rest/api/3/attachment/content/{i}").mock(
+            return_value=httpx.Response(404, json={"errorMessages": ["not found"]})
+        )
+
+    before = _open_fd_count()
+    downloaded, entries = await _client(http_client).download("ACME-1", tmp_path)
+    after = _open_fd_count()
+
+    assert downloaded == []
+    assert len(entries) == 30
+    assert all(e["status"] == "failed" for e in entries)
+    assert list(tmp_path.iterdir()) == []
+    assert after == before
+
+
+@respx.mock
+async def test_base_exception_mid_stream_closes_fd_and_leaves_no_part_file(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """A `BaseException` mid-stream (e.g. task cancellation) must still be
+    let through to the caller -- it must never leave the `mkstemp` fd open
+    or the `.part` scratch file behind on its way out."""
+
+    class _FakeCancellation(BaseException):
+        pass
+
+    async def cancelled_body() -> AsyncIterator[bytes]:
+        yield b"partial"
+        raise _FakeCancellation
+
+    _mock_list([_attachment("1", "notes.txt")])
+    respx.get("https://acme.atlassian.net/rest/api/3/attachment/content/1").mock(
+        return_value=httpx.Response(200, content=cancelled_body())
+    )
+
+    before = _open_fd_count()
+    with pytest.raises(_FakeCancellation):
+        await _client(http_client).download("ACME-1", tmp_path)
+    after = _open_fd_count()
+
+    assert list(tmp_path.iterdir()) == []
+    assert after == before
 
 
 @respx.mock
@@ -440,8 +513,10 @@ async def test_no_clobber_falls_back_to_a_copy_when_hard_links_are_unsupported(
 
     assert entries == []
     assert len(downloaded) == 1
-    assert (tmp_path / "notes.txt").read_bytes() == b"cross-device-content"
+    dest = tmp_path / "notes.txt"
+    assert dest.read_bytes() == b"cross-device-content"
     assert [p.name for p in tmp_path.iterdir()] == ["notes.txt"]
+    assert stat.S_IMODE(dest.stat().st_mode) == 0o600
 
 
 @respx.mock
@@ -469,3 +544,32 @@ async def test_no_clobber_copy_fallback_still_refuses_a_dest_that_appears_mid_ra
     assert len(entries) == 1
     assert entries[0]["status"] == "skipped"
     assert dest.read_bytes() == b"raced-in-content"
+
+
+@respx.mock
+async def test_copy_fallback_mid_copy_failure_leaves_no_truncated_dest(
+    http_client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A failure partway through the copy fallback's write (e.g. disk full)
+    must never leave a truncated file under `dest`'s final name, and must
+    not leak the fallback's own second temp file either."""
+
+    def flaky_link(src: object, dst: object, **kwargs: object) -> None:
+        raise OSError(errno.EXDEV, "Invalid cross-device link")
+
+    def flaky_copyfileobj(fsrc: object, fdst: Any, length: int = 0) -> None:
+        fdst.write(b"xx")
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(os, "link", flaky_link)
+    monkeypatch.setattr(shutil, "copyfileobj", flaky_copyfileobj)
+    _mock_list([_attachment("1", "notes.txt")])
+    _mock_content("1", b"full-content")
+
+    downloaded, entries = await _client(http_client).download("ACME-1", tmp_path)
+
+    assert downloaded == []
+    assert len(entries) == 1
+    assert entries[0]["status"] == "failed"
+    assert not (tmp_path / "notes.txt").exists()
+    assert list(tmp_path.iterdir()) == []  # no truncated dest, no leftover temp

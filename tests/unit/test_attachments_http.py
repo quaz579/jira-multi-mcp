@@ -15,7 +15,7 @@ from fastmcp.exceptions import ToolError
 
 from jira_multi_mcp.attachments import JiraAttachmentClient
 from jira_multi_mcp.model import SiteConfig
-from jira_multi_mcp.secrets import Secret, redact_text
+from jira_multi_mcp.secrets import Secret, redact_text, scrub_urls
 
 _SECRET_TOKEN = "zz-super-secret-api-token-zz"
 
@@ -238,6 +238,59 @@ async def test_404_issue_raises_tool_error_with_jira_message(http_client: httpx.
 
     assert "404" in str(exc_info.value)
     assert "Issue does not exist" in str(exc_info.value)
+
+
+@respx.mock
+async def test_transport_error_during_download_is_redacted_and_stripped_of_url_query(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """A transport-level failure's `str()` can itself carry a CDN URL's query
+    string (a credential) or a known secret value -- both must be scrubbed
+    before the message reaches a `_DownloadEntry`, same as any other tool
+    result."""
+    site = _cloud_site()
+    content_url = "https://acme.atlassian.net/rest/api/3/attachment/content/10001"
+    respx.get("https://acme.atlassian.net/rest/api/3/issue/ACME-1", params={"fields": "attachment"}).mock(
+        return_value=httpx.Response(
+            200,
+            json={
+                "fields": {
+                    "attachment": [
+                        {
+                            "id": "10001",
+                            "filename": "notes.txt",
+                            "size": 5,
+                            "mimeType": "text/plain",
+                            "created": "2026-09-10T12:00:00.000+0000",
+                            "author": {"displayName": "Ben Grossman"},
+                            "content": content_url,
+                        }
+                    ]
+                }
+            },
+        )
+    )
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            f"connection to {content_url}?token=SECRET failed near token {_SECRET_TOKEN}"
+        )
+
+    respx.get(content_url).mock(side_effect=boom)
+
+    client = JiraAttachmentClient(
+        site,
+        http_client,
+        max_bytes=10_000_000,
+        redact=lambda text: scrub_urls(redact_text(text, [Secret(_SECRET_TOKEN)])),
+    )
+    downloaded, entries = await client.download("ACME-1", tmp_path)
+
+    assert downloaded == []
+    assert entries[0]["status"] == "failed"
+    assert _SECRET_TOKEN not in entries[0]["reason"]
+    assert "token=SECRET" not in entries[0]["reason"]
+    assert "?***" in entries[0]["reason"]
 
 
 async def test_dc_site_refuses_all_three_operations(http_client: httpx.AsyncClient, tmp_path: Path) -> None:

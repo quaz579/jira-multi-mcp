@@ -28,7 +28,7 @@ from mcp import MCPError
 
 from jira_multi_mcp.model import Defaults, SiteConfig, UpstreamConfig
 from jira_multi_mcp.registry import SiteRegistry
-from jira_multi_mcp.secrets import Secret, redact_text
+from jira_multi_mcp.secrets import Secret, redact_text, scrub_urls
 from jira_multi_mcp.tools_meta import CURATED_TOOLS, WRAPPER_OWNED_TOOLS
 
 _logger = logging.getLogger(__name__)
@@ -237,8 +237,14 @@ class ChildManager:
     def redact(self, text: str) -> str:
         """Masks every configured site's credential out of model- or
         log-visible text built outside the logging redaction path (e.g. a
-        ``ToolError`` message forwarded straight to the calling model)."""
-        return redact_text(text, self._secrets)
+        ``ToolError`` message forwarded straight to the calling model).
+
+        Also strips any http(s) URL's query string (``scrub_urls``): a
+        pre-signed CDN/media URL (e.g. Jira's attachment content redirect)
+        can carry its own credential as a query parameter we never
+        configured as a known secret, so ``redact_text`` alone wouldn't
+        catch it."""
+        return scrub_urls(redact_text(text, self._secrets))
 
     async def start_all(self, stack: AsyncExitStack, connect_timeout: float) -> None:
         """Connects every configured child concurrently.

@@ -406,6 +406,25 @@ async def test_a_bare_timeouterror_raised_by_the_factory_is_not_relabeled_as_our
         assert health["acme"]["error"] == "TimeoutError: "
 
 
+def test_redact_also_strips_a_cdn_urls_query_string(tmp_path: Path) -> None:
+    """`redact` is used on the tool-result path (e.g. an attachment
+    transport-error message) where a pre-signed CDN URL's query string can
+    itself be a credential we never configured as a known `Secret` -- so it
+    must be stripped unconditionally, not only known secret values."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME", api_token=Secret("zz-unique-secret-zz"))])
+    manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
+
+    text = (
+        "ConnectError: GET https://media-cdn.example-atlassian-media.net/path?token=SECRET failed "
+        "near token zz-unique-secret-zz"
+    )
+    redacted = manager.redact(text)
+
+    assert "token=SECRET" not in redacted
+    assert "zz-unique-secret-zz" not in redacted
+    assert "***" in redacted
+
+
 async def test_mark_failed_redacts_the_reason_and_records_a_timestamp(tmp_path: Path) -> None:
     registry = SiteRegistry([_cloud_site("acme", "ACME", api_token=Secret("zz-unique-secret-zz"))])
     manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
