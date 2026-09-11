@@ -4,7 +4,9 @@ routing, error/timeout shaping, and that a wrapper-owned tool is shadowed."""
 
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator
+import contextlib
+import time
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import AsyncExitStack
 from pathlib import Path
 
@@ -73,7 +75,7 @@ async def rig(tmp_path: Path) -> AsyncGenerator[_Rig, None]:
         mirrored = build_mirrored_tools(tools, manager, registry, _ALLOWLIST, timeout=_TIMEOUT)
 
         parent = FastMCP("test-parent")
-        parent.add_tool(build_jira_sites_tool(manager))
+        parent.add_tool(build_jira_sites_tool(manager, Defaults()))
         for tool in mirrored:
             parent.add_tool(tool)
 
@@ -120,7 +122,7 @@ async def test_upstream_download_is_shadowed(tmp_path: Path) -> None:
         mirrored = build_mirrored_tools(tools, manager, registry, _ALLOWLIST, timeout=_TIMEOUT)
 
         parent = FastMCP("test-parent")
-        parent.add_tool(build_jira_sites_tool(manager))
+        parent.add_tool(build_jira_sites_tool(manager, Defaults()))
         for attachment_tool in build_attachment_tools(registry, attachment_clients):
             parent.add_tool(attachment_tool)
         for tool in mirrored:
@@ -388,7 +390,7 @@ async def test_jira_sites_note_when_every_healthy_site_is_read_only(tmp_path: Pa
     async with AsyncExitStack() as stack:
         await manager.start_all(stack, connect_timeout=5)
         parent = FastMCP("test-parent")
-        parent.add_tool(build_jira_sites_tool(manager))
+        parent.add_tool(build_jira_sites_tool(manager, Defaults()))
         async with Client(FastMCPTransport(parent)) as client:
             result = await client.call_tool_mcp("jira_sites", {})
             payload = result.structured_content
@@ -408,7 +410,7 @@ async def test_jira_sites_note_when_no_site_is_healthy(tmp_path: Path) -> None:
         await manager.start_all(stack, connect_timeout=5)
         tools = await manager.discover_tools()
         parent = FastMCP("test-parent")
-        parent.add_tool(build_jira_sites_tool(manager))
+        parent.add_tool(build_jira_sites_tool(manager, Defaults()))
         async with Client(FastMCPTransport(parent)) as client:
             result = await client.call_tool_mcp("jira_sites", {})
             payload = result.structured_content
@@ -454,7 +456,7 @@ async def test_jira_sites_mirrors_real_tools_after_every_site_recovers_from_star
         late_mirror = LateMirror(
             parent, manager, registry, _ALLOWLIST, _TIMEOUT, already_mirrored=bool(mirrored)
         )
-        parent.add_tool(build_jira_sites_tool(manager, late_mirror=late_mirror))
+        parent.add_tool(build_jira_sites_tool(manager, Defaults(), late_mirror=late_mirror))
 
         async with Client(FastMCPTransport(parent)) as client:
             names_before = {t.name for t in await client.list_tools()}
@@ -478,12 +480,92 @@ async def test_jira_sites_mirrors_real_tools_after_every_site_recovers_from_star
             assert "jira_get_issue" in names_after
 
             # A second call must be a no-op: no new factory call (already
-            # healthy), and no duplicate-add crash (fastmcp's default
-            # on_duplicate="error" would raise if LateMirror mirrored twice).
+            # healthy) and no duplicate re-add at all (`_mirrored` short-
+            # circuits before `discover_tools()` runs again -- not because a
+            # duplicate `add_tool` would crash; fastmcp 4.0.3's default
+            # on_duplicate="warn" replaces it instead).
             result_again = await client.call_tool_mcp("jira_sites", {})
             assert not result_again.is_error
             assert attempts["count"] == 2
             assert {t.name for t in await client.list_tools()} == names_after
+
+
+class _GatedRecoveryTransport(ClientTransport):
+    """Blocks ``connect_session`` until ``release`` is set, then hands off to
+    a real in-process fake child -- lets a test hold a recovery attempt open
+    past ``jira_sites``'s own health-recovery budget, then let it actually
+    succeed, without a real sleep-based race."""
+
+    def __init__(self, site_name: str, release: anyio.Event) -> None:
+        self._site_name = site_name
+        self._release = release
+
+    @contextlib.asynccontextmanager
+    async def connect_session(  # type: ignore[override]
+        self, *, transport_options: object = None, **session_kwargs: object
+    ) -> AsyncIterator[object]:
+        await self._release.wait()
+        async with FastMCPTransport(make_fake_child(self._site_name)).connect_session(
+            transport_options=transport_options,  # type: ignore[arg-type]
+            **session_kwargs,  # type: ignore[arg-type]
+        ) as session:
+            yield session
+
+
+async def test_jira_sites_reports_recovering_when_the_health_recovery_budget_expires(
+    tmp_path: Path,
+) -> None:
+    """The M4a MEDIUM 1 finding: `jira_sites` used to await
+    `recover_failed_sites()` with no bound of its own, so a site simply slow
+    to connect (well within its own generous `connect_timeout_seconds`)
+    could make a single `jira_sites` call hang for just as long. The
+    recovery attempt itself must keep running in the background past the
+    budget -- in a task group `ChildManager` owns, not the caller's -- so a
+    later call still observes it finish."""
+    registry = SiteRegistry([_site("acme", "ACME")])
+    release = anyio.Event()
+    attempts = {"count": 0}
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("simulated connect failure")  # the startup attempt
+        return _GatedRecoveryTransport(site.name, release)  # every recovery attempt
+
+    defaults = Defaults(
+        recovery_cooldown_seconds=0.05,
+        health_recovery_budget_seconds=0.3,
+        connect_timeout_seconds=30.0,
+    )
+    manager = ChildManager(registry, UpstreamConfig(), defaults, tmp_path, transport_factory=factory)
+
+    async with AsyncExitStack() as stack, manager.recovery_supervisor():
+        await manager.start_all(stack, connect_timeout=5)
+        parent = FastMCP("test-parent")
+        parent.add_tool(build_jira_sites_tool(manager, defaults))
+
+        async with Client(FastMCPTransport(parent)) as client:
+            await anyio.sleep(0.1)  # past the cooldown
+
+            before = time.monotonic()
+            with anyio.fail_after(5.0):
+                result = await client.call_tool_mcp("jira_sites", {})
+            elapsed = time.monotonic() - before
+
+            assert elapsed < 1.0  # bounded by the recovery budget, not the 30s connect timeout
+            payload = result.structured_content
+            assert payload["sites"][0]["state"] == "recovering"
+            assert "note" in payload["sites"][0]
+            assert attempts["count"] == 2  # the background attempt is genuinely in flight
+
+            release.set()
+            await anyio.sleep(0.2)  # let the background recovery attempt actually finish
+
+            result_again = await client.call_tool_mcp("jira_sites", {})
+            payload_again = result_again.structured_content
+            assert payload_again["sites"][0]["state"] == "healthy"
+
+        await manager.aclose()
 
 
 async def test_discover_tools_prefers_unrestricted_site_over_read_only(
@@ -503,6 +585,67 @@ async def test_discover_tools_prefers_unrestricted_site_over_read_only(
         health = {h["name"]: h for h in manager.health()}
         assert health["beta"]["discovery_source"] is True
         assert health["acme"]["discovery_source"] is False
+
+
+class _GatedDiscoveryManager:
+    """A fake `ChildManager` whose `discover_tools()` starts, signals
+    `entered`, then hangs forever -- lets a test deterministically catch
+    `LateMirror` mid-discovery before racing a second caller against its
+    try-lock, without a real ChildManager/transport at all."""
+
+    def __init__(self, entered: anyio.Event) -> None:
+        self._entered = entered
+        self.calls = 0
+
+    async def discover_tools(self) -> list[mcp_types.Tool]:
+        self.calls += 1
+        self._entered.set()
+        await anyio.sleep_forever()
+        return []  # pragma: no cover - unreachable
+
+
+class _NoopSession:
+    async def send_tool_list_changed(self) -> None:
+        pass
+
+
+class _FakeLateMirrorCtx:
+    session = _NoopSession()
+
+
+async def test_after_recovery_bounds_discover_tools_and_a_concurrent_caller_gets_the_fast_path() -> None:
+    """The M4a MEDIUM 2 finding: `discover_tools()` used to run unbounded
+    while `LateMirror` held its lock (one slow/stuck child's `list_tools()`
+    could stall every `jira_sites` call forever), and a second concurrent
+    caller used to queue behind a plain `anyio.Lock` instead of failing
+    fast."""
+    registry = SiteRegistry([_site("acme", "ACME")])
+    entered = anyio.Event()
+    manager = _GatedDiscoveryManager(entered)
+    parent = FastMCP("test-parent")
+    late_mirror = LateMirror(parent, manager, registry, _ALLOWLIST, timeout=0.3)  # type: ignore[arg-type]
+
+    results: dict[str, object] = {}
+
+    async def _first() -> None:
+        results["first"] = await late_mirror.after_recovery(_FakeLateMirrorCtx())  # type: ignore[arg-type]
+
+    async def _second() -> None:
+        await entered.wait()  # the first caller is now genuinely inside discover_tools()
+        results["second"] = await late_mirror.after_recovery(_FakeLateMirrorCtx())  # type: ignore[arg-type]
+
+    before = time.monotonic()
+    with anyio.fail_after(5.0):
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_first)
+            tg.start_soon(_second)
+    elapsed = time.monotonic() - before
+
+    assert elapsed < 2.0  # `_first` was bounded by `timeout`, not left hanging forever
+    assert results["first"] is None  # timed out -> left unmirrored for a retry
+    assert results["second"] is None  # the try-lock fast path, not queued behind `_first`
+    assert manager.calls == 1  # `_second` never called discover_tools() itself
+    assert late_mirror._mirrored is False  # noqa: SLF001 - whitebox
 
 
 class _DeadChildClient:

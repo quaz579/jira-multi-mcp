@@ -11,8 +11,8 @@ import logging
 import os
 import subprocess
 import time
-from collections.abc import Callable, Sequence
-from contextlib import AsyncExitStack, suppress
+from collections.abc import AsyncIterator, Callable, Sequence
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal, TextIO
@@ -254,6 +254,11 @@ class ChildManager:
         self._secrets: list[Secret] = _collect_secrets(registry.sites)
         self._upstream_version: str | None = None
         self._close_logged = False
+        # Set only while `recovery_supervisor()` (below) is entered -- the
+        # long-lived task group `recover_failed_sites` spawns background
+        # recovery attempts into (M4a MEDIUM 1). `None` outside that scope,
+        # including before it's entered and after `aclose()`.
+        self._recovery_tg: anyio.abc.TaskGroup | None = None
 
     def redact(self, text: str) -> str:
         """Masks every configured site's credential out of model- or
@@ -422,7 +427,12 @@ class ChildManager:
         handle.last_error = redacted
         handle.last_error_at = time.time()
         _logger.warning("site '%s' call timed out (%d consecutive): %s", site_name, handle.timeouts, redacted)
-        if handle.timeouts >= _MAX_CONSECUTIVE_TIMEOUTS:
+        # Only the TRANSITION into `failed` re-arms the cooldown: once a site
+        # is already failed, further timeouts from other still-in-flight
+        # calls hitting this same threshold must not keep pushing
+        # `next_retry_at_monotonic` further out, or a slow trickle of stale
+        # timeouts could keep a site stuck past its original cooldown forever.
+        if handle.timeouts >= _MAX_CONSECUTIVE_TIMEOUTS and handle.state != "failed":
             handle.state = "failed"
             handle.error = redacted
             handle.next_retry_at_monotonic = time.monotonic() + self._defaults.recovery_cooldown_seconds
@@ -515,10 +525,69 @@ class ChildManager:
             )
         return handle.client
 
+    @asynccontextmanager
+    async def recovery_supervisor(self) -> AsyncIterator[None]:
+        """Owns the long-lived task group ``recover_failed_sites`` spawns
+        background recovery attempts into (M4a MEDIUM 1).
+
+        MUST be entered exactly once by the caller's own long-lived task --
+        ``server.serve()``, alongside its ``AsyncExitStack`` -- for the whole
+        life of the server, NOT lazily from inside a `jira_sites` call.
+        anyio requires a task's cancel scopes to nest and unnest in strict
+        LIFO order; a scope entered while nested inside `jira_sites`'s own
+        short-lived ``anyio.move_on_after`` scope could never legally outlive
+        it (confirmed empirically: doing that raised anyio's "not the
+        current task's current cancel scope" the moment the shorter scope
+        tried to exit first). Entered at the top level instead, this task
+        group's cancel scope sits alongside -- never inside -- every
+        individual call's own scope.
+
+        ``aclose()`` ends this early by calling ``cancel()`` on the group's
+        own cancel scope -- safe to do from any task, unlike entering/exiting
+        the group itself -- and lets this coroutine's own ``async with``
+        unwind (on ITS task) do the actual exit once it's next scheduled.
+        """
+        async with anyio.create_task_group() as tg:
+            self._recovery_tg = tg
+            try:
+                yield
+            finally:
+                self._recovery_tg = None
+
+    async def _recover_one(self, handle: ChildHandle) -> None:
+        """Runs one site's recovery attempt as a task in the long-lived
+        recovery task group -- must never let an exception escape (that
+        would cancel every OTHER site's in-flight recovery sharing this same
+        group, and eventually the group itself)."""
+        try:
+            await self._maybe_recover(handle)
+        except ToolError:
+            # Another caller already holds this site's recovery lock (see
+            # `_maybe_recover`) -- not this task's problem; whichever caller
+            # holds the lock will settle the state.
+            pass
+        except Exception:  # noqa: BLE001 - isolate one site's recovery from the rest
+            _logger.exception("site '%s': background recovery attempt raised unexpectedly", handle.site.name)
+
     async def recover_failed_sites(self) -> list[str]:
-        """Attempts recovery for every currently ``failed`` site past its
-        cooldown, concurrently. Returns the names that are ``healthy``
-        afterward (whether they needed recovering just now or already were).
+        """Ensures every currently ``failed`` site (past its cooldown) has a
+        recovery attempt running, then waits for those attempts to settle.
+        Returns the names that are ``healthy`` afterward (whether they needed
+        recovering just now or already were).
+
+        Attempts are spawned into ``recovery_supervisor()``'s long-lived task
+        group when one is running, not a temporary one scoped to this call:
+        ``jira_sites`` (the only caller) wraps this whole method in its own
+        ``anyio.move_on_after(health_recovery_budget_seconds)`` (see
+        ``wrapper_tools.build_jira_sites_tool``), and if that fires while a
+        site is still connecting, only THIS coroutine's wait below is
+        cancelled -- the spawned attempt keeps running in the background and
+        is picked up (or found already ``healthy``) by the next `jira_sites`
+        call. ``health()`` reports such a site as ``"recovering"`` for as long
+        as its `recovery_lock` stays held. Falls back to a temporary task
+        group scoped to just this call if no supervisor is running (e.g. a
+        bare ``ChildManager`` under test) -- recovery still happens, it just
+        can't outlive this call's own cancellation in that case.
 
         Exists because ``client_for`` -- the only other path that ever calls
         ``_maybe_recover`` -- is only reached by a mirrored tool call, and if
@@ -527,22 +596,30 @@ class ChildManager:
         ``client_for`` again, so a site could sit `failed` forever with no
         way back to `healthy` even once whatever was wrong with it clears
         up. ``jira_sites`` calls this on every invocation specifically to
-        give that dead end a way out (see ``wrapper_tools.build_jira_sites_tool``).
+        give that dead end a way out.
         """
         failed = [h for h in self._handles.values() if h.state == "failed"]
-
-        async def _recover_one(handle: ChildHandle) -> None:
-            try:
-                await self._maybe_recover(handle)
-            except ToolError:
-                # Another caller already holds this site's recovery lock
-                # (see `_maybe_recover`) -- not this method's problem; that
-                # caller's own attempt will settle the state.
-                pass
-
-        async with anyio.create_task_group() as tg:
-            for handle in failed:
-                tg.start_soon(_recover_one, handle)
+        if failed:
+            if self._recovery_tg is not None:
+                for handle in failed:
+                    if not handle.recovery_lock.locked():
+                        self._recovery_tg.start_soon(self._recover_one, handle)
+                # `start_soon` only schedules -- give a newly spawned task at
+                # least one turn to actually run before polling `locked()`
+                # below, or a task that hasn't started yet would still read
+                # as "not locked" and this method would return before
+                # recovery truly began. `_maybe_recover`'s cheap checks and
+                # its `acquire_nowait()` are synchronous (no `await` in
+                # between), so one checkpoint is enough for every just-
+                # spawned task to reach the lock.
+                await anyio.sleep(0)
+            else:
+                async with anyio.create_task_group() as temp_tg:
+                    for handle in failed:
+                        if not handle.recovery_lock.locked():
+                            temp_tg.start_soon(self._recover_one, handle)
+            while any(h.recovery_lock.locked() for h in failed):
+                await anyio.sleep(0.02)
 
         return [h.site.name for h in self._handles.values() if h.state == "healthy"]
 
@@ -698,25 +775,38 @@ class ChildManager:
                 # wall-clock time: fine for "roughly when will this retry",
                 # the only thing this field is for.
                 next_retry_at = time.time() + (handle.next_retry_at_monotonic - time.monotonic())
-            result.append(
-                {
-                    "name": handle.site.name,
-                    "host": urlsplit(handle.site.url).netloc,
-                    "key_prefixes": list(handle.site.key_prefixes),
-                    "read_only": handle.site.read_only,
-                    "enabled_tools_restricted": handle.site.enabled_tools is not None,
-                    "state": handle.state,
-                    "error": handle.error,
-                    "last_error": handle.last_error,
-                    "last_error_at": handle.last_error_at,
-                    "timeouts": handle.timeouts,
-                    "recovery_attempts": handle.recovery_attempts,
-                    "next_retry_at": next_retry_at,
-                    "log_path": str(handle.log_path),
-                    "fastmcp_server_version": handle.fastmcp_server_version,
-                    "discovery_source": handle.site.name == self._discovery_source,
-                }
-            )
+            # `"recovering"` is a reporting-only state, not a value ever
+            # stored on `handle.state` itself: a site whose recovery attempt
+            # is actively in flight (its `recovery_lock` held, whether spawned
+            # by THIS `jira_sites` call or one still running in the
+            # background from a previous call whose own budget expired --
+            # see `recover_failed_sites`) is still internally `"failed"` until
+            # that attempt resolves one way or the other.
+            state: str = handle.state
+            note: str | None = None
+            if handle.state == "failed" and handle.recovery_lock.locked():
+                state = "recovering"
+                note = "recovery in progress; call jira_sites again"
+            entry: dict[str, object] = {
+                "name": handle.site.name,
+                "host": urlsplit(handle.site.url).netloc,
+                "key_prefixes": list(handle.site.key_prefixes),
+                "read_only": handle.site.read_only,
+                "enabled_tools_restricted": handle.site.enabled_tools is not None,
+                "state": state,
+                "error": handle.error,
+                "last_error": handle.last_error,
+                "last_error_at": handle.last_error_at,
+                "timeouts": handle.timeouts,
+                "recovery_attempts": handle.recovery_attempts,
+                "next_retry_at": next_retry_at,
+                "log_path": str(handle.log_path),
+                "fastmcp_server_version": handle.fastmcp_server_version,
+                "discovery_source": handle.site.name == self._discovery_source,
+            }
+            if note is not None:
+                entry["note"] = note
+            result.append(entry)
         return result
 
     def log_path(self, site_name: str) -> Path | None:
@@ -744,6 +834,18 @@ class ChildManager:
         if not self._close_logged:
             self._close_logged = True
             _logger.info("child manager shutting down")
+        # A background recovery attempt (M4a MEDIUM 1) must never outlive the
+        # manager: cancel it before closing children, so it can't race
+        # `_close_one` below by swapping in a freshly (half-)connected
+        # replacement client for a handle we're in the middle of closing.
+        # Only `cancel()` the scope here -- safe from any task -- never
+        # `__aexit__` it directly: the task group was entered by whichever
+        # task is running `recovery_supervisor()` (normally `server.serve()`
+        # itself), and only that task may legally exit it; this cancellation
+        # is what makes its own `async with` unwind promptly once it's next
+        # scheduled.
+        if self._recovery_tg is not None:
+            self._recovery_tg.cancel_scope.cancel()
         async with anyio.create_task_group() as tg:
             for handle in self._handles.values():
                 if handle.client is not None:

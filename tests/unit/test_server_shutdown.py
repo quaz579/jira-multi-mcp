@@ -6,6 +6,7 @@ is orphaned. Also covers the watchdog's exit-code fidelity (M2r2 item 5)."""
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
@@ -397,6 +398,69 @@ def test_sigterm_after_healthy_shuts_down_quickly(tmp_path: Path) -> None:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=5)
+
+
+def test_sigstopped_child_does_not_delay_shutdown_past_the_watchdog(tmp_path: Path) -> None:
+    """The LOW finding: `stack.aclose()`'s own exit (the exit stack's ordinary,
+    non-forced `__aexit__` on each originally-connected client) must be bounded
+    by the same watchdog budget as `manager.aclose()` -- an unkillable child
+    (SIGSTOP'd, so not even SIGKILL can be delivered until it's resumed) must
+    not make the parent ride out an indefinite wait on top of the bounded
+    force-close."""
+    pid_file = tmp_path / "child.pid"
+    upstream_script = _write_real_fastmcp_upstream_script(tmp_path)
+    config_path = _write_config(tmp_path, command=[sys.executable, str(upstream_script), str(pid_file)])
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from jira_multi_mcp.cli import main; sys.exit(main())",
+            "--config",
+            str(config_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    child_pid: int | None = None
+    try:
+        _wait_for_file(pid_file, timeout=15.0)
+        child_pid = int(pid_file.read_text().strip())
+        time.sleep(0.5)  # let the site actually finish the handshake, not just spawn
+
+        os.kill(child_pid, signal.SIGSTOP)
+        t_signal = time.monotonic()
+        assert proc.stdin is not None
+        proc.stdin.close()  # the real trigger this reproduces: the client goes away
+
+        try:
+            proc.wait(timeout=_MAX_SHUTDOWN_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            pytest.fail(
+                f"parent did not exit within {_MAX_SHUTDOWN_SECONDS}s of stdin closing with a SIGSTOP'd child"
+            )
+        finally:
+            # SIGCONT before anything else touches child_pid again -- a
+            # stopped process can't even be waited on/reaped normally.
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGCONT)
+        parent_elapsed = time.monotonic() - t_signal
+
+        print(f"parent exited {parent_elapsed:.2f}s after stdin closed with a SIGSTOP'd child")
+        assert parent_elapsed < _MAX_SHUTDOWN_SECONDS
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+        if child_pid is not None:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGCONT)
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(child_pid, signal.SIGKILL)
 
 
 def test_schema_conflict_still_exits_2_not_an_exceptiongroup(tmp_path: Path) -> None:

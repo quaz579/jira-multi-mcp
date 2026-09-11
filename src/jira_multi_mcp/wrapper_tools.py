@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import anyio
 import mcp_types
 from fastmcp import Context
 from fastmcp.exceptions import ToolError
@@ -18,6 +19,7 @@ from jira_multi_mcp.attachments import AttachmentClientRegistry
 from jira_multi_mcp.children import ChildManager
 from jira_multi_mcp.errors import SiteResolutionError
 from jira_multi_mcp.mirror import LateMirror
+from jira_multi_mcp.model import Defaults
 from jira_multi_mcp.registry import SiteRegistry, SiteResolution, resolve_site
 from jira_multi_mcp.site_policy import enforce_site_policy
 
@@ -44,7 +46,9 @@ def _resolve_or_raise(
         raise ToolError(str(exc)) from exc
 
 
-def build_jira_sites_tool(manager: ChildManager, *, late_mirror: LateMirror | None = None) -> Tool:
+def build_jira_sites_tool(
+    manager: ChildManager, defaults: Defaults, *, late_mirror: LateMirror | None = None
+) -> Tool:
     """Per-site health, never credentials: name, host, prefixes, read_only,
     state, error, last_error/last_error_at, log path, the FastMCP library
     version each child reports, and whether that site was the tool-discovery
@@ -60,10 +64,20 @@ def build_jira_sites_tool(manager: ChildManager, *, late_mirror: LateMirror | No
     chance to mirror real tools once one comes back (see ``LateMirror``'s
     docstring). Both are no-ops once nothing is failed / tools are already
     mirrored, so a healthy server pays only the cost of ``manager.health()``.
+
+    Recovery is bounded by ``defaults.health_recovery_budget_seconds`` (the
+    M4a MEDIUM 1 finding): a site whose connect is simply slow (e.g. a
+    generous ``connect_timeout_seconds``) must not make this call itself hang
+    for as long as that connect takes. The recovery attempt itself is NOT
+    cancelled when the budget expires -- only this call's wait for it is;
+    ``ChildManager`` keeps it running in its own background task group (see
+    ``ChildManager.recover_failed_sites``), and ``manager.health()`` reports
+    such a site as ``"recovering"`` until it settles.
     """
 
     async def jira_sites(ctx: Context) -> dict[str, Any]:
-        await manager.recover_failed_sites()
+        with anyio.move_on_after(defaults.health_recovery_budget_seconds):
+            await manager.recover_failed_sites()
         recovery_note: str | None = None
         if late_mirror is not None:
             recovery_note = await late_mirror.after_recovery(ctx)

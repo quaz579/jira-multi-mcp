@@ -21,6 +21,7 @@ class Defaults:
     connect_timeout_seconds: float = 90.0
     attachment_max_bytes: int = 104_857_600
     recovery_cooldown_seconds: float = 30.0
+    health_recovery_budget_seconds: float = 8.0
 
 
 @dataclass(frozen=True, slots=True)

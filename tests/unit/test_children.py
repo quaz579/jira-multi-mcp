@@ -507,6 +507,35 @@ async def test_mark_timeout_increments_and_flips_to_failed_after_three(tmp_path:
         assert health["acme"]["state"] == "failed"
 
 
+async def test_mark_timeout_does_not_re_arm_the_cooldown_past_the_transition_to_failed(
+    tmp_path: Path,
+) -> None:
+    """The LOW finding: only the TRANSITION into `failed` may set
+    `next_retry_at_monotonic` -- a slow trickle of further timeouts (from
+    other still-in-flight calls) that each also cross the 3-consecutive
+    threshold must not keep pushing the site's cooldown further out."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+
+        manager.mark_timeout("acme", "timed out")
+        manager.mark_timeout("acme", "timed out")
+        manager.mark_timeout("acme", "timed out")  # the transition to failed
+        handle = manager._handles["acme"]  # noqa: SLF001 - whitebox: health()'s epoch-seconds
+        # estimate is recomputed against the CURRENT clock offset on every
+        # read, so it drifts by a few microseconds between two calls even
+        # when the underlying monotonic value hasn't changed -- read the raw
+        # monotonic value directly for an exact equality check instead.
+        assert handle.state == "failed"
+        first_retry_at_monotonic = handle.next_retry_at_monotonic
+        assert isinstance(first_retry_at_monotonic, float)
+
+        manager.mark_timeout("acme", "a further stale timeout")  # already failed
+        assert handle.state == "failed"
+        assert handle.next_retry_at_monotonic == first_retry_at_monotonic  # not pushed further out
+
+
 async def test_mark_success_resets_the_timeout_counter(tmp_path: Path) -> None:
     registry = SiteRegistry([_cloud_site("acme", "ACME")])
     manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))

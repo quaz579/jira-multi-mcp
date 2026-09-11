@@ -77,7 +77,9 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
     state = _ShutdownState()
     startup_error: JiraMultiError | None = None
 
-    async with AsyncExitStack() as stack:
+    stack = AsyncExitStack()
+    await stack.__aenter__()
+    try:
         try:
             async with anyio.create_task_group() as tg:
                 # Armed BEFORE any startup work runs -- not after `start_all`
@@ -91,6 +93,22 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
                 # `finally` ever runs, and every already-spawned child is
                 # orphaned.
                 await tg.start(_cancel_on_shutdown_signal, tg.cancel_scope, manager, state)
+
+                # Started as a CHILD task of `tg` (not entered directly on
+                # this coroutine's own task, via `stack`) so its task group's
+                # cancel scope belongs to a task whose ENTIRE cancel-scope
+                # stack this method controls -- entering it directly here
+                # instead would nest it inside `tg`'s own scope on THIS task,
+                # and a scope meant to outlive `tg` can never legally nest
+                # inside it (anyio requires strict LIFO nesting; confirmed
+                # empirically: doing that raised "not the current task's
+                # current cancel scope" the moment `tg` tried to exit first).
+                # `tg`'s own cancellation (shutdown or the normal-completion
+                # path below) cancels this task exactly like every other
+                # child task, which is what actually tears the recovery
+                # supervisor down; `manager.aclose()`'s own `cancel_scope.cancel()`
+                # is a redundant, harmless second trigger for the same thing.
+                await tg.start(_run_recovery_supervisor, manager)
 
                 # `run_stdio_async` below is the first thing that ever reads
                 # fd 0 -- so a client that abandons the connection (closes
@@ -159,9 +177,16 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
                             registry,
                             allowlist,
                             config.defaults.call_timeout_seconds,
-                            already_mirrored=bool(mirrored),
+                            # `bool(tools)`, not `bool(mirrored)`: discovery
+                            # ran fine against a healthy child even when the
+                            # configured `enabled_tools`/curated allowlist
+                            # filters every discovered tool away, and that
+                            # case must not look like "discovery never ran"
+                            # -- it would otherwise re-discover (and re-warn)
+                            # on every single `jira_sites` call for no reason.
+                            already_mirrored=bool(tools),
                         )
-                        mcp.add_tool(build_jira_sites_tool(manager, late_mirror=late_mirror))
+                        mcp.add_tool(build_jira_sites_tool(manager, config.defaults, late_mirror=late_mirror))
                         for attachment_tool in build_attachment_tools(registry, attachment_clients):
                             mcp.add_tool(attachment_tool)
                         for tool in mirrored:
@@ -200,6 +225,16 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
                 await manager.aclose()
             if not scope.cancelled_caught:
                 state.aclose_completed = True
+    finally:
+        # `stack` still holds each ORIGINALLY-connected client's own ordinary
+        # `__aexit__` (from `ChildManager.start_all`'s `stack.enter_async_context`).
+        # `manager.aclose()` just above already force-closed those same
+        # clients -- normally making this a fast no-op (see `ChildManager.aclose`'s
+        # docstring) -- but a child that's still unkillable at this point
+        # (e.g. SIGSTOP'd) must not be allowed to hang this exit open-endedly;
+        # bounded by the same watchdog budget as everything else in shutdown.
+        with anyio.move_on_after(_ACLOSE_BUDGET_SECONDS):
+            await stack.aclose()
 
     if startup_error is not None:
         raise startup_error
@@ -248,6 +283,20 @@ async def _shutdown_children(
         with anyio.move_on_after(_ACLOSE_BUDGET_SECONDS) as scope:
             await manager.aclose()
         state.aclose_completed = not scope.cancelled_caught
+
+
+async def _run_recovery_supervisor(
+    manager: ChildManager, *, task_status: anyio.abc.TaskStatus[None] = anyio.TASK_STATUS_IGNORED
+) -> None:
+    """Owns `ChildManager`'s long-lived recovery task group (M4a MEDIUM 1)
+    for the server's whole run, as a task of `serve()`'s own task group
+    rather than directly on `serve()`'s task -- see the call site's comment
+    for why. `task_status.started()` only fires once `recovery_supervisor()`
+    has actually entered its task group, so `recover_failed_sites` never
+    observes a "not started yet" gap once `tg.start()` returns."""
+    async with manager.recovery_supervisor():
+        task_status.started()
+        await anyio.sleep_forever()
 
 
 async def _cancel_on_shutdown_signal(
