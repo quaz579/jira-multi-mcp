@@ -62,15 +62,13 @@ async def live_client() -> AsyncIterator[Client[ClientTransport]]:
         transport,
         timeout=CLIENT_TIMEOUT_SECONDS,
         init_timeout=CLIENT_TIMEOUT_SECONDS,
-        # fastmcp Client's default mode="auto" probes the newer `server/discover`
-        # protocol era before falling back; against this server (built with the
-        # same fastmcp version but never exercised over a real stdio subprocess
-        # this way before) that probe hangs indefinitely -- confirmed by a raw
-        # JSON-RPC probe (plain "initialize" handshake, no discover) getting an
-        # instant, correct response on the identical server process. "legacy"
-        # skips the probe and uses the classic initialize handshake instead,
-        # which every configured client (Claude Code, Claude Desktop) already
-        # uses in practice.
+        # Pinned to "legacy" for deterministic behavior in this suite -- the
+        # classic initialize handshake every configured client (Claude Code,
+        # Claude Desktop) already uses in practice. fastmcp Client's default
+        # mode="auto" (which probes the newer `server/discover` protocol
+        # before falling back) also connected fine in testing against this
+        # server (3/3); "legacy" is pinned here for determinism, not to work
+        # around a reproduced "auto" failure.
         mode="legacy",
     ) as client:
         yield client

@@ -85,25 +85,50 @@ with the `JIRA_MULTI_CONFIG` environment variable or `--config PATH`.
 | `api_token` | none | A literal Cloud API token. Mutually exclusive with `api_token_env` and with either `personal_token*`. |
 | `api_token_env` | none | Name of an environment variable holding the Cloud API token. Preferred over `api_token` — a literal value logs an INFO line suggesting the env form each time it's used. |
 | `personal_token` / `personal_token_env` | none | Same idea, for a Jira Server/Data Center Personal Access Token (Bearer auth). Mutually exclusive with the `api_token*` pair. |
-| `toolset_preset` | `"curated"` | `"curated"` mirrors the ~35 hand-picked tools below; `"all"` mirrors every `jira_`-prefixed tool upstream exposes (agile boards/sprints, service desk, forms, dev-info, and more — not individually verified by this repo). |
+| `toolset_preset` | `"curated"` | `"curated"` mirrors the 37 hand-picked tools below (36 mirrored directly, plus `jira_download_attachments`, which the wrapper shadows with its own disk-writing version); `"all"` mirrors every `jira_`-prefixed tool upstream exposes (agile boards/sprints, service desk, forms, dev-info, and more — not individually verified by this repo). |
 | `call_timeout_seconds` | `120` | Per-call timeout to a child before the tool call fails with a `[site=...]` error naming the child's log. |
 | `connect_timeout_seconds` | `90` | How long to wait for each child to finish starting up. |
 | `attachment_max_bytes` | `104857600` (100 MiB) | Per-file cap enforced by `jira_download_attachments`, checked against both the reported `Content-Length` and the actual streamed byte count. |
-| `recovery_cooldown_seconds`\* | `30` | How long a site that failed 3 consecutive calls stays marked `failed` before it's tried again. |
+| `recovery_cooldown_seconds` | `30` | How long a site that's `failed` stays marked that way before the next call that needs it (or `jira_sites`) tries to reconnect it. See [How site recovery works](#how-site-recovery-works). |
+| `health_recovery_budget_seconds` | `8` | Upper bound on how long one `jira_sites` call waits for recovery to settle before returning — a slower recovery keeps running in the background and is picked up by a later call. See [How site recovery works](#how-site-recovery-works). |
 
-\* Landing alongside the liveness-recovery work; see `config.example.toml` for the current commented-out placeholder if your checkout predates it.
+### How site recovery works
+
+A site is marked `failed` after a single dropped connection, or after 3
+consecutive per-call timeouts in a row (one slow call doesn't take a site
+down by itself). A `failed` site — including one that failed at startup — is
+retried automatically once `recovery_cooldown_seconds` has elapsed since the
+last failure: either by the next tool call routed to it, or by the next
+`jira_sites` call.
+
+`jira_sites` reports each site's `state` (a site whose recovery attempt is
+actively in flight shows `recovering`, not `failed`), a lifetime
+`recovery_attempts` counter, and an estimated `next_retry_at`. Its own
+recovery pass — and any newly-mirrored tools that requires (see below) — is
+bounded by `health_recovery_budget_seconds`: a recovery attempt that's still
+running when the budget expires keeps going in the background and is picked
+up by the next `jira_sites` call, rather than making that call wait
+indefinitely.
+
+If every configured site was `failed` at startup, no tools were ever
+mirrored (there's nothing to discover them from). Once at least one site
+recovers, `jira_sites` mirrors the real tools for the first time; the
+connected client is notified via a `tools/list_changed` message where the
+transport supports it, or — if that notification can't be sent — the
+`jira_sites` response carries a `note` asking the caller to re-list tools.
 
 ### `[upstream]` — how the child `mcp-atlassian` process is launched
 
 | Key | Default | Notes |
 |---|---|---|
 | `command` | `["uvx", "mcp-atlassian@latest"]` | The `@latest` suffix forces `uvx` to revalidate against PyPI on every launch (a cheap conditional request, not a full re-download unless the version actually changed) — see [How it stays current with upstream](#how-it-stays-current-with-upstream). Pin a version for reproducibility instead, e.g. `["uvx", "mcp-atlassian==0.23.1"]`. |
-| `env_passthrough` | `["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]` | Extra environment variables forwarded to each child. The child's own env is otherwise minimal (`HOME LOGNAME PATH SHELL TERM USER` plus whatever `jira-multi-mcp` sets for that site) — no ambient secret leaks in by default. |
+| `env_passthrough` | `["SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY"]` | Extra environment variables forwarded to each child. The child's own env is otherwise minimal — just `PATH` and `HOME`, plus whatever `jira-multi-mcp` sets for that site (its Jira URL, credentials, `TOOLSETS`, etc.) — no ambient secret leaks in by default. |
 | `workspace_dir` | `"."` | Working directory for the child process. |
 
 ### `[[sites]]` — one entry per Jira instance
 
-Each entry needs a unique `name` (lowercase letters/digits/`_`/`-`), an
+Each entry needs a unique `name` (lowercase letters/digits, then any run of
+lowercase letters/digits/`_`/`-`; it can't start with `_` or `-`), an
 `https://` `url`, and `key_prefixes` — the project-key prefixes (e.g. `JMC`,
 `JUMP`) used to route a bare `JMC-1234` to the right site with no `site`
 argument. **Every prefix across every site must be globally unique** — that's
@@ -122,11 +147,12 @@ Server/Data Center site (`personal_token_env`, no `username` needed).
 ### Environment variable overlay
 
 A `JIRA_MULTI_SITE_<NAME>_<FIELD>` variable overrides one field of a site
-already defined in the TOML file (`<NAME>` is the site name, uppercased won't
-match — it's matched case-insensitively against the lowercase name), for
-example `JIRA_MULTI_SITE_jumpmind_API_TOKEN_ENV=JIRA_JUMPMIND_TOKEN`. A site
-name containing `-` can only be reached via the TOML file (environment
-variable names can't contain a dash). A variable that would introduce a
+already defined in the TOML file. `<NAME>` is matched case-insensitively — it's
+lowercased before comparing against the (already-lowercase) site name — so
+`JIRA_MULTI_SITE_JUMPMIND_API_TOKEN_ENV` and
+`JIRA_MULTI_SITE_jumpmind_API_TOKEN_ENV` both target the site named
+`jumpmind`. A site name containing `-` can only be reached via the TOML file
+(environment variable names can't contain a dash). A variable that would introduce a
 **new** site the TOML file never defined is ignored (with a warning) unless
 it supplies at least `_URL` and `_KEY_PREFIXES` — a stray/typo'd variable
 should never silently create a broken site.
@@ -167,9 +193,11 @@ mismatch.
 
 ## Tool set
 
-`toolset_preset = "curated"` (the default) mirrors this hand-picked ~35-tool
+`toolset_preset = "curated"` (the default) mirrors this hand-picked 37-tool
 subset of upstream's Jira tools, one `MultiSiteProxyTool` per name, each with
-an added optional `site` parameter:
+an added optional `site` parameter. 36 are listed below; the 37th,
+`jira_download_attachments`, is served by the wrapper's own disk-writing
+version instead — see [Wrapper-owned tools](#wrapper-owned-tools).
 
 | Area | Tools |
 |---|---|
@@ -189,16 +217,26 @@ of which this repo has individually verified.
 
 ### Wrapper-owned tools
 
-These four are implemented directly by `jira-multi-mcp` against Jira Cloud
-REST v3 (`httpx`), never forwarded to a child — Jira Cloud sites only; a
-Server/Data Center site (`personal_token`) gets a clear refusal instead.
+These four are implemented directly by `jira-multi-mcp` rather than forwarded
+to a child. The three attachment tools below talk to Jira Cloud REST v3
+(`httpx`) directly and are **Cloud-only** — a Server/Data Center site
+(`personal_token`) gets a clear refusal instead; `jira_sites` has no such
+restriction and reports on every configured site regardless of auth mode.
 
 **`jira_sites()`** — no arguments. Per-site health: `name`, `host`,
-`key_prefixes`, `read_only`, `state`, `error`/`last_error`/`last_error_at`,
-`timeouts`, `log_path`, the upstream `mcp-atlassian` version each child
-reports, and whether that site was the tool-discovery source. Never
-credentials. Call this once per session to learn which prefixes exist and
-whether every site is actually healthy.
+`key_prefixes`, `read_only`, `enabled_tools_restricted`, `state` (`healthy`,
+`failed`, or `recovering` — see [How site recovery works](#how-site-recovery-works)),
+`error`/`last_error`/`last_error_at`, `timeouts`, `recovery_attempts`,
+`next_retry_at`, `log_path`, `discovery_source` (whether that site was the
+tool-discovery source), and `fastmcp_server_version` — the FastMCP *library*
+version the child reports, not upstream mcp-atlassian's own version (that's
+the top-level `upstream_version`, probed once per process since every child
+launches the same command). Never credentials. `healthy` means the child
+process answered a liveness probe — **not** that its credentials or URL are
+valid; run `--check` for that proof. A site actively recovering also carries
+a `note` (e.g. "recovery in progress; call jira_sites again"). Call
+`jira_sites` once per session to learn which prefixes exist and whether every
+site is actually healthy.
 
 **`jira_list_attachments(issue_key, site?)`** — read-only. Returns `id`,
 `filename`, `size`, `mime_type`, `created`, `author` for every attachment on
@@ -284,14 +322,18 @@ query string to be logged — the redaction is unconditional.
 
 Closing stdin (what Claude Code and Claude Desktop do when a session ends)
 is the expected, silent shutdown path — the server notices within roughly
-0.3 seconds and exits cleanly, tearing down every child first. A `SIGTERM`
-(or `SIGINT`) is handled the same way, but rides a 5-second watchdog: if
-tearing down every child hasn't finished by then, the process force-exits
-anyway (reporting failure) rather than hanging indefinitely — the MCP stdio
-transport's own background stdin-reading thread can't always be cancelled
-promptly. Registered via `uvx` (the normal Claude Code registration form),
-`uv` forwards the signal to the actual server process, so this is what a
-supervisor's `kill <pid>` actually experiences.
+0.3-0.4 seconds and exits cleanly, tearing down every child first. A
+`SIGTERM` (or `SIGINT`) is handled the same way and, when every child closes
+cleanly, exits just as quickly (reporting success). A 5-second watchdog is
+armed as a safety net on *every* shutdown — not only a signal, also the
+ordinary "client closed stdin" path — so a hang tearing children down (e.g. a
+child that ignores its own close request) still forces the process to exit
+(reporting failure) rather than hanging indefinitely, since the MCP stdio
+transport's own background stdin-reading thread can't always be canceled
+promptly; any child still alive at that point gets `SIGKILL`ed via its whole
+process group. Registered via `uvx` (the normal Claude Code registration
+form), `uv` forwards the signal to the actual server process, so this is what
+a supervisor's `kill <pid>` actually experiences.
 
 ## Pinning upstream / staying on `@latest`
 
@@ -313,8 +355,9 @@ cold start. See `docs/upstream-notes.md` for the full investigation.
   site is unavailable: ... Run 'jira-multi-mcp --check'.`** — run `--check`
   from a terminal; it authenticates directly and shows the real HTTP status
   and error body, which is much more specific than a tool-call failure. A
-  site that failed 3 consecutive calls (not startup) stays `failed` for
-  `recovery_cooldown_seconds` before it's tried again.
+  site that failed to connect (at startup or later) stays `failed` for
+  `recovery_cooldown_seconds` before it's tried again automatically — see
+  [How site recovery works](#how-site-recovery-works).
 - **`Unknown tool` with no other detail** — the tool name either isn't in
   the curated allowlist (check `toolset_preset`/`enabled_tools`), or no
   currently-healthy child advertised it at discovery time (a dead site at

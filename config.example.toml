@@ -13,7 +13,7 @@ api_token_env  = "JIRA_API_TOKEN"
 # A literal token also works ("api_token = \"...\""), but jira-multi-mcp logs
 # an INFO line each time suggesting api_token_env instead. Never set both.
 
-# "curated" (~35 hand-picked tools: issues, search, comments, transitions,
+# "curated" (37 hand-picked tools: issues, search, comments, transitions,
 # users, links, worklog, project basics) or "all" (every jira_-prefixed tool
 # upstream exposes).
 toolset_preset = "curated"
@@ -24,9 +24,13 @@ connect_timeout_seconds = 90
 # the server's reported Content-Length and the actual streamed byte count).
 # 100 MiB default.
 attachment_max_bytes    = 104857600
-# How long (seconds) a site that failed 3 consecutive calls stays marked
-# "failed" before jira_sites/the mirror will try it again. Default 30.
+# How long (seconds) a failed site stays marked "failed" before the next
+# call that needs it -- or jira_sites -- tries to reconnect it. Default 30.
 # recovery_cooldown_seconds = 30
+# Upper bound (seconds) on how long one jira_sites call waits for recovery
+# to settle before returning; a slower recovery keeps running in the
+# background and is picked up by a later call. Default 8.
+# health_recovery_budget_seconds = 8
 
 [upstream]
 # Re-resolved from PyPI on every launch (small latency, always current).

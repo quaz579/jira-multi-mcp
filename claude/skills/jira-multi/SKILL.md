@@ -46,8 +46,11 @@ For "download the screenshots on JMC-13447" or similar: call
 process's own working directory, not yours). Then use your normal file-read
 tool on the returned path(s). Don't reach for any inline/base64 attachment
 content — it doesn't exist here on purpose; this server always writes to
-disk instead. Check the result's `skipped`/`failed` lists — a filename
-collision or an over-size file lands there, not in `downloaded`.
+disk instead. Pass `filenames` (or `attachment_ids`) to select specific
+attachments instead of pulling everything — e.g. "download the screenshots"
+should pass the PNG filenames rather than also pulling a 15 MB log file
+attached to the same issue. Check the result's `skipped`/`failed` lists — a
+filename collision or an over-size file lands there, not in `downloaded`.
 
 For "attach this file to JUMP-2274": call `jira_upload_attachments(issue_key=...,
 paths=[...])` with absolute local paths.
@@ -57,8 +60,8 @@ paths=[...])` with absolute local paths.
 - An error text prefixed `[site=x]` names the site the call actually ran
   against — use it to tell which child failed, especially when the call had
   no explicit `site` and you're unsure what was inferred.
-- A tool result with a `failed[]` or `skipped[]` list (the attachment tools)
-  describes per-item problems without failing the whole call — read the
+- A tool result with a `failed[]` or `skipped[]` list (`jira_download_attachments`
+  only) describes per-item problems without failing the whole call — read the
   `reason` field on each entry rather than assuming the whole operation
   succeeded or failed as a unit.
 - "site is unavailable" or a `read_only = true` refusal are both expected,
