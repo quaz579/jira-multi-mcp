@@ -190,6 +190,17 @@ class ChildHandle:
     last_error: str | None = None
     last_error_at: float | None = None
     timeouts: int = 0
+    # Recovery bookkeeping (M4): ``next_retry_at`` is the earliest time
+    # ``client_for`` will attempt to restart this child once it's `failed`;
+    # ``recovery_attempts`` is a lifetime counter (never reset on success --
+    # it answers "how many restarts did this site ever need", not "how many
+    # since it last went healthy"). ``recovery_lock`` serializes concurrent
+    # callers hitting `client_for` for the same site the instant the cooldown
+    # expires, so two tool calls racing in that window don't both restart the
+    # child.
+    next_retry_at: float | None = None
+    recovery_attempts: int = 0
+    recovery_lock: anyio.Lock = field(default_factory=anyio.Lock)
 
 
 # A single slow call against an otherwise-healthy child shouldn't take the
@@ -233,6 +244,7 @@ class ChildManager:
         self._discovery_source: str | None = None
         self._secrets: list[Secret] = _collect_secrets(registry.sites)
         self._upstream_version: str | None = None
+        self._close_logged = False
 
     def redact(self, text: str) -> str:
         """Masks every configured site's credential out of model- or
@@ -314,6 +326,7 @@ class ChildManager:
         except Exception as exc:  # noqa: BLE001 - isolate one site's failure from the rest
             handle.state = "failed"
             handle.error = self.redact(f"{exc.__class__.__name__}: {exc}")
+            handle.next_retry_at = time.time() + self._defaults.recovery_cooldown_seconds
             _logger.warning(
                 "site '%s' failed to start: %s (see %s)", site.name, handle.error, handle.log_path
             )
@@ -324,6 +337,7 @@ class ChildManager:
         if timed_out:
             handle.state = "failed"
             handle.error = f"connect timed out after {connect_timeout}s"
+            handle.next_retry_at = time.time() + self._defaults.recovery_cooldown_seconds
             _logger.warning(
                 "site '%s' failed to start: %s (see %s)", site.name, handle.error, handle.log_path
             )
@@ -342,9 +356,11 @@ class ChildManager:
     def mark_failed(self, site_name: str, reason: str) -> None:
         """Records a call-time connection failure discovered by the mirror
         (e.g. the child's pipe broke mid-session) so ``jira_sites`` reflects
-        it instead of continuing to show a stale ``healthy``. Does not restart
-        or reconnect the child (M4) -- it only stops ``client_for`` handing
-        the dead client out again and records when/why."""
+        it instead of continuing to show a stale ``healthy``. Does not itself
+        restart or reconnect the child -- it only stops ``client_for`` handing
+        the dead client out again and records when/why. ``client_for`` is
+        what actually retries, once ``recovery_cooldown_seconds`` has
+        elapsed (see ``_maybe_recover``)."""
         handle = self._handles.get(site_name)
         if handle is None:
             return
@@ -353,6 +369,7 @@ class ChildManager:
         handle.error = redacted
         handle.last_error = redacted
         handle.last_error_at = time.time()
+        handle.next_retry_at = time.time() + self._defaults.recovery_cooldown_seconds
         _logger.warning("site '%s' marked failed after a call: %s", site_name, redacted)
 
     def mark_timeout(self, site_name: str, reason: str) -> None:
@@ -372,6 +389,7 @@ class ChildManager:
         if handle.timeouts >= _MAX_CONSECUTIVE_TIMEOUTS:
             handle.state = "failed"
             handle.error = redacted
+            handle.next_retry_at = time.time() + self._defaults.recovery_cooldown_seconds
 
     def mark_success(self, site_name: str) -> None:
         """Resets the consecutive-timeout counter after a call that actually
@@ -418,6 +436,12 @@ class ChildManager:
             )
             return None
         version = completed.stdout.strip()
+        if not version:
+            # Exit 0 with nothing on stdout is not a version -- leave
+            # `upstream_version()` at its `None` default rather than
+            # reporting an empty string as if it were one.
+            _logger.warning("upstream_version unavailable: command exited 0 but printed nothing")
+            return None
         self._upstream_version = version
         _logger.info("upstream command version: %s", version)
         return version
@@ -427,12 +451,99 @@ class ChildManager:
 
     async def client_for(self, site_name: str) -> Client[ClientTransport]:
         handle = self._handles.get(site_name)
+        if handle is not None and handle.state == "failed":
+            await self._maybe_recover(handle)
         if handle is None or handle.state != "healthy" or handle.client is None:
             reason = handle.error if handle is not None and handle.error else "not configured"
             raise ToolError(
                 f"[site={site_name}] site is unavailable: {reason}. Run 'jira-multi-mcp --check'."
             )
         return handle.client
+
+    async def _maybe_recover(self, handle: ChildHandle) -> None:
+        """Re-probes a ``failed`` site once ``recovery_cooldown_seconds`` has
+        elapsed since its last failure, restarting the child if so.
+
+        The cheap check (``next_retry_at`` in the past) happens before ever
+        taking ``handle.recovery_lock``, so the common case -- a site that's
+        healthy, or still within its cooldown -- costs nothing beyond a
+        timestamp comparison. The lock only serializes the rare case: two
+        calls for the same failed site racing right as the cooldown expires,
+        which must attempt exactly one restart, not two.
+        """
+        if handle.next_retry_at is not None and time.time() < handle.next_retry_at:
+            return
+        async with handle.recovery_lock:
+            # Re-check inside the lock: another caller may have already
+            # completed (or just started, resetting the cooldown on failure)
+            # a recovery attempt while this one waited for the lock.
+            if handle.state != "failed":
+                return
+            if handle.next_retry_at is not None and time.time() < handle.next_retry_at:
+                return
+            await self._attempt_recovery(handle)
+
+    async def _attempt_recovery(self, handle: ChildHandle) -> None:
+        site = handle.site
+        handle.recovery_attempts += 1
+        _logger.info(
+            "site '%s': recovery cooldown elapsed, attempting restart (attempt %d)",
+            site.name,
+            handle.recovery_attempts,
+        )
+        old_client = handle.client
+        if old_client is not None:
+            # Bounded: a child that's `failed` from 3 consecutive timeouts is
+            # presumably stuck, and `Client.close()` has its own disconnect
+            # wait -- don't let a corpse's teardown stall the restart.
+            with anyio.move_on_after(5.0), suppress(Exception):
+                await old_client.close()  # type: ignore[no-untyped-call]
+        handle.client = None
+
+        connect_timeout = self._defaults.connect_timeout_seconds
+        transport: ClientTransport | None = None
+        entered = False
+        try:
+            with anyio.move_on_after(connect_timeout) as scope:
+                transport = self._transport_factory(site, self._upstream)
+                client: Client[ClientTransport] = Client(transport)
+                handle.client = client
+                await client.__aenter__()  # type: ignore[no-untyped-call]
+                entered = True
+                await self._probe_liveness(client)
+            timed_out = scope.cancelled_caught
+        except Exception as exc:  # noqa: BLE001 - one site's failed recovery must not raise
+            self._fail_recovery(handle, self.redact(f"{exc.__class__.__name__}: {exc}"))
+            if not entered:
+                _close_leaked_log_file(transport)
+            return
+
+        if timed_out:
+            self._fail_recovery(handle, f"connect timed out after {connect_timeout}s")
+            if not entered:
+                _close_leaked_log_file(transport)
+            return
+
+        handle.state = "healthy"
+        handle.error = None
+        handle.timeouts = 0
+        handle.connected_at = time.time()
+        handle.next_retry_at = None
+        info = client.server_info
+        handle.fastmcp_server_version = info.version if info is not None else None
+        _logger.info(
+            "site '%s' recovered: child fastmcp serverInfo.version=%s",
+            site.name,
+            handle.fastmcp_server_version,
+        )
+
+    def _fail_recovery(self, handle: ChildHandle, reason: str) -> None:
+        handle.state = "failed"
+        handle.error = reason
+        handle.last_error = reason
+        handle.last_error_at = time.time()
+        handle.next_retry_at = time.time() + self._defaults.recovery_cooldown_seconds
+        _logger.warning("site '%s' recovery attempt failed: %s", handle.site.name, reason)
 
     async def discover_tools(self) -> list[mcp_types.Tool]:
         """Tools to mirror: prefer the first healthy, unrestricted site (the
@@ -466,11 +577,14 @@ class ChildManager:
                     "host": urlsplit(handle.site.url).netloc,
                     "key_prefixes": list(handle.site.key_prefixes),
                     "read_only": handle.site.read_only,
+                    "enabled_tools_restricted": handle.site.enabled_tools is not None,
                     "state": handle.state,
                     "error": handle.error,
                     "last_error": handle.last_error,
                     "last_error_at": handle.last_error_at,
                     "timeouts": handle.timeouts,
+                    "recovery_attempts": handle.recovery_attempts,
+                    "next_retry_at": handle.next_retry_at,
                     "log_path": str(handle.log_path),
                     "fastmcp_server_version": handle.fastmcp_server_version,
                     "discovery_source": handle.site.name == self._discovery_source,
@@ -496,9 +610,13 @@ class ChildManager:
         ``mcp.client.stdio.stdio_client``'s teardown) and is idempotent, so
         this is safe to call even though the exit stack will still run each
         client's ordinary ``__aexit__`` afterward, and safe to call twice
-        (e.g. once from a shutdown-signal handler, once from here).
+        (e.g. once from a shutdown-signal handler, once from here) --
+        ``_close_logged`` only keeps that second call from logging the same
+        "shutting down" line again.
         """
-        _logger.info("child manager shutting down")
+        if not self._close_logged:
+            self._close_logged = True
+            _logger.info("child manager shutting down")
         async with anyio.create_task_group() as tg:
             for handle in self._handles.values():
                 if handle.client is not None:

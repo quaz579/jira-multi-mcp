@@ -149,6 +149,7 @@ def _render_config(config: AppConfig) -> str:
         f"  call_timeout_seconds = {config.defaults.call_timeout_seconds}",
         f"  connect_timeout_seconds = {config.defaults.connect_timeout_seconds}",
         f"  attachment_max_bytes = {config.defaults.attachment_max_bytes}",
+        f"  recovery_cooldown_seconds = {config.defaults.recovery_cooldown_seconds}",
         "",
         "[upstream]",
         f"  command = {list(config.upstream.command)!r}",

@@ -546,6 +546,45 @@ async def test_no_clobber_copy_fallback_still_refuses_a_dest_that_appears_mid_ra
     assert dest.read_bytes() == b"raced-in-content"
 
 
+def test_copy_part_to_dest_direct_write_fallback_second_call_finds_dest_taken(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Whitebox on `_copy_part_to_dest` itself: exercises its OWN direct
+    O_EXCL write (both `os.link` attempts -- the outer one `_finalize` tries
+    first, and the inner one this method tries before falling all the way
+    back -- fail with an unsupported-hard-link errno). First call: `dest`
+    doesn't exist yet, so the direct write succeeds. Second call targeting
+    the SAME `dest`: the O_EXCL open itself raises `FileExistsError` (not
+    `_pick_dest_name`'s pre-check, which this whitebox call bypasses
+    entirely) -- `dest` must be left exactly as call 1 wrote it, and the
+    `.copy` scratch temp must not survive either call."""
+
+    def flaky_link(src: object, dst: object, **kwargs: object) -> None:
+        raise OSError(errno.EPERM, "Operation not permitted")
+
+    monkeypatch.setattr(os, "link", flaky_link)
+
+    dest = tmp_path / "dest.txt"
+    part1 = tmp_path / "part1"
+    part1.write_bytes(b"first-content")
+    JiraAttachmentClient._copy_part_to_dest(part1, dest)  # noqa: SLF001 - whitebox on our own class
+
+    assert dest.read_bytes() == b"first-content"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["dest.txt", "part1"]
+
+    part2 = tmp_path / "part2"
+    part2.write_bytes(b"second-content")
+    with pytest.raises(FileExistsError):
+        JiraAttachmentClient._copy_part_to_dest(part2, dest)  # noqa: SLF001 - whitebox on our own class
+
+    assert dest.read_bytes() == b"first-content"  # untouched by the failed second call
+    assert sorted(p.name for p in tmp_path.iterdir()) == [
+        "dest.txt",
+        "part1",
+        "part2",
+    ]  # no leftover .copy temp
+
+
 @respx.mock
 async def test_copy_fallback_mid_copy_failure_leaves_no_truncated_dest(
     http_client: httpx.AsyncClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

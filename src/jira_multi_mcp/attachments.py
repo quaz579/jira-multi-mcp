@@ -137,6 +137,19 @@ class JiraAttachmentClient:
     def api_base(self) -> str:
         return f"{self._site.url}/rest/api/3"
 
+    def _redact_exc(self, exc: BaseException) -> str:
+        return self._redact(f"{exc.__class__.__name__}: {exc}")
+
+    def _shape_transport_error(self, exc: httpx.HTTPError, tool_name: str) -> ToolError:
+        """Gives a transport-level failure (connect/read timeout, dropped
+        connection, ...) on the LIST or UPLOAD phase the same ``[site=]``
+        shape every other error path in this module already has -- used by
+        both single-shot call sites (list/upload raise this directly); the
+        per-attachment DOWNLOAD phase collects failures as ``_DownloadEntry``
+        rows instead of raising, but shares ``_redact_exc`` for the same
+        underlying message text."""
+        return ToolError(f"[site={self._site.name}] {tool_name}: {self._redact_exc(exc)}")
+
     def _require_cloud(self, tool_name: str) -> None:
         if self._site.personal_token is not None:
             raise ToolError(
@@ -144,10 +157,15 @@ class JiraAttachmentClient:
                 f"only in this version (site '{self._site.name}' is configured as Server/Data Center)"
             )
 
-    async def list_attachments(self, issue_key: str) -> list[AttachmentMeta]:
-        self._require_cloud("jira_list_attachments")
+    async def list_attachments(
+        self, issue_key: str, *, tool_name: str = "jira_list_attachments"
+    ) -> list[AttachmentMeta]:
+        self._require_cloud(tool_name)
         path = f"/issue/{issue_key}"
-        response = await self._http.get(f"{self.api_base}{path}", params={"fields": "attachment"})
+        try:
+            response = await self._http.get(f"{self.api_base}{path}", params={"fields": "attachment"})
+        except httpx.HTTPError as exc:
+            raise self._shape_transport_error(exc, tool_name) from exc
         await self._raise_for_status(response, "GET", path)
         data = response.json()
         raw_attachments = (data.get("fields") or {}).get("attachment") or []
@@ -173,7 +191,7 @@ class JiraAttachmentClient:
                 f"[site={self._site.name}] jira_download_attachments: 'attachment_ids' is an empty list; "
                 "omit the argument entirely to download every attachment"
             )
-        attachments = await self.list_attachments(issue_key)
+        attachments = await self.list_attachments(issue_key, tool_name="jira_download_attachments")
         selected, unmatched = self._select(attachments, filenames, attachment_ids, issue_key)
 
         downloaded: list[DownloadedFile] = []
@@ -237,11 +255,14 @@ class JiraAttachmentClient:
                 for path, fh in zip(paths, handles, strict=True)
             ]
             path_str = f"/issue/{issue_key}/attachments"
-            response = await self._http.post(
-                f"{self.api_base}{path_str}",
-                files=files,
-                headers={"X-Atlassian-Token": "no-check"},
-            )
+            try:
+                response = await self._http.post(
+                    f"{self.api_base}{path_str}",
+                    files=files,
+                    headers={"X-Atlassian-Token": "no-check"},
+                )
+            except httpx.HTTPError as exc:
+                raise self._shape_transport_error(exc, "jira_upload_attachments") from exc
         await self._raise_for_status(response, "POST", path_str)
         return [self._parse_attachment(raw) for raw in response.json()]
 
@@ -420,9 +441,7 @@ class JiraAttachmentClient:
                 # while just setting up the stream, before a single byte was
                 # ever written -- not a Jira-returned error status. `dest`
                 # was never touched either way.
-                return _DownloadEntry(
-                    attachment.filename, self._redact(f"{exc.__class__.__name__}: {exc}"), "failed"
-                )
+                return _DownloadEntry(attachment.filename, self._redact_exc(exc), "failed")
             finally:
                 handle.close()
 
@@ -483,21 +502,28 @@ class JiraAttachmentClient:
 
     @staticmethod
     def _copy_part_to_dest(part: Path, dest: Path) -> None:
-        """Used when ``os.link`` isn't supported at all between ``part`` and
-        ``dest`` (different filesystems, or a filesystem/OS that never
-        supports hard links).
+        """Used when ``_finalize``'s own ``os.link(part, dest)`` can't
+        publish the download at all -- in practice a filesystem/OS that
+        doesn't support hard links (``EPERM``/``ENOTSUP``/``EOPNOTSUPP``).
+        ``EXDEV`` (cross-device) is in ``_LINK_UNSUPPORTED_ERRNOS``
+        defensively, but every path this method ever links -- ``part``, this
+        method's own ``.copy`` temp, and ``dest`` -- lives in ``target_dir``
+        (see ``_stream_to_dest``'s and this method's own ``tempfile.mkstemp``
+        calls), so cross-device is not actually reachable here.
 
-        Copies through a second temp file in ``dest``'s own directory and
-        publishes THAT via ``os.link``, so a failure partway through the
-        copy never leaves a truncated file under ``dest``'s final name.
-        Only if that second link also can't be made (the same
-        unsupported-hard-link errnos) does this fall back to writing
-        ``dest`` directly -- still ``O_EXCL``, so a same-named file that
-        appeared on disk after ``_pick_dest_name`` checked (but before this
-        runs) still isn't silently clobbered, raising ``FileExistsError``
-        the same as the ordinary ``os.link`` collision case -- and removes
-        ``dest`` again if that direct write itself fails partway, rather
-        than leaving a partial download under the delivered filename.
+        Copies through a second temp file in ``dest``'s own directory, then
+        tries to publish THAT via ``os.link`` too. If that also fails, this
+        falls all the way back to writing ``dest`` directly -- still
+        ``O_EXCL``, so a same-named file that appeared on disk after
+        ``_pick_dest_name`` checked (but before this runs) still isn't
+        silently clobbered, raising ``FileExistsError`` the same as the
+        ordinary ``os.link`` collision case. The actual protection against a
+        truncated ``dest`` on THIS direct-write path is the
+        ``except BaseException: dest.unlink(...); raise`` below, not the
+        ``os.link`` publish step above it (that step's atomicity is what
+        protects the copy-then-link path, not this one) -- a failure partway
+        through the direct write removes ``dest`` again rather than leaving
+        a partial download under the delivered filename.
 
         ``tempfile.mkstemp`` creates its file with mode 0o600; the O_EXCL
         fallback below matches that explicitly, since plain ``os.open``

@@ -57,10 +57,22 @@ def build_jira_sites_tool(manager: ChildManager) -> Tool:
             "sites": sites,
             "upstream_version": manager.upstream_version(),
         }
-        if not any(site["state"] == "healthy" for site in sites):
+        healthy = [site for site in sites if site["state"] == "healthy"]
+        if not healthy:
             payload["note"] = (
                 "no configured site is currently healthy; tool discovery could not run "
                 "against any child. See each site's 'error'/'log_path' above."
+            )
+        elif all(site["read_only"] or site["enabled_tools_restricted"] for site in healthy):
+            # Distinct from the no-healthy-site case above: every child IS
+            # reachable, it's just that none of them is allowed to serve a
+            # write tool -- so a write tool call fails with a bare "Unknown
+            # tool" (fastmcp has no catch-all to shape that into a clearer
+            # error) rather than the usual "[site=x] ... read_only" hint.
+            payload["note"] = (
+                "every healthy site is read_only or has enabled_tools configured; write tools "
+                "are not mirrored, so calling one by name fails with a bare 'Unknown tool' rather "
+                "than a [site=] error. See each site's 'read_only'/'enabled_tools_restricted' above."
             )
         return payload
 

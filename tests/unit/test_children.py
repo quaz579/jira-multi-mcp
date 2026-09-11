@@ -516,3 +516,160 @@ async def test_probe_upstream_version_handles_a_missing_command(tmp_path: Path) 
 
     assert version is None
     assert manager.upstream_version() is None
+
+
+async def test_probe_upstream_version_is_none_when_command_prints_nothing(tmp_path: Path) -> None:
+    """Exit 0 with empty stdout is not a version -- `upstream_version()` must
+    stay at its `None` default rather than reporting `""` as if it were one."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    upstream = UpstreamConfig(command=(sys.executable, "-c", "pass"))
+    manager = ChildManager(registry, upstream, Defaults(), tmp_path)
+
+    version = await manager.probe_upstream_version()
+
+    assert version is None
+    assert manager.upstream_version() is None
+
+
+# --- failed-site recovery (M4) ---
+
+
+async def test_client_for_recovers_a_failed_site_once_the_cooldown_elapses(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    attempts = {"count": 0}
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("simulated connect failure")
+        return FastMCPTransport(make_fake_child(site.name))
+
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05),
+        tmp_path,
+        transport_factory=factory,
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "failed"
+        assert health["acme"]["next_retry_at"] is not None
+
+        await anyio.sleep(0.1)  # past the cooldown
+        client = await manager.client_for("acme")
+
+        assert client is not None
+        assert attempts["count"] == 2
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "healthy"
+        assert health["acme"]["recovery_attempts"] == 1
+        assert health["acme"]["next_retry_at"] is None
+        assert health["acme"]["error"] is None
+
+
+async def test_client_for_does_not_retry_before_the_cooldown_elapses(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    attempts = {"count": 0}
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        attempts["count"] += 1
+        raise RuntimeError("simulated connect failure")
+
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=30.0),
+        tmp_path,
+        transport_factory=factory,
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        assert attempts["count"] == 1
+
+        with pytest.raises(ToolError):
+            await manager.client_for("acme")
+
+        assert attempts["count"] == 1  # cooldown not elapsed yet -- no retry attempted
+
+
+async def test_client_for_stays_failed_and_updates_next_retry_at_when_recovery_keeps_failing(
+    tmp_path: Path,
+) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        raise RuntimeError("simulated connect failure")
+
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05),
+        tmp_path,
+        transport_factory=factory,
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        first_retry_at = manager._handles["acme"].next_retry_at  # noqa: SLF001 - whitebox on our own fake
+        assert first_retry_at is not None
+
+        await anyio.sleep(0.1)
+        with pytest.raises(ToolError):
+            await manager.client_for("acme")
+
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "failed"
+        assert health["acme"]["recovery_attempts"] == 1
+        next_retry_at = health["acme"]["next_retry_at"]
+        assert isinstance(next_retry_at, float)
+        assert next_retry_at > first_retry_at
+
+
+async def test_recovery_closes_the_old_client_before_restarting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05),
+        tmp_path,
+        transport_factory=lambda site, up: FastMCPTransport(make_fake_child(site.name)),
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        handle = manager._handles["acme"]  # noqa: SLF001 - whitebox on our own fake
+        old_client = handle.client
+        assert old_client is not None
+
+        closed: list[str] = []
+        original_close = old_client.close
+
+        async def _spy_close() -> None:
+            closed.append("acme")
+            await original_close()  # type: ignore[no-untyped-call]
+
+        monkeypatch.setattr(old_client, "close", _spy_close)
+        manager.mark_failed("acme", "simulated pipe break")
+
+        await anyio.sleep(0.1)
+        new_client = await manager.client_for("acme")
+
+        assert closed == ["acme"]
+        assert new_client is not old_client
+
+
+async def test_aclose_logs_shutting_down_only_once_across_repeated_calls(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        with caplog.at_level("INFO"):
+            await manager.aclose()
+            await manager.aclose()
+
+    matches = [r for r in caplog.records if "child manager shutting down" in r.message]
+    assert len(matches) == 1

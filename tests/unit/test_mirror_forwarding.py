@@ -369,6 +369,32 @@ async def test_jira_sites_shape_and_no_credentials(rig: _Rig) -> None:
     assert beta["discovery_source"] is False
     assert acme["host"] == "acme.atlassian.net"
     assert acme["key_prefixes"] == ["ACME"]
+    assert acme["enabled_tools_restricted"] is False
+    assert acme["recovery_attempts"] == 0
+    assert acme["next_retry_at"] is None
+
+
+async def test_jira_sites_note_when_every_healthy_site_is_read_only(tmp_path: Path) -> None:
+    """Distinct from the no-healthy-site case below: every child IS
+    reachable, but none is allowed to serve a write tool."""
+    registry = SiteRegistry([_site("acme", "ACME", read_only=True), _site("beta", "BETA", read_only=True)])
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(),
+        tmp_path,
+        transport_factory=lambda site, up: FastMCPTransport(make_fake_child(site.name)),
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        parent = FastMCP("test-parent")
+        parent.add_tool(build_jira_sites_tool(manager))
+        async with Client(FastMCPTransport(parent)) as client:
+            result = await client.call_tool_mcp("jira_sites", {})
+            payload = result.structured_content
+            assert all(s["state"] == "healthy" for s in payload["sites"])
+            assert "note" in payload
+            assert "read_only" in payload["note"]
 
 
 async def test_jira_sites_note_when_no_site_is_healthy(tmp_path: Path) -> None:

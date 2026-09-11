@@ -47,6 +47,23 @@ def test_toml_round_trip(tmp_path: Path) -> None:
     assert site.auth_mode == "cloud"
 
 
+def test_recovery_cooldown_seconds_defaults_to_thirty(tmp_path: Path) -> None:
+    config = _load(tmp_path, MINIMAL_TOML)
+    assert config.defaults.recovery_cooldown_seconds == 30.0
+
+
+def test_recovery_cooldown_seconds_is_configurable(tmp_path: Path) -> None:
+    content = MINIMAL_TOML.replace("[defaults]", "[defaults]\nrecovery_cooldown_seconds = 5\n")
+    config = _load(tmp_path, content)
+    assert config.defaults.recovery_cooldown_seconds == 5.0
+
+
+def test_recovery_cooldown_seconds_must_be_positive(tmp_path: Path) -> None:
+    content = MINIMAL_TOML.replace("[defaults]", "[defaults]\nrecovery_cooldown_seconds = 0\n")
+    with pytest.raises(ConfigError, match="recovery_cooldown_seconds"):
+        _load(tmp_path, content)
+
+
 def test_url_trailing_slash_is_stripped(tmp_path: Path) -> None:
     content = MINIMAL_TOML.replace(
         'url = "https://acme.atlassian.net"', 'url = "https://acme.atlassian.net/"'

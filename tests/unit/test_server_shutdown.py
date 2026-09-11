@@ -128,6 +128,123 @@ def test_sigterm_during_startup_does_not_orphan_the_spawned_child(tmp_path: Path
             proc.wait(timeout=5)
 
 
+def test_stdin_eof_during_startup_does_not_orphan_the_spawned_child(tmp_path: Path) -> None:
+    """The client-abandons-mid-connect scenario, but via stdin closing
+    (no bytes ever written) rather than a signal -- proves the stdin-EOF
+    watcher, not just the SIGTERM path, unblocks a stuck connect and kills
+    the spawned child."""
+    pid_file = tmp_path / "child.pid"
+    upstream_script = _write_hanging_upstream_script(tmp_path)
+    config_path = _write_config(tmp_path, command=[sys.executable, str(upstream_script), str(pid_file)])
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from jira_multi_mcp.cli import main; sys.exit(main())",
+            "--config",
+            str(config_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_file(pid_file, timeout=15.0)
+        child_pid = int(pid_file.read_text().strip())
+        assert _pid_alive(child_pid), "fake upstream child never actually started"
+
+        time.sleep(0.5)
+        t_close = time.monotonic()
+        assert proc.stdin is not None
+        proc.stdin.close()
+
+        try:
+            proc.wait(timeout=_MAX_SHUTDOWN_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            pytest.fail(
+                f"parent did not exit within {_MAX_SHUTDOWN_SECONDS}s of stdin closing "
+                "during the connect window (stdin-EOF watcher regression)"
+            )
+        parent_elapsed = time.monotonic() - t_close
+
+        deadline = time.monotonic() + 5.0
+        while _pid_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        assert not _pid_alive(child_pid), (
+            f"fake upstream child pid {child_pid} was orphaned: still alive after the "
+            "parent exited following stdin closing mid-connect"
+        )
+        assert parent_elapsed <= _MAX_SHUTDOWN_SECONDS
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
+def test_stdin_eof_still_detected_after_the_client_already_wrote_bytes(tmp_path: Path) -> None:
+    """The realistic case: a real MCP client writes its ``initialize``
+    request immediately on spawn, then later abandons the connection by
+    closing its end of stdin without ever reading a reply. Those bytes sit
+    unread in the pipe the whole time -- proving detection still fires
+    (via POLLHUP, not a data-vs-EOF guess from `select()`) and that nothing
+    about consuming/peeking those bytes breaks the shutdown path."""
+    pid_file = tmp_path / "child.pid"
+    upstream_script = _write_hanging_upstream_script(tmp_path)
+    config_path = _write_config(tmp_path, command=[sys.executable, str(upstream_script), str(pid_file)])
+
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from jira_multi_mcp.cli import main; sys.exit(main())",
+            "--config",
+            str(config_path),
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        _wait_for_file(pid_file, timeout=15.0)
+        child_pid = int(pid_file.read_text().strip())
+        assert _pid_alive(child_pid), "fake upstream child never actually started"
+
+        assert proc.stdin is not None
+        proc.stdin.write('{"jsonrpc": "2.0", "method": "initialize"}\n')
+        proc.stdin.flush()
+        time.sleep(0.5)
+        t_close = time.monotonic()
+        proc.stdin.close()
+
+        try:
+            proc.wait(timeout=_MAX_SHUTDOWN_SECONDS)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=5)
+            pytest.fail(
+                f"parent did not exit within {_MAX_SHUTDOWN_SECONDS}s of stdin closing "
+                "with an unread 'initialize' request still queued"
+            )
+        parent_elapsed = time.monotonic() - t_close
+
+        deadline = time.monotonic() + 5.0
+        while _pid_alive(child_pid) and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        assert not _pid_alive(child_pid)
+        assert parent_elapsed <= _MAX_SHUTDOWN_SECONDS
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=5)
+
+
 def _write_real_fastmcp_upstream_script(tmp_path: Path) -> Path:
     """A fake upstream that speaks real MCP over stdio (via the installed
     fastmcp), so `start_all` actually completes and the site becomes
