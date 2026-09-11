@@ -38,6 +38,24 @@ PROJECTS_FILTER_ARGS: tuple[str, ...] = ("projects_filter",)
 # though they can contain text that looks like an issue key.
 NEVER_PARSED: frozenset[str] = frozenset({"jql"})
 
+# Comfortably above any real Jira key (longest observed project keys are a
+# handful of characters) but small enough to make a pathological input (e.g.
+# thousands of digits) a cheap, obvious rejection rather than a large string
+# threaded through logging/error messages.
+_DEFAULT_ERROR_SHOW_LEN = 80
+
+
+def shorten_for_error(value: str, limit: int = _DEFAULT_ERROR_SHOW_LEN) -> str:
+    """Truncates and reprs a raw, caller-supplied string before it's embedded
+    in an error message. Several call sites echo an `issue_key` (or similar)
+    BEFORE it has passed length/shape validation -- site resolution and
+    `enforce_site_policy` both run first -- so without this, a pathological
+    value (thousands of characters, an embedded newline) would reach the
+    message untruncated and unescaped."""
+    shown = value if len(value) <= limit else f"{value[:limit]}...({len(value)} chars)"
+    return repr(shown)
+
+
 # `[0-9]`, not `\d` -- Python's `\d` also matches non-ASCII decimal digits
 # (Arabic-indic, fullwidth, etc.), which would otherwise reach the REST URL
 # percent-encoded instead of being refused as an invalid key.

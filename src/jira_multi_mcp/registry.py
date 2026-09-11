@@ -16,6 +16,7 @@ from jira_multi_mcp.tools_meta import (
     PROJECT_KEY_ARGS,
     PROJECT_KEY_RE,
     PROJECTS_FILTER_ARGS,
+    shorten_for_error,
 )
 
 _logger = logging.getLogger(__name__)
@@ -99,7 +100,8 @@ def resolve_site(
         site = registry.get_by_prefix(prefix)
         if site is None:
             raise UnknownPrefixError(
-                f"tool '{tool_name}': unknown project prefix '{prefix}' (from '{token}' in '{arg_name}'); "
+                f"tool '{tool_name}': unknown project prefix {shorten_for_error(prefix)} "
+                f"(from {shorten_for_error(token)} in '{arg_name}'); "
                 f"configured prefixes: {registry.prefix_table()}"
             )
         matched_sites[site.name] = site

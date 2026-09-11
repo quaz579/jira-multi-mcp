@@ -401,9 +401,7 @@ class JiraAttachmentClient:
             # of escaping `download()`'s loop and aborting every other
             # attachment selected in the same call (the exact bug an
             # unshaped `IsADirectoryError` from `os.replace` caused).
-            return _DownloadEntry(
-                attachment.filename, self._redact(f"{exc.__class__.__name__}: {exc}"), "failed"
-            )
+            return _DownloadEntry(attachment.filename, self._redact_exc(exc), "failed")
         if isinstance(result, DownloadedFile):
             used_names.add(result.filename)
         return result
@@ -534,7 +532,7 @@ class JiraAttachmentClient:
         except OSError as exc:
             return _DownloadEntry(
                 attachment.filename,
-                self._redact(f"could not finalize download: {exc.__class__.__name__}: {exc}"),
+                f"could not finalize download: {self._redact_exc(exc)}",
                 "failed",
             )
         finally:

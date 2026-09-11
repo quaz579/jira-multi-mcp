@@ -33,7 +33,7 @@ from __future__ import annotations
 from fastmcp.exceptions import ToolError
 
 from jira_multi_mcp.model import SiteConfig
-from jira_multi_mcp.tools_meta import ISSUE_KEY_RE
+from jira_multi_mcp.tools_meta import ISSUE_KEY_RE, shorten_for_error
 
 
 def enforce_site_policy(site: SiteConfig, tool_name: str, *, is_write: bool, issue_key: str | None) -> None:
@@ -63,7 +63,7 @@ def enforce_site_policy(site: SiteConfig, tool_name: str, *, is_write: bool, iss
             # project it belongs to).
             raise ToolError(
                 f"[site={site.name}] {tool_name}: projects_filter is configured for this site; "
-                f"use a project issue key (e.g. PROJ-123); got '{issue_key}'"
+                f"use a project issue key (e.g. PROJ-123); got {shorten_for_error(issue_key)}"
             )
         project = match.group(1)
         # `site.projects_filter` is normalized to uppercase at config load
@@ -72,6 +72,6 @@ def enforce_site_policy(site: SiteConfig, tool_name: str, *, is_write: bool, iss
         if project not in site.projects_filter:
             raise ToolError(
                 f"[site={site.name}] {tool_name}: project '{project}' (from issue "
-                f"'{issue_key}') is not in this site's projects_filter "
+                f"{shorten_for_error(issue_key)}) is not in this site's projects_filter "
                 f"({', '.join(site.projects_filter)})"
             )

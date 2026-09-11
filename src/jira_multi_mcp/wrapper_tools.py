@@ -23,7 +23,7 @@ from jira_multi_mcp.mirror import LateMirror
 from jira_multi_mcp.model import Defaults
 from jira_multi_mcp.registry import SiteRegistry, SiteResolution, resolve_site
 from jira_multi_mcp.site_policy import enforce_site_policy
-from jira_multi_mcp.tools_meta import COMMENT_ID_RE, ISSUE_KEY_RE
+from jira_multi_mcp.tools_meta import COMMENT_ID_RE, ISSUE_KEY_RE, shorten_for_error
 
 # Comfortably above any real Jira key (longest observed project keys are a
 # handful of characters) but small enough to make a pathological input (e.g.
@@ -85,10 +85,9 @@ def _validate_issue_key(issue_key: str, site_name: str, tool_name: str) -> str:
     # is the only thing stopping e.g. "CAP-" + "9" * 5000 -- a well-shaped
     # but absurd key -- from reaching the REST path.
     if len(candidate) > _MAX_ISSUE_KEY_LEN or not ISSUE_KEY_RE.fullmatch(candidate):
-        shown = issue_key if len(issue_key) <= 80 else f"{issue_key[:80]}...({len(issue_key)} chars)"
         raise ToolError(
             f"[site={site_name}] {tool_name}: 'issue_key' must be a Jira issue key like "
-            f"PROJ-123, got {shown!r}"
+            f"PROJ-123, got {shorten_for_error(issue_key)}"
         )
     return candidate
 

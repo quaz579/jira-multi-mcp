@@ -130,6 +130,18 @@ def test_unknown_prefix_names_it(multi_site_registry: SiteRegistry) -> None:
         resolve_site(multi_site_registry, {"issue_key": "ZZZ-1"}, tool_name="x")
 
 
+def test_unknown_prefix_bounds_a_pathological_key(multi_site_registry: SiteRegistry) -> None:
+    # ISSUE_KEY_RE has no upper bound on the digit run, so an unknown-prefix
+    # key this long reached resolve_site's error message untruncated before
+    # every pre-validation echo site shared tools_meta.shorten_for_error.
+    huge_key = "ZZZ-" + "9" * 5000
+    with pytest.raises(UnknownPrefixError) as exc_info:
+        resolve_site(multi_site_registry, {"issue_key": huge_key}, tool_name="x")
+    message = str(exc_info.value)
+    assert len(message) < 400
+    assert "...(" in message
+
+
 def test_cross_site_names_both_keys_and_sites(multi_site_registry: SiteRegistry) -> None:
     with pytest.raises(CrossSiteError) as exc_info:
         resolve_site(
