@@ -171,9 +171,20 @@ def configure_logging(config: AppConfig | None, *, verbose: bool = False) -> log
     except OSError:
         package_logger.warning("could not open log file under %s; file logging disabled", log_dir)
 
-    if not verbose:
-        logging.getLogger("httpx").setLevel(logging.WARNING)
-        logging.getLogger("httpcore").setLevel(logging.WARNING)
+    # httpx logs the outbound request line -- including the full URL -- at
+    # INFO, and httpcore's DEBUG level logs the full wire trace on top of
+    # that. For the attachment download's cross-host redirect, that URL is a
+    # pre-signed media-CDN URL carrying a `token=` query parameter that on
+    # its own fetches the file with no further auth. Capped at WARNING
+    # ALWAYS -- never raised to INFO/DEBUG under --verbose, unlike every
+    # other logger this module configures -- so that token can never reach
+    # server.log via either logger's own request-line/wire-trace logging.
+    # `RedactingFilter` additionally strips any URL's query string
+    # unconditionally (see `secrets.scrub_urls`) as defense in depth, in case
+    # a future httpx/httpcore version -- or a different library entirely --
+    # logs a URL at WARNING or above.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
 
     for logger_name in _REDACTED_LOGGER_NAMES:
         attach_redaction(logger_name)

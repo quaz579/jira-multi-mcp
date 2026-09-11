@@ -29,8 +29,9 @@ def _write_hanging_upstream_script(tmp_path: Path) -> Path:
     script = tmp_path / "hanging_upstream.py"
     script.write_text(
         "import os, sys, time\n"
-        "with open(sys.argv[1], 'w') as f:\n"
-        "    f.write(str(os.getpid()))\n"
+        "if '--version' not in sys.argv:\n"
+        "    with open(sys.argv[1], 'w') as f:\n"
+        "        f.write(str(os.getpid()))\n"
         "time.sleep(120)\n"
     )
     return script
@@ -135,8 +136,9 @@ def _write_real_fastmcp_upstream_script(tmp_path: Path) -> Path:
     script = tmp_path / "real_upstream.py"
     script.write_text(
         "import os, sys\n"
-        "with open(sys.argv[1], 'w') as f:\n"
-        "    f.write(str(os.getpid()))\n"
+        "if '--version' not in sys.argv:\n"
+        "    with open(sys.argv[1], 'w') as f:\n"
+        "        f.write(str(os.getpid()))\n"
         "from fastmcp import FastMCP\n"
         "mcp = FastMCP('fake-upstream')\n"
         "mcp.run(transport='stdio', show_banner=False)\n"

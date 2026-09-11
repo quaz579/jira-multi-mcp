@@ -17,7 +17,13 @@ import pytest
 from fastmcp.client.transports import ClientTransport, FastMCPTransport, StdioTransport
 from fastmcp.exceptions import ToolError
 
-from jira_multi_mcp.children import BASE_ENV_PASSTHROUGH, ChildManager, build_child_env, minimal_env
+from jira_multi_mcp.children import (
+    BASE_ENV_PASSTHROUGH,
+    EMPTY_ENABLED_TOOLS_SENTINEL,
+    ChildManager,
+    build_child_env,
+    minimal_env,
+)
 from jira_multi_mcp.model import Defaults, SiteConfig, UpstreamConfig
 from jira_multi_mcp.registry import SiteRegistry
 from jira_multi_mcp.secrets import Secret
@@ -54,6 +60,16 @@ def test_enabled_tools_is_curated_minus_wrapper_owned_by_default() -> None:
     assert "jira_download_attachments" not in names
 
 
+def test_enabled_tools_excludes_all_wrapper_owned_attachment_names() -> None:
+    site = _cloud_site("acme", "ACME")
+    env = build_child_env(site, UpstreamConfig(), Defaults(toolset_preset="curated"))
+    names = set(env["ENABLED_TOOLS"].split(","))
+    assert names.isdisjoint(WRAPPER_OWNED_TOOLS)
+    assert "jira_list_attachments" not in names
+    assert "jira_upload_attachments" not in names
+    assert "jira_download_attachments" not in names
+
+
 def test_enabled_tools_omitted_for_all_preset_with_no_site_override() -> None:
     site = _cloud_site("acme", "ACME")
     env = build_child_env(site, UpstreamConfig(), Defaults(toolset_preset="all"))
@@ -66,6 +82,22 @@ def test_site_level_enabled_tools_override_wins_even_under_all_preset() -> None:
     )
     env = build_child_env(site, UpstreamConfig(), Defaults(toolset_preset="all"))
     assert env["ENABLED_TOOLS"] == "jira_get_issue"
+
+
+def test_enabled_tools_of_only_wrapper_owned_names_forces_the_none_sentinel(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A site whose enabled_tools is entirely WRAPPER_OWNED_TOOLS names (e.g.
+    someone only wants the attachment tools on this site) would otherwise
+    compute an empty ENABLED_TOOLS -- which upstream treats as "no filter",
+    serving the child's FULL 63-tool set. The sentinel must be used instead."""
+    site = _cloud_site(
+        "acme", "ACME", enabled_tools=frozenset({"jira_download_attachments", "jira_list_attachments"})
+    )
+    with caplog.at_level("WARNING"):
+        env = build_child_env(site, UpstreamConfig(), Defaults(toolset_preset="all"))
+    assert env["ENABLED_TOOLS"] == EMPTY_ENABLED_TOOLS_SENTINEL
+    assert any("enabled_tools" in record.message for record in caplog.records)
 
 
 def test_read_only_mode_set_only_when_site_is_read_only() -> None:
@@ -372,6 +404,25 @@ async def test_a_bare_timeouterror_raised_by_the_factory_is_not_relabeled_as_our
         # exception was never near the deadline; it just isn't the thing that
         # message means.
         assert health["acme"]["error"] == "TimeoutError: "
+
+
+def test_redact_also_strips_a_cdn_urls_query_string(tmp_path: Path) -> None:
+    """`redact` is used on the tool-result path (e.g. an attachment
+    transport-error message) where a pre-signed CDN URL's query string can
+    itself be a credential we never configured as a known `Secret` -- so it
+    must be stripped unconditionally, not only known secret values."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME", api_token=Secret("zz-unique-secret-zz"))])
+    manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
+
+    text = (
+        "ConnectError: GET https://media-cdn.example-atlassian-media.net/path?token=SECRET failed "
+        "near token zz-unique-secret-zz"
+    )
+    redacted = manager.redact(text)
+
+    assert "token=SECRET" not in redacted
+    assert "zz-unique-secret-zz" not in redacted
+    assert "***" in redacted
 
 
 async def test_mark_failed_redacts_the_reason_and_records_a_timestamp(tmp_path: Path) -> None:

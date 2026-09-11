@@ -11,7 +11,7 @@ import pytest
 from jira_multi_mcp.cli import main
 from jira_multi_mcp.config import load_config
 from jira_multi_mcp.logging_setup import attach_redaction, configure_logging, resolve_log_dir
-from jira_multi_mcp.secrets import RedactingFilter, RedactingFormatter, Secret, redact_text
+from jira_multi_mcp.secrets import RedactingFilter, RedactingFormatter, Secret, redact_text, scrub_urls
 from jira_multi_mcp.sources import EnvOverlaySource, TomlFileConfigSource
 
 TOKEN = "super-secret-token-value"
@@ -135,6 +135,20 @@ def test_redacting_formatter_scrubs_a_formatted_traceback() -> None:
 
 def test_redact_text_masks_every_known_secret() -> None:
     assert redact_text(f"a={TOKEN} b=other", [Secret(TOKEN)]) == "a=*** b=other"
+
+
+def test_scrub_urls_strips_the_query_string_but_keeps_the_rest_of_the_line() -> None:
+    text = 'HTTP Request: GET https://api.media.atlassian.com/file/binary?token=SUPERSECRET "HTTP/1.1 200 OK"'
+    scrubbed = scrub_urls(text)
+    assert "SUPERSECRET" not in scrubbed
+    assert "https://api.media.atlassian.com/file/binary?***" in scrubbed
+    assert "HTTP/1.1 200 OK" in scrubbed
+
+
+def test_scrub_urls_is_a_no_op_on_a_url_with_no_query_string() -> None:
+    assert scrub_urls("see https://acme.atlassian.net/browse/ACME-1 for details") == (
+        "see https://acme.atlassian.net/browse/ACME-1 for details"
+    )
 
 
 def test_configure_logging_redacts_exception_text_from_stderr_and_file(
@@ -335,3 +349,54 @@ def test_child_logger_record_redacted_via_parents_non_propagating_handler(tmp_pa
     output = stream.getvalue()
     assert TOKEN not in output
     assert "***" in output
+
+
+def test_httpx_and_httpcore_stay_at_warning_even_when_verbose(tmp_path: Path) -> None:
+    """httpx logs each outbound request's full URL at INFO, and httpcore's
+    DEBUG level logs the full wire trace -- for the attachment download's
+    cross-host redirect that's a pre-signed CDN URL carrying a `token=` query
+    parameter. `--verbose` must not raise these two loggers above WARNING
+    even though it does exactly that for everything else, or that token
+    reaches server.log."""
+    config = load_config(sources=[TomlFileConfigSource(_write_config(tmp_path)), EnvOverlaySource({})])
+
+    configure_logging(config, verbose=True)
+
+    assert logging.getLogger("httpx").level == logging.WARNING
+    assert logging.getLogger("httpcore").level == logging.WARNING
+    assert logging.getLogger("jira_multi_mcp").level == logging.DEBUG
+
+
+def test_a_url_with_a_token_query_param_never_reaches_stderr_or_the_log_file_even_under_verbose(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The r2 auditor's exact reproduction: a pre-signed media-CDN URL logged
+    by httpx (or any other redacted logger) at a level `--verbose` doesn't
+    even reach (httpx/httpcore are capped at WARNING now, not raised to INFO
+    like everything else) must still come out scrubbed -- both because the
+    cap holds, and because `RedactingFilter` strips any URL's query string
+    unconditionally as a second, independent layer."""
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    config = load_config(sources=[TomlFileConfigSource(_write_config(tmp_path)), EnvOverlaySource({})])
+    configure_logging(config, verbose=True)
+
+    httpx_logger = logging.getLogger("httpx")
+    httpx_logger.info(
+        'HTTP Request: GET https://api.media.atlassian.com/file/binary?token=SUPERSECRET123 "HTTP/1.1 200 OK"'
+    )
+    # httpx is capped at WARNING, so the INFO call above produces no output
+    # at all -- log the same line at WARNING too, proving the second,
+    # independent layer (RedactingFilter's URL scrubbing) also holds even for
+    # a level verbose users DO see.
+    httpx_logger.warning(
+        'HTTP Request: GET https://api.media.atlassian.com/file/binary?token=SUPERSECRET123 "HTTP/1.1 200 OK"'
+    )
+
+    stderr = capsys.readouterr().err
+    assert "SUPERSECRET123" not in stderr
+    assert "***" in stderr
+
+    log_file = resolve_log_dir() / "server.log"
+    contents = log_file.read_text()
+    assert "SUPERSECRET123" not in contents
+    assert "***" in contents

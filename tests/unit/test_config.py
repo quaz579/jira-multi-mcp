@@ -197,6 +197,18 @@ def test_enabled_tools_accepts_a_wrapper_owned_tool_name(tmp_path: Path) -> None
     assert config.sites[0].enabled_tools == frozenset({"jira_get_issue", "jira_download_attachments"})
 
 
+def test_projects_filter_is_normalized_to_uppercase(tmp_path: Path) -> None:
+    content = MINIMAL_TOML + '\nprojects_filter = ["acme", "AcmeOps"]\n'
+    config = _load(tmp_path, content)
+    assert config.sites[0].projects_filter == ("ACME", "ACMEOPS")
+
+
+def test_projects_filter_rejects_a_numeric_entry(tmp_path: Path) -> None:
+    content = MINIMAL_TOML + '\nprojects_filter = ["ACME", "10001"]\n'
+    with pytest.raises(ConfigError, match="10001"):
+        _load(tmp_path, content)
+
+
 def test_no_sites_configured_is_an_error(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match="no sites configured"):
         _load(tmp_path, '[defaults]\nusername = "x"\n')

@@ -18,6 +18,7 @@ from pydantic import PrivateAttr
 from jira_multi_mcp.children import ChildManager
 from jira_multi_mcp.errors import SchemaConflictError, SiteResolutionError
 from jira_multi_mcp.registry import SiteRegistry, resolve_site
+from jira_multi_mcp.site_policy import enforce_site_policy
 from jira_multi_mcp.tools_meta import WRAPPER_OWNED_TOOLS
 
 _logger = logging.getLogger(__name__)
@@ -123,6 +124,30 @@ class MultiSiteProxyTool(Tool):
             raise ToolError(str(exc)) from exc
 
         site = resolution.site
+        # Belt, scoped to `enabled_tools` only: that's normally enforced for
+        # free by the child process itself (its own ENABLED_TOOLS env var --
+        # see `children.build_child_env`), but calling `enforce_site_policy`
+        # here too means the restriction still holds even if a child
+        # misbehaves -- serves a tool it was never supposed to (the
+        # ENABLED_TOOLS empty-string "no filter" upstream bug this same round
+        # fixed is exactly that kind of misbehavior).
+        #
+        # `is_write=False` here is deliberate, NOT "this tool happens to be
+        # read-only": it means this call can never trip `enforce_site_policy`'s
+        # `read_only` branch. `read_only` enforcement for a mirrored call
+        # stays entirely the child's job (READ_ONLY_MODE) plus the existing
+        # post-hoc hint appended below on a child error -- verified against
+        # the real jumpmind site that every CURATED read tool sets
+        # `readOnlyHint=True` explicitly, but the "all" toolset preset can
+        # mirror uncurated (e.g. agile/board) tools whose annotations aren't
+        # verified, and pre-emptively refusing those here on a read_only site
+        # would be a real, unproven regression risk -- not something this
+        # round's finding (which only asked for an `enabled_tools` belt)
+        # asked for. `issue_key=None` because at this layer we only have the
+        # raw (pre-routing) arguments, not a resolved issue key worth
+        # checking against `projects_filter` -- that check stays
+        # wrapper-tool-only.
+        enforce_site_policy(site, self.name, is_write=False, issue_key=None)
         client = await self._manager.client_for(site.name)
 
         assert self.timeout is not None, f"mirrored tool '{self.name}' was built without a timeout"

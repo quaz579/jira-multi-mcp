@@ -17,6 +17,7 @@ import anyio
 from fastmcp import FastMCP
 
 from jira_multi_mcp import __version__
+from jira_multi_mcp.attachments import AttachmentClientRegistry
 from jira_multi_mcp.children import ChildManager
 from jira_multi_mcp.errors import JiraMultiError
 from jira_multi_mcp.logging_setup import attach_redaction, configure_logging, resolve_log_dir
@@ -24,7 +25,7 @@ from jira_multi_mcp.mirror import build_mirrored_tools
 from jira_multi_mcp.model import AppConfig
 from jira_multi_mcp.registry import SiteRegistry
 from jira_multi_mcp.tools_meta import CURATED_TOOLS
-from jira_multi_mcp.wrapper_tools import build_jira_sites_tool
+from jira_multi_mcp.wrapper_tools import build_attachment_tools, build_jira_sites_tool
 
 _logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
     log_dir = resolve_log_dir()
     registry = SiteRegistry(config.sites)
     manager = ChildManager(registry, config.upstream, config.defaults, log_dir, verbose=verbose)
+    attachment_clients = AttachmentClientRegistry(config.sites, config.defaults, redact=manager.redact)
 
     mcp: FastMCP = FastMCP(_SERVER_NAME, version=__version__)
     state = _ShutdownState()
@@ -125,6 +127,8 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
                         raise
                 else:
                     mcp.add_tool(build_jira_sites_tool(manager))
+                    for attachment_tool in build_attachment_tools(registry, attachment_clients):
+                        mcp.add_tool(attachment_tool)
                     for tool in mirrored:
                         mcp.add_tool(tool)
 
@@ -133,6 +137,11 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
                     await mcp.run_stdio_async(show_banner=False)
                     tg.cancel_scope.cancel()
         finally:
+            # Own httpx clients, no subprocess -- closed first (fast, no
+            # watchdog risk) so the shared shutdown budget below is spent
+            # entirely on the part that can actually hang: tearing down
+            # child processes.
+            await attachment_clients.aclose()
             # Attempted unconditionally (aclose() is idempotent) even if the
             # signal handler already ran it -- but bounded and its own
             # completion tracked, so a hang here is visible in the exit code

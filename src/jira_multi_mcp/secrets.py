@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -11,6 +12,22 @@ _MIN_REDACT_LEN = 4
 # A plain Formatter used only to render exc_info into text ourselves, so we
 # can redact it and store it in record.exc_text before any real handler runs.
 _EXC_FORMATTER = logging.Formatter()
+
+# Matches an http(s) URL's query string. A pre-signed CDN/media URL's query
+# string can itself BE the credential (Jira's attachment CDN redirect target
+# carries `?token=<jwt>` that fetches the file with no further auth), and
+# that URL can reach a log line via a third-party library (httpx logs the
+# outbound request line at INFO) that never goes through `Secret`/known
+# values at all. So this runs unconditionally in `RedactingFilter`,
+# independent of whatever secrets are configured -- stripping the whole
+# query string is the simplest rule that can't miss a new parameter name
+# (`token=`, `sig=`, `X-Amz-Signature=`, ...) a future CDN might use.
+_URL_QUERY_RE = re.compile(r"(https?://[^\s\"'<>]+?)\?[^\s\"'<>]*")
+
+
+def scrub_urls(text: str) -> str:
+    """Strips the query string off every http(s) URL found in ``text``."""
+    return _URL_QUERY_RE.sub(r"\1?***", text)
 
 
 class Secret:
@@ -95,23 +112,29 @@ class RedactingFilter(logging.Filter):
         except Exception:
             self._mark_format_error(record)
         else:
+            redacted = scrub_urls(message)
             if self._values:
-                redacted = _redact_with_values(message, self._values)
-                if redacted != message:
-                    record.msg = redacted
-                    record.args = ()
+                redacted = _redact_with_values(redacted, self._values)
+            if redacted != message:
+                record.msg = redacted
+                record.args = ()
 
-        if not self._values:
-            return True
-
+        # Everything below runs unconditionally (not gated on `self._values`):
+        # URL query-string scrubbing is independent of which secret values are
+        # configured, so even a deployment with zero known secrets still gets
+        # it applied to args/exc_info/stack_info.
         record.args = self._redact_args(record.args)
         if record.exc_info:
-            record.exc_text = _redact_with_values(
-                _EXC_FORMATTER.formatException(record.exc_info), self._values
-            )
+            formatted = _EXC_FORMATTER.formatException(record.exc_info)
+            if self._values:
+                formatted = _redact_with_values(formatted, self._values)
+            record.exc_text = scrub_urls(formatted)
             record.exc_info = None
         if record.stack_info:
-            record.stack_info = _redact_with_values(str(record.stack_info), self._values)
+            stack_text = str(record.stack_info)
+            if self._values:
+                stack_text = _redact_with_values(stack_text, self._values)
+            record.stack_info = scrub_urls(stack_text)
         return True
 
     def _mark_format_error(self, record: logging.LogRecord) -> None:
@@ -134,7 +157,7 @@ class RedactingFilter(logging.Filter):
         record.args = ()
 
     def _redact_args(self, args: Any) -> Any:
-        if not self._values or not args:
+        if not args:
             return args
         if isinstance(args, Mapping):
             return {key: self._redact_one(value) for key, value in args.items()}
@@ -144,12 +167,15 @@ class RedactingFilter(logging.Filter):
 
     def _redact_one(self, value: Any) -> Any:
         if isinstance(value, str):
-            return _redact_with_values(value, self._values)
-        try:
-            text = repr(value)
-        except Exception:
-            return value
-        redacted = _redact_with_values(text, self._values)
+            text = value
+        else:
+            try:
+                text = repr(value)
+            except Exception:
+                return value
+        redacted = scrub_urls(text)
+        if self._values:
+            redacted = _redact_with_values(redacted, self._values)
         return redacted if redacted != text else value
 
 
@@ -167,5 +193,5 @@ class RedactingFormatter(logging.Formatter):
         self._values = _secret_values(secrets)
 
     def format(self, record: logging.LogRecord) -> str:
-        formatted = super().format(record)
+        formatted = scrub_urls(super().format(record))
         return _redact_with_values(formatted, self._values)
