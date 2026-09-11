@@ -41,6 +41,18 @@ ChildState = Literal["starting", "healthy", "failed"]
 # (e.g. an unrelated API token in the parent's own env) leak in by default.
 BASE_ENV_PASSTHROUGH: tuple[str, ...] = ("PATH", "HOME")
 
+# Upstream's ENABLED_TOOLS parsing treats an EMPTY string as "no filter"
+# (`get_enabled_tools()` in servers/main.py returns None for an empty env
+# var, and None means "serve everything"). A site whose configured
+# enabled_tools is made up entirely of WRAPPER_OWNED_TOOLS names (e.g. only
+# "jira_download_attachments") would otherwise compute an empty
+# ENABLED_TOOLS and the child would silently serve its FULL tool set --
+# exactly backwards from what the site was restricted to. This sentinel can
+# never match a real upstream tool name (upstream's should_include_tool does
+# exact membership, never a prefix/glob match), forcing the child to serve
+# zero tools instead of falling back to "no filter".
+EMPTY_ENABLED_TOOLS_SENTINEL = "__jira_multi_mcp_none__"
+
 
 def minimal_env(env_passthrough: Sequence[str]) -> dict[str, str]:
     """``BASE_ENV_PASSTHROUGH`` plus any explicitly configured passthrough
@@ -79,7 +91,18 @@ def build_child_env(
     if effective_allowlist is not None:
         # WRAPPER_OWNED_TOOLS are served by the wrapper itself (jira_download_attachments,
         # M3); the child must never advertise or run its own version of them.
-        env["ENABLED_TOOLS"] = ",".join(sorted(effective_allowlist - WRAPPER_OWNED_TOOLS))
+        names = sorted(effective_allowlist - WRAPPER_OWNED_TOOLS)
+        if names:
+            env["ENABLED_TOOLS"] = ",".join(names)
+        else:
+            env["ENABLED_TOOLS"] = EMPTY_ENABLED_TOOLS_SENTINEL
+            _logger.warning(
+                "site '%s': enabled_tools contains only wrapper-owned tool names; forcing "
+                "ENABLED_TOOLS=%r so the child serves none, instead of upstream's "
+                "empty-string 'no filter' fallback",
+                site.name,
+                EMPTY_ENABLED_TOOLS_SENTINEL,
+            )
 
     if site.read_only:
         env["READ_ONLY_MODE"] = "true"

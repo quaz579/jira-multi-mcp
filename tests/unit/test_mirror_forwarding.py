@@ -190,6 +190,50 @@ async def test_cross_site_arguments_raise_an_error(rig: _Rig) -> None:
     assert "beta" in _text(result)
 
 
+async def test_enabled_tools_restriction_is_enforced_by_the_wrapper_even_if_the_child_serves_the_tool(
+    tmp_path: Path,
+) -> None:
+    """Belt: if a child ever serves a tool outside its own configured
+    ENABLED_TOOLS (e.g. the upstream empty-string 'no filter' bug this same
+    round fixed, or any future child misbehavior), the wrapper itself must
+    still refuse a call the site's `enabled_tools` doesn't cover. The fake
+    child here doesn't simulate ENABLED_TOOLS filtering at all -- standing in
+    for exactly that misbehavior -- so this proves the refusal comes from
+    the wrapper's own `enforce_site_policy` call, not from the child."""
+    registry = SiteRegistry(
+        [
+            SiteConfig(
+                name="acme",
+                url="https://acme.atlassian.net",
+                key_prefixes=("ACME",),
+                username="bgrossman@jumpmind.com",
+                api_token=Secret("token"),
+                enabled_tools=frozenset({"jira_get_issue"}),
+            )
+        ]
+    )
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(),
+        tmp_path,
+        transport_factory=lambda site, up: FastMCPTransport(make_fake_child(site.name)),
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        tools = await manager.discover_tools()
+        mirrored = build_mirrored_tools(tools, manager, registry, _ALLOWLIST, timeout=_TIMEOUT)
+        parent = FastMCP("test-parent")
+        for tool in mirrored:
+            parent.add_tool(tool)
+        async with Client(FastMCPTransport(parent)) as client:
+            result = await client.call_tool_mcp("jira_boom", {"site": "acme"})
+
+    assert result.is_error is True
+    text = _text(result)
+    assert "enabled_tools" in text
+
+
 async def test_child_is_error_gets_a_site_prefix(rig: _Rig) -> None:
     client, _, _ = rig
     result = await client.call_tool_mcp("jira_boom", {"site": "acme"})

@@ -17,7 +17,13 @@ import pytest
 from fastmcp.client.transports import ClientTransport, FastMCPTransport, StdioTransport
 from fastmcp.exceptions import ToolError
 
-from jira_multi_mcp.children import BASE_ENV_PASSTHROUGH, ChildManager, build_child_env, minimal_env
+from jira_multi_mcp.children import (
+    BASE_ENV_PASSTHROUGH,
+    EMPTY_ENABLED_TOOLS_SENTINEL,
+    ChildManager,
+    build_child_env,
+    minimal_env,
+)
 from jira_multi_mcp.model import Defaults, SiteConfig, UpstreamConfig
 from jira_multi_mcp.registry import SiteRegistry
 from jira_multi_mcp.secrets import Secret
@@ -76,6 +82,22 @@ def test_site_level_enabled_tools_override_wins_even_under_all_preset() -> None:
     )
     env = build_child_env(site, UpstreamConfig(), Defaults(toolset_preset="all"))
     assert env["ENABLED_TOOLS"] == "jira_get_issue"
+
+
+def test_enabled_tools_of_only_wrapper_owned_names_forces_the_none_sentinel(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A site whose enabled_tools is entirely WRAPPER_OWNED_TOOLS names (e.g.
+    someone only wants the attachment tools on this site) would otherwise
+    compute an empty ENABLED_TOOLS -- which upstream treats as "no filter",
+    serving the child's FULL 63-tool set. The sentinel must be used instead."""
+    site = _cloud_site(
+        "acme", "ACME", enabled_tools=frozenset({"jira_download_attachments", "jira_list_attachments"})
+    )
+    with caplog.at_level("WARNING"):
+        env = build_child_env(site, UpstreamConfig(), Defaults(toolset_preset="all"))
+    assert env["ENABLED_TOOLS"] == EMPTY_ENABLED_TOOLS_SENTINEL
+    assert any("enabled_tools" in record.message for record in caplog.records)
 
 
 def test_read_only_mode_set_only_when_site_is_read_only() -> None:
