@@ -9,6 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import mcp_types
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.base import Tool
 
@@ -16,6 +17,7 @@ from jira_multi_mcp.attachments import AttachmentClientRegistry
 from jira_multi_mcp.children import ChildManager
 from jira_multi_mcp.errors import SiteResolutionError
 from jira_multi_mcp.registry import SiteRegistry, SiteResolution, resolve_site
+from jira_multi_mcp.site_policy import enforce_site_policy
 
 
 def _resolve_or_raise(
@@ -61,6 +63,7 @@ def build_attachment_tools(
 
     async def jira_list_attachments(issue_key: str, site: str | None = None) -> dict[str, Any]:
         resolution = _resolve_or_raise(registry, issue_key, site, "jira_list_attachments")
+        enforce_site_policy(resolution.site, "jira_list_attachments", is_write=False, issue_key=issue_key)
         client = attachment_clients.get(resolution.site.name)
         attachments = await client.list_attachments(issue_key)
         return {
@@ -88,6 +91,7 @@ def build_attachment_tools(
         overwrite: bool = False,
     ) -> dict[str, Any]:
         resolution = _resolve_or_raise(registry, issue_key, site, "jira_download_attachments")
+        enforce_site_policy(resolution.site, "jira_download_attachments", is_write=False, issue_key=issue_key)
         client = attachment_clients.get(resolution.site.name)
         downloaded, entries = await client.download(
             issue_key,
@@ -104,6 +108,7 @@ def build_attachment_tools(
                 {
                     "attachment_id": d.attachment_id,
                     "filename": d.filename,
+                    "original_filename": d.original_filename,
                     "path": d.path,
                     "size": d.size,
                     "mime_type": d.mime_type,
@@ -124,6 +129,7 @@ def build_attachment_tools(
         issue_key: str, paths: list[str], site: str | None = None
     ) -> dict[str, Any]:
         resolution = _resolve_or_raise(registry, issue_key, site, "jira_upload_attachments")
+        enforce_site_policy(resolution.site, "jira_upload_attachments", is_write=True, issue_key=issue_key)
         resolved_paths = []
         for raw_path in paths:
             candidate = Path(raw_path).expanduser()
@@ -145,7 +151,15 @@ def build_attachment_tools(
         }
 
     return [
-        Tool.from_function(jira_list_attachments, name="jira_list_attachments"),
+        Tool.from_function(
+            jira_list_attachments,
+            name="jira_list_attachments",
+            description=(
+                "Lists an issue's attachments: id, filename, size, mime_type, created, author. "
+                "Read-only; does not fetch content -- use jira_download_attachments for that."
+            ),
+            annotations=mcp_types.ToolAnnotations(read_only_hint=True),
+        ),
         Tool.from_function(
             jira_download_attachments,
             name="jira_download_attachments",
@@ -153,8 +167,21 @@ def build_attachment_tools(
                 "Downloads one or more of an issue's attachments to disk under target_dir. "
                 "Writes files to disk and returns their paths; then use your file-reading tool "
                 "on the path. Prefer this over any base64 tool. Omit filenames/attachment_ids "
-                "to download every attachment. Jira Cloud sites only."
+                "to download every attachment. Jira Cloud sites only. Use an absolute target_dir "
+                "-- a relative one resolves against the server process's own working directory, "
+                "not yours (the resolved path is echoed back in the result either way)."
             ),
+            annotations=mcp_types.ToolAnnotations(read_only_hint=True),
         ),
-        Tool.from_function(jira_upload_attachments, name="jira_upload_attachments"),
+        Tool.from_function(
+            jira_upload_attachments,
+            name="jira_upload_attachments",
+            description=(
+                "Uploads one or more local files as new attachments on an issue. Each path must "
+                "already exist as a regular file; use absolute paths -- a relative one resolves "
+                "against the server process's own working directory, not yours. Write operation: "
+                "refused with a clear error on a site configured read_only = true."
+            ),
+            annotations=mcp_types.ToolAnnotations(read_only_hint=False),
+        ),
     ]

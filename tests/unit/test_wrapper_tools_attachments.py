@@ -20,23 +20,37 @@ from jira_multi_mcp.secrets import Secret
 from jira_multi_mcp.wrapper_tools import build_attachment_tools
 
 
-def _site(name: str, *prefixes: str) -> SiteConfig:
+def _site(
+    name: str,
+    *prefixes: str,
+    read_only: bool = False,
+    enabled_tools: frozenset[str] | None = None,
+    projects_filter: tuple[str, ...] | None = None,
+) -> SiteConfig:
     return SiteConfig(
         name=name,
         url=f"https://{name}.atlassian.net",
         key_prefixes=prefixes,
         username="bgrossman@jumpmind.com",
         api_token=Secret(f"{name}-token"),
+        read_only=read_only,
+        enabled_tools=enabled_tools,
+        projects_filter=projects_filter,
     )
 
 
-@pytest.fixture
-async def client() -> AsyncGenerator[Client[FastMCPTransport], None]:
-    registry = SiteRegistry([_site("acme", "ACME"), _site("beta", "BETA")])
+def _server_for(*sites: SiteConfig) -> tuple[SiteRegistry, FastMCP]:
+    registry = SiteRegistry(sites)
     attachment_clients = AttachmentClientRegistry(registry.sites, Defaults(), redact=lambda t: t)
     parent = FastMCP("test-parent")
     for tool in build_attachment_tools(registry, attachment_clients):
         parent.add_tool(tool)
+    return registry, parent
+
+
+@pytest.fixture
+async def client() -> AsyncGenerator[Client[FastMCPTransport], None]:
+    _registry, parent = _server_for(_site("acme", "ACME"), _site("beta", "BETA"))
     async with Client(FastMCPTransport(parent)) as c:
         yield c
 
@@ -139,3 +153,70 @@ async def test_jira_download_attachments_writes_to_disk_and_returns_paths(
     assert payload["downloaded"][0]["filename"] == "screenshot.png"
     written_path = Path(payload["downloaded"][0]["path"])
     assert written_path.read_bytes() == b"\x89PN"
+
+
+async def test_upload_refused_on_read_only_site_with_no_http_request_made(tmp_path: Path) -> None:
+    _registry, parent = _server_for(_site("acme", "ACME", read_only=True))
+    upload_path = tmp_path / "file.txt"
+    upload_path.write_text("hello")
+
+    with respx.mock:
+        route = respx.post("https://acme.atlassian.net/rest/api/3/issue/ACME-1/attachments")
+        c: Client[FastMCPTransport]
+        async with Client(FastMCPTransport(parent)) as c:
+            result = await c.call_tool_mcp(
+                "jira_upload_attachments", {"issue_key": "ACME-1", "paths": [str(upload_path)]}
+            )
+
+        assert result.is_error is True
+        text = result.content[0].text  # type: ignore[union-attr]
+        assert "read_only" in text
+        assert not route.called
+
+
+async def test_list_and_download_still_work_on_a_read_only_site(tmp_path: Path) -> None:
+    _registry, parent = _server_for(_site("acme", "ACME", read_only=True))
+
+    with respx.mock:
+        respx.get("https://acme.atlassian.net/rest/api/3/issue/ACME-1", params={"fields": "attachment"}).mock(
+            return_value=httpx.Response(200, json={"fields": {"attachment": []}})
+        )
+        async with Client(FastMCPTransport(parent)) as c:
+            list_result = await c.call_tool_mcp("jira_list_attachments", {"issue_key": "ACME-1"})
+            download_result = await c.call_tool_mcp(
+                "jira_download_attachments", {"issue_key": "ACME-1", "target_dir": str(tmp_path)}
+            )
+
+        assert list_result.is_error is False
+        assert download_result.is_error is False
+
+
+async def test_upload_refused_when_enabled_tools_excludes_it(tmp_path: Path) -> None:
+    _registry, parent = _server_for(_site("acme", "ACME", enabled_tools=frozenset({"jira_list_attachments"})))
+    upload_path = tmp_path / "file.txt"
+    upload_path.write_text("hello")
+
+    with respx.mock:
+        route = respx.post("https://acme.atlassian.net/rest/api/3/issue/ACME-1/attachments")
+        c: Client[FastMCPTransport]
+        async with Client(FastMCPTransport(parent)) as c:
+            result = await c.call_tool_mcp(
+                "jira_upload_attachments", {"issue_key": "ACME-1", "paths": [str(upload_path)]}
+            )
+
+        assert result.is_error is True
+        text = result.content[0].text  # type: ignore[union-attr]
+        assert "enabled_tools" in text
+        assert not route.called
+
+
+async def test_projects_filter_mismatch_is_a_tool_error() -> None:
+    _registry, parent = _server_for(_site("acme", "ACME", "ZZZ", projects_filter=("ZZZ",)))
+
+    c: Client[FastMCPTransport]
+    async with Client(FastMCPTransport(parent)) as c:
+        result = await c.call_tool_mcp("jira_list_attachments", {"issue_key": "ACME-1"})
+
+    assert result.is_error is True
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert "projects_filter" in text
