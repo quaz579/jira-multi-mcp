@@ -17,13 +17,13 @@ import httpx
 
 from jira_multi_mcp import __version__
 from jira_multi_mcp.children import minimal_env
-from jira_multi_mcp.config import load_config
+from jira_multi_mcp.config import default_sources, load_config
 from jira_multi_mcp.errors import JiraMultiError
 from jira_multi_mcp.logging_setup import LOGGER_NAME, collect_secrets, configure_logging
 from jira_multi_mcp.model import AppConfig, SiteConfig
 from jira_multi_mcp.secrets import redact_text
 from jira_multi_mcp.server import SHUTDOWN_WATCHDOG_SECONDS, serve
-from jira_multi_mcp.sources import ConfigSource, EnvOverlaySource, TomlFileConfigSource
+from jira_multi_mcp.sources import ConfigSource, EnvOverlaySource
 
 _CLOUD_MYSELF_PATH = "/rest/api/3/myself"
 _SERVER_MYSELF_PATH = "/rest/api/2/myself"
@@ -72,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
 def _sources_for(config_path: Path | None) -> list[ConfigSource] | None:
     if config_path is None:
         return None
-    return [TomlFileConfigSource(config_path), EnvOverlaySource()]
+    return default_sources(config_path)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -214,6 +214,7 @@ def _render_config(config: AppConfig) -> str:
     for site in config.sites:
         lines.append("")
         lines.append(f"[[sites]]  # {site.name}")
+        lines.append(f"  source = {site.source!r}")
         lines.append(f"  url = {site.url!r}")
         lines.append(f"  key_prefixes = {list(site.key_prefixes)!r}")
         lines.append(f"  read_only = {site.read_only}")
@@ -394,21 +395,22 @@ def _render_check_table(results: Sequence[_CheckResult]) -> str:
         auth_mode = "bearer" if site.personal_token is not None else "basic"
         prefixes = ", ".join(site.key_prefixes)
         status = f"OK {result.display_name} ({result.account_id})" if result.ok else f"FAILED {result.detail}"
-        rows.append((site.name, host, auth_mode, status, prefixes))
+        rows.append((site.name, host, auth_mode, status, site.source, prefixes))
 
     site_width = max(4, *(len(r[0]) for r in rows))
     host_width = max(4, *(len(r[1]) for r in rows))
     auth_width = max(4, *(len(r[2]) for r in rows))
     status_width = max(6, *(len(r[3]) for r in rows))
+    source_width = max(6, *(len(r[4]) for r in rows))
 
     header = (
         f"{'SITE':<{site_width}} {'HOST':<{host_width}} {'AUTH':<{auth_width}} "
-        f"{'STATUS':<{status_width}} {'PREFIXES'}"
+        f"{'STATUS':<{status_width}} {'SOURCE':<{source_width}} {'PREFIXES'}"
     )
     lines = [header, "-" * len(header)]
-    for name, host, auth_mode, status, prefixes in rows:
+    for name, host, auth_mode, status, source, prefixes in rows:
         lines.append(
             f"{name:<{site_width}} {host:<{host_width}} {auth_mode:<{auth_width}} "
-            f"{status:<{status_width}} {prefixes}"
+            f"{status:<{status_width}} {source:<{source_width}} {prefixes}"
         )
     return "\n".join(lines) + "\n"

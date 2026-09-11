@@ -46,7 +46,10 @@ class SiteConfig:
     ``api_token``/``personal_token`` hold the resolved secret value (from the
     file or from the environment variable named by the matching ``*_env``
     field); the ``*_env`` field is kept only so ``--print-config`` can show
-    where the value came from without showing the value itself.
+    where the value came from without showing the value itself. ``source`` is
+    the config file (or drop-in file, or ``"env"``) that defined this site --
+    shown by ``--print-config``/``--check``/``jira_sites`` for provenance,
+    never used for anything semantic.
     """
 
     name: str
@@ -60,6 +63,7 @@ class SiteConfig:
     read_only: bool = False
     enabled_tools: frozenset[str] | None = None
     projects_filter: tuple[str, ...] | None = None
+    source: str = "unknown"
 
     @property
     def auth_mode(self) -> str:

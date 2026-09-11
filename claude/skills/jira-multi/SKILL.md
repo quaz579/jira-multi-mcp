@@ -23,6 +23,15 @@ nothing and tells you:
 - `read_only` per site — a write call (add comment, create issue, upload
   attachment) against a `read_only` site will be refused; don't attempt one
   without checking this first, and don't treat the refusal as a bug.
+- `source` per site — which file actually defined it (`config.toml`, a
+  `sites.d/` drop-in file another tool added, or `"env"`). Useful when a
+  site's behavior is surprising and you need to know where its config comes
+  from.
+
+Sites can also arrive from a `sites.d/` drop-in directory (another tool
+adding a site without editing the user's `config.toml`) in addition to
+`config.toml` itself — you don't need to do anything differently, just be
+aware `source` may point at either.
 
 ## Omit `site` whenever an issue key is in your arguments
 

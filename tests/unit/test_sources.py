@@ -8,7 +8,13 @@ from pathlib import Path
 import pytest
 
 from jira_multi_mcp.errors import ConfigError
-from jira_multi_mcp.sources import EnvOverlaySource, RawConfig, TomlFileConfigSource, merge_sources
+from jira_multi_mcp.sources import (
+    DropInSitesSource,
+    EnvOverlaySource,
+    RawConfig,
+    TomlFileConfigSource,
+    merge_sources,
+)
 
 
 def test_toml_file_source_keys_sites_by_name(tmp_path: Path) -> None:
@@ -133,3 +139,97 @@ def test_merge_sources_can_add_a_new_site_without_touching_others() -> None:
     }
     merged = merge_sources(first, second)
     assert set(merged["sites"]) == {"acme", "beta"}
+
+
+def test_toml_file_source_records_provenance(tmp_path: Path) -> None:
+    path = tmp_path / "config.toml"
+    path.write_text('[[sites]]\nname = "acme"\nurl = "https://acme.atlassian.net"\n')
+    raw = TomlFileConfigSource(path).load()
+    assert raw["sources"] == {"acme": str(path)}
+
+
+def test_merge_sources_merges_provenance_last_wins() -> None:
+    first: RawConfig = {"defaults": {}, "upstream": {}, "sites": {}, "sources": {"acme": "first"}}
+    second: RawConfig = {"defaults": {}, "upstream": {}, "sites": {}, "sources": {"acme": "second"}}
+    merged = merge_sources(first, second)
+    assert merged["sources"] == {"acme": "second"}
+
+
+# --- DropInSitesSource ---------------------------------------------------
+
+
+def test_drop_in_source_missing_directory_is_empty(tmp_path: Path) -> None:
+    raw = DropInSitesSource(tmp_path / "does-not-exist").load()
+    assert raw["sites"] == {}
+    assert raw["sources"] == {}
+
+
+def test_drop_in_source_ignores_non_toml_files(tmp_path: Path) -> None:
+    (tmp_path / "notes.txt").write_text("not toml")
+    raw = DropInSitesSource(tmp_path).load()
+    assert raw["sites"] == {}
+
+
+def test_drop_in_source_loads_sites_in_lexical_order_last_wins_per_key(tmp_path: Path) -> None:
+    (tmp_path / "01-acme.toml").write_text(
+        '[[sites]]\nname = "acme"\nurl = "https://acme.atlassian.net"\nkey_prefixes = ["ACME"]\n'
+    )
+    (tmp_path / "02-acme-override.toml").write_text('[[sites]]\nname = "acme"\nread_only = true\n')
+    raw = DropInSitesSource(tmp_path).load()
+    assert raw["sites"]["acme"]["url"] == "https://acme.atlassian.net"
+    assert raw["sites"]["acme"]["key_prefixes"] == ["ACME"]
+    assert raw["sites"]["acme"]["read_only"] is True
+    assert raw["sources"]["acme"] == str(tmp_path / "02-acme-override.toml")
+
+
+def test_drop_in_source_rejects_non_sites_top_level_table(tmp_path: Path) -> None:
+    path = tmp_path / "bad.toml"
+    path.write_text('[defaults]\nusername = "you@example.com"\n')
+    with pytest.raises(ConfigError, match="defaults") as exc_info:
+        DropInSitesSource(tmp_path).load()
+    assert str(path) in str(exc_info.value)
+
+
+def test_drop_in_source_rejects_literal_api_token(tmp_path: Path) -> None:
+    path = tmp_path / "bad.toml"
+    path.write_text(
+        '[[sites]]\nname = "acme"\nurl = "https://acme.atlassian.net"\napi_token = "leaked-token"\n'
+    )
+    with pytest.raises(ConfigError, match="api_token") as exc_info:
+        DropInSitesSource(tmp_path).load()
+    assert str(path) in str(exc_info.value)
+
+
+def test_drop_in_source_rejects_literal_personal_token(tmp_path: Path) -> None:
+    path = tmp_path / "bad.toml"
+    path.write_text('[[sites]]\nname = "acme"\npersonal_token = "leaked-token"\n')
+    with pytest.raises(ConfigError, match="personal_token"):
+        DropInSitesSource(tmp_path).load()
+
+
+def test_drop_in_source_accepts_the_env_form_of_token_fields(tmp_path: Path) -> None:
+    path = tmp_path / "ok.toml"
+    path.write_text(
+        '[[sites]]\nname = "acme"\nurl = "https://acme.atlassian.net"\n'
+        'key_prefixes = ["ACME"]\napi_token_env = "ACME_TOKEN"\n'
+    )
+    raw = DropInSitesSource(tmp_path).load()
+    assert raw["sites"]["acme"]["api_token_env"] == "ACME_TOKEN"
+
+
+def test_drop_in_source_rejects_duplicate_name_within_one_file(tmp_path: Path) -> None:
+    path = tmp_path / "dupe.toml"
+    path.write_text(
+        '[[sites]]\nname = "acme"\nurl = "https://acme.atlassian.net"\n\n'
+        '[[sites]]\nname = "acme"\nurl = "https://acme2.atlassian.net"\n'
+    )
+    with pytest.raises(ConfigError, match="duplicate"):
+        DropInSitesSource(tmp_path).load()
+
+
+def test_drop_in_source_rejects_sites_table_instead_of_array(tmp_path: Path) -> None:
+    path = tmp_path / "bad.toml"
+    path.write_text('[sites]\nacme = "oops"\n')
+    with pytest.raises(ConfigError, match="array") as exc_info:
+        DropInSitesSource(tmp_path).load()
+    assert str(path) in str(exc_info.value)

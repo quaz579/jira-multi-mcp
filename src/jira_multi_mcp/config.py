@@ -15,6 +15,7 @@ from jira_multi_mcp.model import AppConfig, Defaults, SiteConfig, UpstreamConfig
 from jira_multi_mcp.secrets import Secret
 from jira_multi_mcp.sources import (
     ConfigSource,
+    DropInSitesSource,
     EnvOverlaySource,
     RawConfig,
     TomlFileConfigSource,
@@ -36,6 +37,9 @@ _TOOLSET_PRESETS = ("curated", "all")
 _CURATED_ALLOWLIST = CURATED_TOOLS | WRAPPER_OWNED_TOOLS
 
 
+_SITES_DIR_ENV = "JIRA_MULTI_SITES_DIR"
+
+
 def resolve_config_path() -> Path:
     """Where ``load_config`` reads from when no explicit sources are given."""
     env_path = os.environ.get("JIRA_MULTI_CONFIG")
@@ -46,13 +50,41 @@ def resolve_config_path() -> Path:
     return base / "jira-multi-mcp" / "config.toml"
 
 
+def resolve_sites_dir(config_path: Path) -> Path:
+    """Where the ``sites.d`` drop-in directory lives for a given config file.
+
+    Overridable via ``JIRA_MULTI_SITES_DIR`` so an integration (e.g. a
+    dashboard) can point it somewhere other than next to ``config.toml``.
+    """
+    env_dir = os.environ.get(_SITES_DIR_ENV)
+    if env_dir:
+        return Path(env_dir).expanduser()
+    return config_path.parent / "sites.d"
+
+
+def default_sources(config_path: Path) -> list[ConfigSource]:
+    """The real, non-test source list for a given config file path.
+
+    Centralized so both entry points that build sources from just a path --
+    ``load_config(sources=None)`` and the CLI's ``--config PATH`` -- agree on
+    what's loaded. Drop-in files are listed FIRST so ``config.toml`` overrides
+    them per field, per site name.
+    """
+    return [
+        DropInSitesSource(resolve_sites_dir(config_path)),
+        TomlFileConfigSource(config_path),
+        EnvOverlaySource(),
+    ]
+
+
 def load_config(sources: Sequence[ConfigSource] | None = None) -> AppConfig:
     if sources is None:
-        sources = [TomlFileConfigSource(resolve_config_path()), EnvOverlaySource()]
+        sources = default_sources(resolve_config_path())
     loaded = [(source, source.load()) for source in sources]
 
-    # Merge the non-overlay sources (e.g. the TOML file) first, so we know
-    # which site names existed before any env overlay touches them.
+    # Merge the non-overlay sources (e.g. the drop-in dir + the TOML file)
+    # first, so we know which site names existed before any env overlay
+    # touches them.
     base = merge_sources(*(raw for source, raw in loaded if not isinstance(source, EnvOverlaySource)))
     known_site_names = set(base["sites"])
 
@@ -84,6 +116,7 @@ def _drop_incomplete_env_only_sites(raw: RawConfig, known_site_names: set[str]) 
             site_name.upper(),
         )
         del raw["sites"][site_name]
+        raw.get("sources", {}).pop(site_name, None)
 
 
 def _build_app_config(raw: RawConfig) -> AppConfig:
@@ -93,11 +126,12 @@ def _build_app_config(raw: RawConfig) -> AppConfig:
 
     defaults = _parse_defaults(raw["defaults"])
     upstream = _parse_upstream(raw["upstream"])
+    provenance = raw.get("sources", {})
 
     sites: list[SiteConfig] = []
     prefix_owners: dict[str, str] = {}
     for name, fields in sites_raw.items():
-        site = _parse_site(name, fields, defaults)
+        site = _parse_site(name, fields, defaults, source=provenance.get(name, "env"))
         for prefix in site.key_prefixes:
             owner = prefix_owners.get(prefix)
             if owner is not None and owner != site.name:
@@ -201,7 +235,7 @@ def _split_token_fields(
     return None, env_name
 
 
-def _parse_site(name: str, fields: dict[str, Any], defaults: Defaults) -> SiteConfig:
+def _parse_site(name: str, fields: dict[str, Any], defaults: Defaults, *, source: str = "env") -> SiteConfig:
     if not _SITE_NAME_RE.match(name):
         raise ConfigError(f"site name '{name}' is invalid; names must match {_SITE_NAME_RE.pattern}")
 
@@ -264,6 +298,7 @@ def _parse_site(name: str, fields: dict[str, Any], defaults: Defaults) -> SiteCo
         read_only=read_only,
         enabled_tools=enabled_tools,
         projects_filter=projects_filter,
+        source=source,
     )
 
 
