@@ -48,7 +48,7 @@ def test_warm_inserts_refresh_right_after_uvx(tmp_path: Path, monkeypatch: pytes
     config_path.write_text(
         """
         [defaults]
-        username = "bgrossman@jumpmind.com"
+        username = "you@example.com"
         api_token = "token"
 
         [[sites]]

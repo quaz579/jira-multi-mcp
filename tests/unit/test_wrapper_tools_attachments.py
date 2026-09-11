@@ -31,7 +31,7 @@ def _site(
         name=name,
         url=f"https://{name}.atlassian.net",
         key_prefixes=prefixes,
-        username="bgrossman@jumpmind.com",
+        username="you@example.com",
         api_token=Secret(f"{name}-token"),
         read_only=read_only,
         enabled_tools=enabled_tools,

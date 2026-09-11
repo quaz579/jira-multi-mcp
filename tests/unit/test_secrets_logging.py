@@ -67,7 +67,7 @@ def _write_config(tmp_path: Path) -> Path:
     path.write_text(
         f"""
         [defaults]
-        username = "bgrossman@jumpmind.com"
+        username = "you@example.com"
         api_token = "{TOKEN}"
 
         [[sites]]
@@ -98,7 +98,7 @@ def test_print_config_shows_the_env_var_name_for_an_env_sourced_token(
     path.write_text(
         """
         [defaults]
-        username = "bgrossman@jumpmind.com"
+        username = "you@example.com"
 
         [[sites]]
         name = "acme"
@@ -224,7 +224,7 @@ def test_print_config_labels_a_literal_token_from_the_env_overlay(
         key_prefixes = ["ACME"]
         """
     )
-    monkeypatch.setenv("JIRA_MULTI_SITE_ACME_USERNAME", "bgrossman@jumpmind.com")
+    monkeypatch.setenv("JIRA_MULTI_SITE_ACME_USERNAME", "you@example.com")
     monkeypatch.setenv("JIRA_MULTI_SITE_ACME_API_TOKEN", TOKEN)
 
     exit_code = main(["--print-config", "--config", str(path)])

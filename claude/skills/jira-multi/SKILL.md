@@ -1,6 +1,6 @@
 ---
 name: jira-multi
-description: Look up, search, or update Jira issues across several Jira Cloud sites through the jira-multi-mcp server, and download or upload attachments straight to disk. Use for requests like "look at JUMP-2274", "get JMC-13447", "what's the status of VJAP-979", "download the screenshots on JMC-13447", "attach this file to JUMP-2274", or "add a comment to JMC-13447" — anything naming a Jira issue key or asking to search/browse Jira.
+description: Look up, search, or update Jira issues across several Jira Cloud sites through the jira-multi-mcp server, and download or upload attachments straight to disk. Use for requests like "look at BETA-2274", "get ACME-13447", "what's the status of GAM-979", "download the screenshots on ACME-13447", "attach this file to BETA-2274", or "add a comment to ACME-13447" — anything naming a Jira issue key or asking to search/browse Jira.
 ---
 
 # jira-multi-mcp
@@ -14,8 +14,8 @@ you mean.
 Before the first Jira tool call in a session, call `jira_sites()`. It costs
 nothing and tells you:
 
-- Which sites are configured and their `key_prefixes` (e.g. `jumpmind: JMC,
-  JMCH, JMI | dtlr: JUMP | valiram: VJAP`) — this is how you know which
+- Which sites are configured and their `key_prefixes` (e.g. `acme: ACME,
+  ACMEH, ACMI | beta: BETA | gamma: GAM`) — this is how you know which
   prefix maps to which site without guessing.
 - Which sites are actually `healthy` right now vs `failed` — if a site you
   need is `failed`, say so rather than retrying silently; point at its
@@ -29,7 +29,7 @@ nothing and tells you:
 Every mirrored tool and the three attachment tools accept an optional `site`
 parameter, but it's inferred automatically from any issue key in the call
 (`issue_key`, `epic_key`, `parent`, and similar arguments) — just pass
-`JUMP-2274` or `JMC-13447` and let it route. Only pass `site` explicitly when
+`BETA-2274` or `ACME-13447` and let it route. Only pass `site` explicitly when
 you already know it or the call has no issue key to infer from.
 
 **Always pass `site` explicitly for `jira_search` or any other JQL-only
@@ -40,7 +40,7 @@ work around this by embedding a key in the JQL, just pass `site`.
 
 ## Attachments: download to disk, then `Read` the path
 
-For "download the screenshots on JMC-13447" or similar: call
+For "download the screenshots on ACME-13447" or similar: call
 `jira_download_attachments(issue_key=..., target_dir=...)`, using an
 **absolute** `target_dir` (a relative one resolves against the server
 process's own working directory, not yours). Then use your normal file-read
@@ -52,7 +52,7 @@ should pass the PNG filenames rather than also pulling a 15 MB log file
 attached to the same issue. Check the result's `skipped`/`failed` lists — a
 filename collision or an over-size file lands there, not in `downloaded`.
 
-For "attach this file to JUMP-2274": call `jira_upload_attachments(issue_key=...,
+For "attach this file to BETA-2274": call `jira_upload_attachments(issue_key=...,
 paths=[...])` with absolute local paths.
 
 ## Reading errors

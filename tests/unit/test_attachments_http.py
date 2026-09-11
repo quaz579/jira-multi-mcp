@@ -25,7 +25,7 @@ def _cloud_site(name: str = "acme", *, token: str = _SECRET_TOKEN) -> SiteConfig
         name=name,
         url=f"https://{name}.atlassian.net",
         key_prefixes=("ACME",),
-        username="bgrossman@jumpmind.com",
+        username="you@example.com",
         api_token=Secret(token),
     )
 
@@ -49,7 +49,7 @@ def _client(
 
 @pytest.fixture
 async def http_client() -> AsyncGenerator[httpx.AsyncClient, None]:
-    async with httpx.AsyncClient(auth=httpx.BasicAuth("bgrossman@jumpmind.com", _SECRET_TOKEN)) as client:
+    async with httpx.AsyncClient(auth=httpx.BasicAuth("you@example.com", _SECRET_TOKEN)) as client:
         yield client
 
 

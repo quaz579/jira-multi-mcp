@@ -17,7 +17,7 @@ def _site(name: str, *prefixes: str) -> SiteConfig:
         name=name,
         url=f"https://{name}.atlassian.net",
         key_prefixes=prefixes,
-        username="bgrossman@jumpmind.com",
+        username="you@example.com",
         api_token=Secret("token"),
     )
 
