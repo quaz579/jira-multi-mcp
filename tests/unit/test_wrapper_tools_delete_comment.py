@@ -197,7 +197,8 @@ async def test_delete_comment_refused_by_projects_filter_mismatch() -> None:
 
 
 @pytest.mark.parametrize(
-    "bad_comment_id", ["12/34", "abc", "", "12?x=1", "12 34", "-1", "1.5", "113395\n", "9" * 5001 + "x"]
+    "bad_comment_id",
+    ["12/34", "abc", "", "12?x=1", "12 34", "-1", "1.5", "113395\n", "9" * 5001 + "x", "9" * 33],
 )
 async def test_delete_comment_rejects_invalid_comment_id_before_any_http_call(
     client: Client[FastMCPTransport], bad_comment_id: str

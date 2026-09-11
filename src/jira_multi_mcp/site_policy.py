@@ -71,7 +71,7 @@ def enforce_site_policy(site: SiteConfig, tool_name: str, *, is_write: bool, iss
         # above, so this comparison is already case-insensitive.
         if project not in site.projects_filter:
             raise ToolError(
-                f"[site={site.name}] {tool_name}: project '{shorten_for_error(project)}' (from issue "
+                f"[site={site.name}] {tool_name}: project {shorten_for_error(project)} (from issue "
                 f"{shorten_for_error(issue_key)}) is not in this site's projects_filter "
                 f"({', '.join(site.projects_filter)})"
             )

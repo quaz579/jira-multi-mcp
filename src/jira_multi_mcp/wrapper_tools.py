@@ -30,6 +30,7 @@ from jira_multi_mcp.tools_meta import COMMENT_ID_RE, ISSUE_KEY_RE, shorten_for_e
 # thousands of digits) a cheap, obvious rejection rather than a large string
 # threaded through logging/URL-building.
 _MAX_ISSUE_KEY_LEN = 255
+_MAX_COMMENT_ID_LEN = 32
 
 
 def _shape_entry(entry: dict[str, str]) -> dict[str, str]:
@@ -59,7 +60,9 @@ def _validate_comment_id(comment_id: str, site_name: str) -> str:
     path, so an unvalidated value (a slash, ``..``, a query string, or a
     trailing newline) would reshape the request rather than simply fail as
     an unknown comment id."""
-    if not COMMENT_ID_RE.fullmatch(comment_id):
+    # COMMENT_ID_RE has no upper bound on the digit run; Jira ids are far
+    # shorter than this, so the cap only stops absurd input reaching the path.
+    if len(comment_id) > _MAX_COMMENT_ID_LEN or not COMMENT_ID_RE.fullmatch(comment_id):
         raise ToolError(
             f"[site={site_name}] jira_delete_comment: 'comment_id' must be a Jira comment id "
             f"(digits only), got {shorten_for_error(comment_id)}"
