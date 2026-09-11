@@ -148,18 +148,34 @@ class MultiSiteProxyTool(Tool):
         # checking against `projects_filter` -- that check stays
         # wrapper-tool-only.
         enforce_site_policy(site, self.name, is_write=False, issue_key=None)
-        client = await self._manager.client_for(site.name)
 
         assert self.timeout is not None, f"mirrored tool '{self.name}' was built without a timeout"
         log_path = self._manager.log_path(site.name)
         try:
+            # `client_for` runs INSIDE this scope, not before it: a failed
+            # site's recovery (closing the old client, connecting a new one,
+            # probing liveness) can itself take several seconds, and that
+            # time must count against this call's own `call_timeout_seconds`
+            # budget rather than running for free ahead of it -- otherwise a
+            # caller's effective timeout was `call_timeout_seconds +
+            # recovery time`, up to `connect_timeout_seconds` more (see
+            # `children.ChildManager.client_for`'s docstring).
             with anyio.fail_after(self.timeout):
+                client = await self._manager.client_for(site.name)
                 result = await client.call_tool_mcp(self.name, args)
         except TimeoutError as exc:
             self._manager.mark_timeout(site.name, f"{self.name} timed out after {self.timeout}s")
             raise ToolError(
                 f"[site={site.name}] {self.name} timed out after {self.timeout}s. Child log: {log_path}"
             ) from exc
+        except ToolError:
+            # `client_for` (or the recovery attempt it triggers) can raise
+            # its own already-well-shaped `ToolError` directly -- "site is
+            # unavailable: ..." or "is recovering; retry shortly". Re-raise
+            # as-is rather than double-wrapping it in the generic-failure
+            # shape below (which would otherwise render as
+            # "... failed: ToolError: [site=x] ...").
+            raise
         except Exception as exc:
             # The child died or the connection otherwise broke mid-call (not a
             # timeout, not a tool-level error the child reported normally) --

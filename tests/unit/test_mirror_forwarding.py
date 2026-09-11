@@ -580,6 +580,101 @@ async def test_call_timeout_records_a_mark_timeout_call(tmp_path: Path) -> None:
     assert manager.timeouts == ["acme"]
 
 
+class _SlowClientForManagerSpy:
+    """``client_for`` itself is slow (models the MEDIUM fix: recovery now
+    runs inside ``client_for``, which must be bounded by the caller's own
+    call timeout) -- distinct from ``_HangingChildManagerSpy`` above, where
+    ``client_for`` resolves instantly but the call itself hangs."""
+
+    def __init__(self, log_path: Path) -> None:
+        self._log_path = log_path
+        self.timeouts: list[str] = []
+
+    async def client_for(self, site_name: str) -> _HangingClient:
+        await anyio.sleep(3600)
+        raise AssertionError("unreachable")
+
+    def log_path(self, site_name: str) -> Path:
+        return self._log_path
+
+    def redact(self, text: str) -> str:
+        return text
+
+    def mark_failed(self, site_name: str, reason: str) -> None:
+        pass
+
+    def mark_timeout(self, site_name: str, reason: str) -> None:
+        self.timeouts.append(site_name)
+
+    def mark_success(self, site_name: str) -> None:
+        pass
+
+
+async def test_call_timeout_bounds_a_slow_client_for_not_just_the_call(tmp_path: Path) -> None:
+    """The MEDIUM finding: ``client_for`` (and any recovery it triggers) now
+    runs INSIDE ``anyio.fail_after(self.timeout)``, not before it -- proves a
+    slow/hung ``client_for`` is bounded by the tool's own call timeout rather
+    than running for free ahead of it."""
+    registry = SiteRegistry([_site("acme", "ACME")])
+    manager = _SlowClientForManagerSpy(tmp_path / "acme.log")
+    mcp_tool = mcp_types.Tool(
+        name="jira_get_issue",
+        input_schema={"type": "object", "properties": {"issue_key": {"type": "string"}}},
+    )
+    tool = MultiSiteProxyTool.from_mcp_tool(manager, registry, mcp_tool, timeout=0.01)  # type: ignore[arg-type]
+
+    with pytest.raises(ToolError, match="timed out"):
+        await tool.run({"issue_key": "ACME-1"})
+
+    assert manager.timeouts == ["acme"]
+
+
+class _RecoveringChildManagerSpy:
+    """``client_for`` raises its own already-shaped ``ToolError`` directly --
+    the real ``ChildManager.client_for`` does this for "site is unavailable"
+    and "is recovering; retry shortly" -- must NOT be double-wrapped into
+    "... failed: ToolError: ..."."""
+
+    def __init__(self, log_path: Path, message: str) -> None:
+        self._log_path = log_path
+        self._message = message
+
+    async def client_for(self, site_name: str) -> _HangingClient:
+        raise ToolError(self._message)
+
+    def log_path(self, site_name: str) -> Path:
+        return self._log_path
+
+    def redact(self, text: str) -> str:
+        return text
+
+    def mark_failed(self, site_name: str, reason: str) -> None:
+        pass
+
+    def mark_timeout(self, site_name: str, reason: str) -> None:
+        pass
+
+    def mark_success(self, site_name: str) -> None:
+        pass
+
+
+async def test_a_tool_error_from_client_for_is_not_double_wrapped(tmp_path: Path) -> None:
+    registry = SiteRegistry([_site("acme", "ACME")])
+    manager = _RecoveringChildManagerSpy(tmp_path / "acme.log", "Site 'acme' is recovering; retry shortly")
+    mcp_tool = mcp_types.Tool(
+        name="jira_get_issue",
+        input_schema={"type": "object", "properties": {"issue_key": {"type": "string"}}},
+    )
+    tool = MultiSiteProxyTool.from_mcp_tool(manager, registry, mcp_tool, timeout=5.0)  # type: ignore[arg-type]
+
+    with pytest.raises(ToolError) as exc_info:
+        await tool.run({"issue_key": "ACME-1"})
+
+    message = str(exc_info.value)
+    assert message == "Site 'acme' is recovering; retry shortly"
+    assert "failed:" not in message
+
+
 async def test_generic_application_failure_does_not_mark_the_site_failed(tmp_path: Path) -> None:
     registry = SiteRegistry([_site("acme", "ACME")])
     manager = _DeadChildManager(tmp_path / "acme.log", exc=RuntimeError("some other bug"))

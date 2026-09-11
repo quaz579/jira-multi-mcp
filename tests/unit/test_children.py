@@ -660,6 +660,122 @@ async def test_recovery_closes_the_old_client_before_restarting(
         assert new_client is not old_client
 
 
+class _EventGatedHangingTransport(ClientTransport):
+    """Sets ``entered`` the instant its connect actually starts, then never
+    yields a session -- lets a test deterministically wait for a recovery
+    attempt to be genuinely in flight before racing a second caller against
+    it, without a sleep-based guess."""
+
+    def __init__(self, entered: anyio.Event) -> None:
+        self._entered = entered
+
+    @contextlib.asynccontextmanager
+    async def connect_session(  # type: ignore[override]
+        self, *, transport_options: object = None, **session_kwargs: object
+    ) -> AsyncIterator[object]:
+        self._entered.set()
+        await anyio.sleep_forever()
+        yield None  # pragma: no cover - unreachable, connect_session never yields
+
+
+async def test_recovery_lock_uses_try_lock_so_a_second_caller_fails_fast(tmp_path: Path) -> None:
+    """The MEDIUM finding's (c): recovery now runs inside the CALLER's own
+    call-timeout budget (see mirror.py), so a second caller must not queue
+    behind `handle.recovery_lock` (burning its own budget waiting on someone
+    else's restart) -- it must fail fast with a clear "is recovering"
+    error, and only ONE recovery attempt (one factory call) must happen."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    attempts = {"count": 0}
+    entered = anyio.Event()
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("simulated connect failure")
+        return _EventGatedHangingTransport(entered)
+
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        # Short connect_timeout: once gated open, the recovery attempt's own
+        # internal deadline resolves it (as a normal failure, not an
+        # external cancellation) well within the test.
+        Defaults(recovery_cooldown_seconds=0.05, connect_timeout_seconds=0.3),
+        tmp_path,
+        transport_factory=factory,
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        await anyio.sleep(0.1)  # past the cooldown
+
+        results: dict[str, object] = {}
+
+        async def _first() -> None:
+            try:
+                results["first"] = await manager.client_for("acme")
+            except ToolError as exc:
+                results["first"] = exc
+
+        async def _second() -> None:
+            await entered.wait()  # the first caller is now genuinely mid-recovery
+            try:
+                results["second"] = await manager.client_for("acme")
+            except ToolError as exc:
+                results["second"] = exc
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_first)
+            tg.start_soon(_second)
+
+        assert attempts["count"] == 2  # exactly one recovery attempt, not two
+        assert isinstance(results["second"], ToolError)
+        assert "is recovering" in str(results["second"])
+        assert not manager._handles["acme"].recovery_lock.locked()  # noqa: SLF001 - whitebox
+
+
+async def test_recovery_interrupted_by_the_callers_own_timeout_still_marks_the_site_failed(
+    tmp_path: Path,
+) -> None:
+    """Recovery now runs inside the caller's own `anyio.fail_after` (see
+    mirror.py's `MultiSiteProxyTool.run`) -- that timeout firing while
+    `_attempt_recovery` is mid-connect must not leave the handle silently
+    pointed at a half-connected client with `next_retry_at` still in the
+    past, which would make the very next call immediately re-attempt the
+    same stuck connect."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    attempts = {"count": 0}
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("simulated connect failure")
+        return _HangingTransport()  # recovery's own connect never resolves on its own
+
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05, connect_timeout_seconds=30.0),
+        tmp_path,
+        transport_factory=factory,
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        await anyio.sleep(0.1)
+
+        before = time.time()
+        with pytest.raises(TimeoutError):
+            with anyio.fail_after(0.2):
+                await manager.client_for("acme")
+
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "failed"
+        assert health["acme"]["recovery_attempts"] == 1
+        next_retry_at = health["acme"]["next_retry_at"]
+        assert isinstance(next_retry_at, float)
+        assert next_retry_at > before  # not left stuck in the past
+        assert not manager._handles["acme"].recovery_lock.locked()  # noqa: SLF001 - whitebox
+
+
 async def test_aclose_logs_shutting_down_only_once_across_repeated_calls(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

@@ -450,6 +450,20 @@ class ChildManager:
         return self._upstream_version
 
     async def client_for(self, site_name: str) -> Client[ClientTransport]:
+        """Resolves ``site_name`` to a healthy client, attempting recovery
+        first if it's currently marked ``failed`` and its cooldown has
+        elapsed.
+
+        Callers must invoke this from *inside* their own
+        ``anyio.fail_after(call_timeout_seconds)`` scope (see
+        ``mirror.py``'s ``MultiSiteProxyTool.run``): recovery itself
+        (closing the old client, connecting a new one, probing liveness) can
+        take several seconds and must count against the caller's own call
+        budget rather than running for free beforehand. May raise
+        ``ToolError`` directly -- either "site is unavailable" below, or (via
+        ``_maybe_recover``) "is recovering; retry shortly" when another
+        caller already holds the recovery lock.
+        """
         handle = self._handles.get(site_name)
         if handle is not None and handle.state == "failed":
             await self._maybe_recover(handle)
@@ -465,23 +479,34 @@ class ChildManager:
         elapsed since its last failure, restarting the child if so.
 
         The cheap check (``next_retry_at`` in the past) happens before ever
-        taking ``handle.recovery_lock``, so the common case -- a site that's
-        healthy, or still within its cooldown -- costs nothing beyond a
-        timestamp comparison. The lock only serializes the rare case: two
-        calls for the same failed site racing right as the cooldown expires,
-        which must attempt exactly one restart, not two.
+        touching ``handle.recovery_lock``, so the common case -- a site
+        that's healthy, or still within its cooldown -- costs nothing beyond
+        a timestamp comparison.
+
+        Uses try-lock semantics (``acquire_nowait``), not ``async with
+        handle.recovery_lock``: this now runs *inside* the caller's
+        ``anyio.fail_after(call_timeout_seconds)`` (see ``mirror.py``'s
+        ``MultiSiteProxyTool.run``), so a second caller queuing behind the
+        lock would burn its own call budget waiting on someone else's
+        restart instead of getting a fast, clear answer.
         """
         if handle.next_retry_at is not None and time.time() < handle.next_retry_at:
             return
-        async with handle.recovery_lock:
-            # Re-check inside the lock: another caller may have already
-            # completed (or just started, resetting the cooldown on failure)
-            # a recovery attempt while this one waited for the lock.
+        try:
+            handle.recovery_lock.acquire_nowait()
+        except anyio.WouldBlock:
+            raise ToolError(f"Site '{handle.site.name}' is recovering; retry shortly") from None
+        try:
+            # Re-check now that the lock is held: another caller may have
+            # already completed (or just started, resetting the cooldown on
+            # failure) a recovery attempt before this one got here.
             if handle.state != "failed":
                 return
             if handle.next_retry_at is not None and time.time() < handle.next_retry_at:
                 return
             await self._attempt_recovery(handle)
+        finally:
+            handle.recovery_lock.release()
 
     async def _attempt_recovery(self, handle: ChildHandle) -> None:
         site = handle.site
@@ -495,14 +520,32 @@ class ChildManager:
         if old_client is not None:
             # Bounded: a child that's `failed` from 3 consecutive timeouts is
             # presumably stuck, and `Client.close()` has its own disconnect
-            # wait -- don't let a corpse's teardown stall the restart.
-            with anyio.move_on_after(5.0), suppress(Exception):
+            # wait -- don't let a corpse's teardown stall the restart. This
+            # attempt now runs inside the caller's own call-timeout budget
+            # (see `client_for`'s docstring), so the budget is kept small.
+            with anyio.move_on_after(2.0), suppress(Exception):
                 await old_client.close()  # type: ignore[no-untyped-call]
         handle.client = None
 
-        connect_timeout = self._defaults.connect_timeout_seconds
+        # Bounded by whichever of the two timeouts is smaller: recovery now
+        # runs inside the caller's `call_timeout_seconds` budget (see
+        # `client_for`), so a `connect_timeout_seconds` of e.g. 90s must not
+        # be allowed to blow straight through a 10s call timeout on its own.
+        connect_timeout = min(self._defaults.connect_timeout_seconds, self._defaults.call_timeout_seconds)
         transport: ClientTransport | None = None
         entered = False
+        # Recovery now runs inside the caller's own
+        # `anyio.fail_after(call_timeout_seconds)` (see `client_for`'s
+        # docstring), so that timeout firing while `__aenter__`/
+        # `_probe_liveness` is in flight raises anyio's cancelled-exception
+        # type here -- a `BaseException` under the asyncio backend, so a
+        # plain `except Exception` wouldn't catch it, and it would escape
+        # leaving the handle pointed at a half-connected client with
+        # `next_retry_at` still in the past (the very next call would then
+        # immediately retry the same stuck connect). Caught explicitly
+        # alongside `Exception` so the failure is always recorded, then
+        # re-raised so the call's own timeout still actually fires.
+        cancelled_exc = anyio.get_cancelled_exc_class()
         try:
             with anyio.move_on_after(connect_timeout) as scope:
                 transport = self._transport_factory(site, self._upstream)
@@ -512,10 +555,12 @@ class ChildManager:
                 entered = True
                 await self._probe_liveness(client)
             timed_out = scope.cancelled_caught
-        except Exception as exc:  # noqa: BLE001 - one site's failed recovery must not raise
+        except (Exception, cancelled_exc) as exc:  # noqa: BLE001 - one site's failed recovery must not raise
             self._fail_recovery(handle, self.redact(f"{exc.__class__.__name__}: {exc}"))
             if not entered:
                 _close_leaked_log_file(transport)
+            if isinstance(exc, cancelled_exc):
+                raise
             return
 
         if timed_out:
