@@ -29,7 +29,7 @@ from jira_multi_mcp.mirror import LateMirror, build_mirrored_tools
 from jira_multi_mcp.model import AppConfig
 from jira_multi_mcp.registry import SiteRegistry
 from jira_multi_mcp.tools_meta import CURATED_TOOLS
-from jira_multi_mcp.wrapper_tools import build_attachment_tools, build_jira_sites_tool
+from jira_multi_mcp.wrapper_tools import build_attachment_tools, build_comment_tools, build_jira_sites_tool
 
 _logger = logging.getLogger(__name__)
 
@@ -189,6 +189,8 @@ async def serve(config: AppConfig, *, verbose: bool = False) -> int:
                         mcp.add_tool(build_jira_sites_tool(manager, config.defaults, late_mirror=late_mirror))
                         for attachment_tool in build_attachment_tools(registry, attachment_clients):
                             mcp.add_tool(attachment_tool)
+                        for comment_tool in build_comment_tools(registry, attachment_clients):
+                            mcp.add_tool(comment_tool)
                         for tool in mirrored:
                             mcp.add_tool(tool)
 

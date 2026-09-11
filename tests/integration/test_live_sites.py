@@ -189,3 +189,65 @@ async def test_attachment_upload_list_download_delete_round_trip(
                     f"cleanup DELETE for attachment {attachment_id} on {issue_key} returned "
                     f"{delete_response.status_code}; it may still exist on the issue"
                 )
+
+
+@pytest.mark.skipif(
+    _sandbox_issue_key() is None,
+    reason="set JIRA_MULTI_TEST_SANDBOX_ISSUE to a writable issue key to run the delete_comment round trip",
+)
+async def test_delete_comment_round_trip(
+    live_client: Client[ClientTransport], real_config: AppConfig
+) -> None:
+    issue_key = _sandbox_issue_key()
+    if issue_key is None:
+        # Belt: the skipif above is the real guard; see the attachment round
+        # trip test's identical comment for why this must never run silently.
+        raise RuntimeError(
+            "refusing to run the delete_comment round trip without JIRA_MULTI_TEST_SANDBOX_ISSUE set"
+        )
+
+    site = _site_for_issue_key(real_config, issue_key)
+
+    sites_result = await live_client.call_tool_mcp("jira_sites", {})
+    site_health = next(s for s in sites_result.structured_content["sites"] if s["name"] == site.name)
+    assert site_health["state"] == "healthy", f"site '{site.name}' is not healthy: {site_health['error']}"
+    assert site.read_only is False, (
+        f"site '{site.name}' is configured read_only = true; "
+        f"refusing to run a write test against it. Use a non-read-only sandbox site."
+    )
+
+    add_result = await live_client.call_tool_mcp(
+        "jira_add_comment",
+        {"issue_key": issue_key, "body": f"jira-multi-mcp integration test comment for {issue_key}"},
+    )
+    assert add_result.is_error is False, _text_content(add_result)
+    # Upstream's jira_add_comment returns a JSON string of the created
+    # comment's own dict (mcp_atlassian.jira.comments.CommentsMixin.add_comment),
+    # always carrying the new comment's id at the top level.
+    added = json.loads(_text_content(add_result))
+    comment_id = str(added["id"])
+
+    try:
+        delete_result = await live_client.call_tool_mcp(
+            "jira_delete_comment", {"issue_key": issue_key, "comment_id": comment_id}
+        )
+        assert delete_result.is_error is False, _text_content(delete_result)
+        assert delete_result.structured_content == {
+            "site": site.name,
+            "issue_key": issue_key,
+            "comment_id": comment_id,
+            "deleted": True,
+        }
+
+        second_delete_result = await live_client.call_tool_mcp(
+            "jira_delete_comment", {"issue_key": issue_key, "comment_id": comment_id}
+        )
+        assert second_delete_result.is_error is True
+        assert "404" in _text_content(second_delete_result)
+    finally:
+        # Best-effort cleanup if the first delete above never ran (an
+        # assertion before it failed) -- harmless 404 if it already
+        # succeeded, same pattern as the attachment round trip's cleanup.
+        await live_client.call_tool_mcp(
+            "jira_delete_comment", {"issue_key": issue_key, "comment_id": comment_id}
+        )

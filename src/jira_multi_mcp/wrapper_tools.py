@@ -1,11 +1,13 @@
 """Tools this wrapper implements itself rather than mirroring from a child:
-``jira_sites`` plus the three attachment tools (M3), which talk to Jira Cloud
-REST v3 directly via ``attachments.AttachmentClientRegistry`` rather than
-going through an upstream child -- see that module's docstring for why.
+``jira_sites``, the three attachment tools (M3), and ``jira_delete_comment``
+(M6) -- all of which talk to Jira Cloud REST v3 directly via
+``attachments.AttachmentClientRegistry`` rather than going through an
+upstream child -- see that module's docstring for why.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -44,6 +46,21 @@ def _resolve_or_raise(
         return resolve_site(registry, {"issue_key": issue_key}, explicit=site, tool_name=tool_name)
     except SiteResolutionError as exc:
         raise ToolError(str(exc)) from exc
+
+
+_COMMENT_ID_RE = re.compile(r"^[0-9]+$")
+
+
+def _validate_comment_id(comment_id: str, site_name: str) -> str:
+    """Jira's DELETE endpoint takes ``comment_id`` straight into the URL
+    path, so an unvalidated value (a slash, ``..``, a query string) would
+    reshape the request rather than simply fail as an unknown comment id."""
+    if not _COMMENT_ID_RE.match(comment_id):
+        raise ToolError(
+            f"[site={site_name}] jira_delete_comment: 'comment_id' must be a Jira comment id "
+            f"(digits only), got {comment_id!r}"
+        )
+    return comment_id
 
 
 def build_jira_sites_tool(
@@ -255,4 +272,42 @@ def build_attachment_tools(
             ),
             annotations=mcp_types.ToolAnnotations(read_only_hint=False),
         ),
+    ]
+
+
+def build_comment_tools(registry: SiteRegistry, attachment_clients: AttachmentClientRegistry) -> list[Tool]:
+    """``jira_delete_comment`` -- upstream ``mcp-atlassian`` has no
+    delete-comment tool or library method at all (only add/edit), so this
+    goes straight to Jira Cloud REST v3 via the same per-site client the
+    attachment tools use."""
+
+    async def jira_delete_comment(issue_key: str, comment_id: str, site: str | None = None) -> dict[str, Any]:
+        resolution = _resolve_or_raise(registry, issue_key, site, "jira_delete_comment")
+        enforce_site_policy(resolution.site, "jira_delete_comment", is_write=True, issue_key=issue_key)
+        validated_id = _validate_comment_id(comment_id, resolution.site.name)
+        client = attachment_clients.get(resolution.site.name)
+        await client.delete_comment(issue_key, validated_id)
+        return {
+            "site": resolution.site.name,
+            "issue_key": issue_key,
+            "comment_id": validated_id,
+            "deleted": True,
+        }
+
+    return [
+        Tool.from_function(
+            jira_delete_comment,
+            name="jira_delete_comment",
+            description=(
+                "Permanently deletes ONE comment from an issue. Irreversible -- there is no undo "
+                "and no upstream equivalent (mcp-atlassian only supports add/edit). site is "
+                "inferred from issue_key's prefix if omitted. Write operation: refused with a "
+                "clear error on a site configured read_only = true. Jira Cloud sites only."
+            ),
+            # Not idempotent: a second call with the same arguments errors
+            # (comment already gone) rather than repeating the same result.
+            annotations=mcp_types.ToolAnnotations(
+                read_only_hint=False, destructive_hint=True, idempotent_hint=False
+            ),
+        )
     ]

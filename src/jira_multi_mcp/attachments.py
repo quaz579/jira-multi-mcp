@@ -1,10 +1,12 @@
-"""Direct Jira Cloud REST v3 attachment client: list, download-to-disk, upload.
+"""Direct Jira Cloud REST v3 client: attachments (list, download-to-disk,
+upload) and comment deletion.
 
 Implemented directly against the REST API (not through an upstream child)
-because upstream ``mcp-atlassian`` only exposes a base64-in-band download
-tool -- see ``tools_meta.WRAPPER_OWNED_TOOLS``. Cloud only in this version:
-Server/Data Center attachment endpoints differ and are out of scope (the
-plan's v1 decision), so every method refuses on a ``personal_token`` site.
+because upstream ``mcp-atlassian`` has no delete-comment tool at all, and
+only exposes a base64-in-band download tool for attachments -- see
+``tools_meta.WRAPPER_OWNED_TOOLS``. Cloud only in this version: Server/Data
+Center endpoints differ and are out of scope (the plan's v1 decision), so
+every method refuses on a ``personal_token`` site.
 """
 
 from __future__ import annotations
@@ -265,6 +267,19 @@ class JiraAttachmentClient:
                 raise self._shape_transport_error(exc, "jira_upload_attachments") from exc
         await self._raise_for_status(response, "POST", path_str)
         return [self._parse_attachment(raw) for raw in response.json()]
+
+    async def delete_comment(self, issue_key: str, comment_id: str) -> None:
+        """Permanently deletes one comment. ``comment_id`` is validated by
+        the caller (``wrapper_tools._validate_comment_id``) before it ever
+        reaches this method -- never call this with an unvalidated value,
+        since it goes straight into the URL path."""
+        self._require_cloud("jira_delete_comment")
+        path = f"/issue/{issue_key}/comment/{comment_id}"
+        try:
+            response = await self._http.delete(f"{self.api_base}{path}")
+        except httpx.HTTPError as exc:
+            raise self._shape_transport_error(exc, "jira_delete_comment") from exc
+        await self._raise_for_status(response, "DELETE", path)
 
     def _select(
         self,

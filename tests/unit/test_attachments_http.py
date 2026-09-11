@@ -349,3 +349,75 @@ async def test_dc_site_refuses_all_three_operations(http_client: httpx.AsyncClie
         await client.download("ONPREM-1", tmp_path)
     with pytest.raises(ToolError, match="Jira Cloud sites only in this version"):
         await client.upload("ONPREM-1", [])
+
+
+@respx.mock
+async def test_delete_comment_success_raises_nothing_on_204(http_client: httpx.AsyncClient) -> None:
+    site = _cloud_site()
+    route = respx.delete("https://acme.atlassian.net/rest/api/3/issue/ACME-1/comment/10050").mock(
+        return_value=httpx.Response(204)
+    )
+
+    await _client(site, http_client).delete_comment("ACME-1", "10050")
+
+    assert route.called
+
+
+@respx.mock
+async def test_delete_comment_403_carries_jira_messages_and_not_the_token(
+    http_client: httpx.AsyncClient,
+) -> None:
+    site = _cloud_site()
+    respx.delete("https://acme.atlassian.net/rest/api/3/issue/ACME-1/comment/10050").mock(
+        return_value=httpx.Response(
+            403, json={"errorMessages": ["You do not have permission to delete this comment."]}
+        )
+    )
+
+    with pytest.raises(ToolError) as exc_info:
+        await _client(site, http_client).delete_comment("ACME-1", "10050")
+
+    message = str(exc_info.value)
+    assert "403" in message
+    assert "You do not have permission to delete this comment." in message
+    assert _SECRET_TOKEN not in message
+
+
+@respx.mock
+async def test_delete_comment_404_raises_tool_error_with_jira_message(http_client: httpx.AsyncClient) -> None:
+    site = _cloud_site()
+    respx.delete("https://acme.atlassian.net/rest/api/3/issue/ACME-1/comment/99999").mock(
+        return_value=httpx.Response(404, json={"errorMessages": ["Comment does not exist"]})
+    )
+
+    with pytest.raises(ToolError) as exc_info:
+        await _client(site, http_client).delete_comment("ACME-1", "99999")
+
+    assert "404" in str(exc_info.value)
+    assert "Comment does not exist" in str(exc_info.value)
+
+
+@respx.mock
+async def test_delete_comment_transport_error_is_shaped_as_a_tool_error(
+    http_client: httpx.AsyncClient,
+) -> None:
+    site = _cloud_site()
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"connection failed near token {_SECRET_TOKEN}")
+
+    respx.delete("https://acme.atlassian.net/rest/api/3/issue/ACME-1/comment/10050").mock(side_effect=boom)
+
+    with pytest.raises(ToolError) as exc_info:
+        await _client(site, http_client).delete_comment("ACME-1", "10050")
+
+    message = str(exc_info.value)
+    assert message.startswith("[site=acme] jira_delete_comment:")
+    assert _SECRET_TOKEN not in message
+    assert "***" in message
+
+
+async def test_dc_site_refuses_delete_comment(http_client: httpx.AsyncClient) -> None:
+    site = _dc_site()
+    with pytest.raises(ToolError, match="Jira Cloud sites only in this version"):
+        await _client(site, http_client).delete_comment("ONPREM-1", "10050")
