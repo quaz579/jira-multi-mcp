@@ -101,6 +101,12 @@ def parse_upstream_inventory(jira_server_path: Path) -> UpstreamInventory:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         for decorator in node.decorator_list:
+            # A bare `@jira_mcp.tool` (no call, no parens) is also a valid
+            # decoration -- only a `Call` decorator can carry `name=`/`tags=`
+            # keywords, but the function is still a tool either way.
+            if isinstance(decorator, ast.Attribute) and decorator.attr == "tool":
+                tool_names.add(f"jira_{node.name}")
+                continue
             if not (isinstance(decorator, ast.Call) and getattr(decorator.func, "attr", None) == "tool"):
                 continue
             wire_name = node.name
@@ -111,7 +117,9 @@ def parse_upstream_inventory(jira_server_path: Path) -> UpstreamInventory:
                     toolset_tags |= {
                         elt.value
                         for elt in keyword.value.elts
-                        if isinstance(elt, ast.Constant) and str(elt.value).startswith("toolset:")
+                        if isinstance(elt, ast.Constant)
+                        and isinstance(elt.value, str)
+                        and elt.value.startswith("toolset:")
                     }
             tool_names.add(f"jira_{wire_name}")
 
@@ -177,7 +185,8 @@ def build_report(upstream: UpstreamInventory) -> str:
 def has_drift(upstream: UpstreamInventory) -> bool:
     missing_curated = CURATED_TOOLS - upstream.tool_names
     new_toolset_tags = upstream.toolset_tags - BASELINE_TOOLSET_TAGS
-    return bool(missing_curated or new_toolset_tags)
+    gone_toolset_tags = BASELINE_TOOLSET_TAGS - upstream.toolset_tags
+    return bool(missing_curated or new_toolset_tags or gone_toolset_tags)
 
 
 def _gh(*args: str) -> subprocess.CompletedProcess[str]:
