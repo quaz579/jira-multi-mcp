@@ -9,13 +9,17 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import anyio
 import mcp_types
+from fastmcp import Context
 from fastmcp.exceptions import ToolError
 from fastmcp.tools.base import Tool
 
 from jira_multi_mcp.attachments import AttachmentClientRegistry
 from jira_multi_mcp.children import ChildManager
 from jira_multi_mcp.errors import SiteResolutionError
+from jira_multi_mcp.mirror import LateMirror
+from jira_multi_mcp.model import Defaults
 from jira_multi_mcp.registry import SiteRegistry, SiteResolution, resolve_site
 from jira_multi_mcp.site_policy import enforce_site_policy
 
@@ -42,26 +46,75 @@ def _resolve_or_raise(
         raise ToolError(str(exc)) from exc
 
 
-def build_jira_sites_tool(manager: ChildManager) -> Tool:
+def build_jira_sites_tool(
+    manager: ChildManager, defaults: Defaults, *, late_mirror: LateMirror | None = None
+) -> Tool:
     """Per-site health, never credentials: name, host, prefixes, read_only,
     state, error, last_error/last_error_at, log path, the FastMCP library
     version each child reports, and whether that site was the tool-discovery
     source. Also carries the ONE shared ``upstream_version`` (mcp-atlassian's
     own version, probed once at startup -- every site launches the same
     command) and, when no configured site is currently healthy, a top-level
-    ``note`` explaining that no child could be reached."""
+    ``note`` explaining that no child could be reached.
 
-    async def jira_sites() -> dict[str, Any]:
+    Also drives recovery: every call attempts ``ChildManager.recover_failed_sites()``
+    first (a no-op for a site still within its cooldown, or already
+    healthy), then, if ``late_mirror`` is given, ``LateMirror.after_recovery``
+    -- the only way a server that started with EVERY site down ever gets a
+    chance to mirror real tools once one comes back (see ``LateMirror``'s
+    docstring). Both are no-ops once nothing is failed / tools are already
+    mirrored, so a healthy server pays only the cost of ``manager.health()``.
+
+    Both steps run inside ONE ``anyio.move_on_after(defaults.health_recovery_budget_seconds)``
+    scope, so this call's total added latency is bounded by that budget, not
+    by either step's own (much longer) internal timeout --
+    ``recover_failed_sites``'s spawned attempt and ``after_recovery``'s
+    ``discover_tools()`` call both keep running in the background past the
+    budget (see their own docstrings) and are picked up by a later
+    ``jira_sites`` call; only THIS call's wait for them is cut short. When the
+    budget expires mid-``after_recovery``, ``late_mirror`` is left unmirrored
+    (``_mirrored`` stays ``False``) for a later call to retry, and the
+    response's ``note`` says so instead of claiming anything was mirrored.
+    """
+
+    async def jira_sites(ctx: Context) -> dict[str, Any]:
+        recovery_note: str | None = None
+        with anyio.move_on_after(defaults.health_recovery_budget_seconds) as scope:
+            await manager.recover_failed_sites()
+            if late_mirror is not None:
+                recovery_note = await late_mirror.after_recovery(ctx)
+        if scope.cancelled_caught and late_mirror is not None and recovery_note is None:
+            recovery_note = "tool mirroring pending; call jira_sites again"
+
         sites = manager.health()
         payload: dict[str, Any] = {
             "sites": sites,
             "upstream_version": manager.upstream_version(),
         }
-        if not any(site["state"] == "healthy" for site in sites):
-            payload["note"] = (
+        notes: list[str] = []
+        healthy = [site for site in sites if site["state"] == "healthy"]
+        if not healthy:
+            notes.append(
                 "no configured site is currently healthy; tool discovery could not run "
-                "against any child. See each site's 'error'/'log_path' above."
+                "against any child. Recovery is attempted automatically on every jira_sites "
+                "call once a failed site's cooldown has elapsed -- see each site's "
+                "'error'/'next_retry_at' above."
             )
+        elif all(site["read_only"] or site["enabled_tools_restricted"] for site in healthy):
+            # Distinct from the no-healthy-site case above: every child IS
+            # reachable, it's just that none of them is allowed to serve a
+            # write tool -- so a write tool call fails with a bare "Unknown
+            # tool" (fastmcp has no catch-all to shape that into a clearer
+            # error) rather than the usual "[site=x] ... read_only" hint.
+            notes.append(
+                "every healthy site is read_only or has enabled_tools configured; write tools "
+                "are not mirrored, so calling one by name fails with a bare 'Unknown tool' rather "
+                "than a [site=] error. See each site's 'read_only'/'enabled_tools_restricted' above."
+            )
+        if recovery_note is not None:
+            notes.append(recovery_note)
+        if notes:
+            payload["note"] = " ".join(notes)
         return payload
 
     return Tool.from_function(jira_sites, name="jira_sites")

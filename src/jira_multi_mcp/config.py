@@ -137,6 +137,10 @@ def _parse_defaults(fields: dict[str, Any]) -> Defaults:
         call_timeout_seconds=_positive_number(fields, "call_timeout_seconds", 120.0, "defaults"),
         connect_timeout_seconds=_positive_number(fields, "connect_timeout_seconds", 90.0, "defaults"),
         attachment_max_bytes=int(_positive_number(fields, "attachment_max_bytes", 104_857_600, "defaults")),
+        recovery_cooldown_seconds=_positive_number(fields, "recovery_cooldown_seconds", 30.0, "defaults"),
+        health_recovery_budget_seconds=_positive_number(
+            fields, "health_recovery_budget_seconds", 8.0, "defaults"
+        ),
     )
 
 

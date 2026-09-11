@@ -293,6 +293,52 @@ async def test_transport_error_during_download_is_redacted_and_stripped_of_url_q
     assert "?***" in entries[0]["reason"]
 
 
+@respx.mock
+async def test_transport_error_during_list_is_shaped_as_a_tool_error(http_client: httpx.AsyncClient) -> None:
+    """A connection failure on the LIST phase itself (as opposed to the
+    per-attachment content download, covered above) used to escape unshaped
+    -- no ``[site=]`` prefix, no tool name, no redaction."""
+    site = _cloud_site()
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"connection failed near token {_SECRET_TOKEN}")
+
+    respx.get("https://acme.atlassian.net/rest/api/3/issue/ACME-1", params={"fields": "attachment"}).mock(
+        side_effect=boom
+    )
+
+    with pytest.raises(ToolError) as exc_info:
+        await _client(site, http_client).list_attachments("ACME-1")
+
+    message = str(exc_info.value)
+    assert message.startswith("[site=acme] jira_list_attachments:")
+    assert _SECRET_TOKEN not in message
+    assert "***" in message
+
+
+@respx.mock
+async def test_transport_error_during_upload_post_is_shaped_as_a_tool_error(
+    http_client: httpx.AsyncClient, tmp_path: Path
+) -> None:
+    """Same fix as the LIST phase above, for the UPLOAD POST."""
+    site = _cloud_site()
+    upload_path = tmp_path / "notes.txt"
+    upload_path.write_text("hello")
+
+    def boom(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(f"connection failed near token {_SECRET_TOKEN}")
+
+    respx.post("https://acme.atlassian.net/rest/api/3/issue/ACME-1/attachments").mock(side_effect=boom)
+
+    with pytest.raises(ToolError) as exc_info:
+        await _client(site, http_client).upload("ACME-1", [upload_path])
+
+    message = str(exc_info.value)
+    assert message.startswith("[site=acme] jira_upload_attachments:")
+    assert _SECRET_TOKEN not in message
+    assert "***" in message
+
+
 async def test_dc_site_refuses_all_three_operations(http_client: httpx.AsyncClient, tmp_path: Path) -> None:
     site = _dc_site()
     client = _client(site, http_client)

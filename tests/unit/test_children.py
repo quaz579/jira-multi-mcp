@@ -263,6 +263,57 @@ async def test_aclose_kills_a_real_child_process(tmp_path: Path) -> None:
             pytest.fail(f"child pid {pid} was still alive 5s after ChildManager.aclose()")
 
 
+async def test_recovery_reuses_the_same_log_file_instead_of_leaking_one_fd_per_attempt(
+    tmp_path: Path,
+) -> None:
+    """The MEDIUM finding: fastmcp's `StdioTransport` never closes a
+    caller-supplied `log_file`, so opening a fresh one on every recovery
+    attempt would leak one fd per attempt for the rest of the process's
+    life. Proved against the REAL default transport factory (an actual,
+    fast-exiting subprocess each cycle, not a fake) by counting THIS
+    process's own open fds -- the log file is opened by the parent to hand
+    to the child as its stderr, so a leak would show up here directly."""
+    if not Path("/dev/fd").is_dir():
+        pytest.skip("requires /dev/fd (not available on this platform)")
+
+    script = (
+        "import sys\n"
+        "if '--version' in sys.argv:\n"
+        "    sys.exit(0)\n"
+        "from fastmcp import FastMCP\n"
+        "mcp = FastMCP('probe')\n"
+        "mcp.run(transport='stdio', show_banner=False)\n"
+    )
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(command=(sys.executable, "-c", script)),
+        Defaults(recovery_cooldown_seconds=0.02, connect_timeout_seconds=10),
+        tmp_path,
+    )
+
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=15)
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "healthy"
+
+        baseline = len(os.listdir("/dev/fd"))
+
+        for _ in range(5):
+            manager.mark_failed("acme", "simulated pipe break")
+            await anyio.sleep(0.05)  # past the cooldown
+            await manager.client_for("acme")  # triggers one real recovery/respawn
+
+        after = len(os.listdir("/dev/fd"))
+        # A little fd noise (the listdir call itself, GC timing) is
+        # tolerated; a real per-attempt leak would show as +5 (one per
+        # recovery cycle), not +0 or +1.
+        assert after - baseline <= 1, (
+            f"open fd count grew by {after - baseline} across 5 recovery cycles -- a child log "
+            "file was opened per attempt instead of being reused"
+        )
+
+
 async def test_cancelling_a_stuck_handshake_still_kills_the_spawned_child(tmp_path: Path) -> None:
     """Characterization test, not a regression test: this passes whether or
     not `handle.client` is assigned before or after `enter_async_context`,
@@ -456,6 +507,35 @@ async def test_mark_timeout_increments_and_flips_to_failed_after_three(tmp_path:
         assert health["acme"]["state"] == "failed"
 
 
+async def test_mark_timeout_does_not_re_arm_the_cooldown_past_the_transition_to_failed(
+    tmp_path: Path,
+) -> None:
+    """The LOW finding: only the TRANSITION into `failed` may set
+    `next_retry_at_monotonic` -- a slow trickle of further timeouts (from
+    other still-in-flight calls) that each also cross the 3-consecutive
+    threshold must not keep pushing the site's cooldown further out."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+
+        manager.mark_timeout("acme", "timed out")
+        manager.mark_timeout("acme", "timed out")
+        manager.mark_timeout("acme", "timed out")  # the transition to failed
+        handle = manager._handles["acme"]  # noqa: SLF001 - whitebox: health()'s epoch-seconds
+        # estimate is recomputed against the CURRENT clock offset on every
+        # read, so it drifts by a few microseconds between two calls even
+        # when the underlying monotonic value hasn't changed -- read the raw
+        # monotonic value directly for an exact equality check instead.
+        assert handle.state == "failed"
+        first_retry_at_monotonic = handle.next_retry_at_monotonic
+        assert isinstance(first_retry_at_monotonic, float)
+
+        manager.mark_timeout("acme", "a further stale timeout")  # already failed
+        assert handle.state == "failed"
+        assert handle.next_retry_at_monotonic == first_retry_at_monotonic  # not pushed further out
+
+
 async def test_mark_success_resets_the_timeout_counter(tmp_path: Path) -> None:
     registry = SiteRegistry([_cloud_site("acme", "ACME")])
     manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
@@ -465,6 +545,62 @@ async def test_mark_success_resets_the_timeout_counter(tmp_path: Path) -> None:
         manager.mark_timeout("acme", "timed out")
         manager.mark_timeout("acme", "timed out")
         manager.mark_success("acme")
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["timeouts"] == 0
+        assert health["acme"]["state"] == "healthy"
+
+
+async def test_mark_failed_with_a_stale_generation_is_a_no_op(tmp_path: Path) -> None:
+    """A slow, still-in-flight call captured `generation` before a recovery
+    already replaced the client it was using -- its eventual `mark_failed`
+    must not clobber the NEWER client's healthy state (the LOW finding)."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05),
+        tmp_path,
+        transport_factory=lambda site, up: FastMCPTransport(make_fake_child(site.name)),
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        stale_generation = manager.generation("acme")
+        assert stale_generation == 1
+
+        manager.mark_failed("acme", "simulated pipe break")
+        await anyio.sleep(0.1)  # past the (default) cooldown
+        await manager.client_for("acme")  # recovers -> generation bumps to 2
+
+        assert manager.generation("acme") == 2
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "healthy"
+
+        # The stale call's verdict, arriving late, must not un-heal the site.
+        manager.mark_failed("acme", "a stale call's late verdict", generation=stale_generation)
+
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "healthy"
+
+
+async def test_mark_timeout_with_a_stale_generation_is_a_no_op(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05),
+        tmp_path,
+        transport_factory=lambda site, up: FastMCPTransport(make_fake_child(site.name)),
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        stale_generation = manager.generation("acme")
+
+        manager.mark_failed("acme", "simulated pipe break")
+        await anyio.sleep(0.1)
+        await manager.client_for("acme")  # recovers -> a newer generation
+
+        manager.mark_timeout("acme", "a stale call's late timeout", generation=stale_generation)
+
         health = {h["name"]: h for h in manager.health()}
         assert health["acme"]["timeouts"] == 0
         assert health["acme"]["state"] == "healthy"
@@ -516,3 +652,285 @@ async def test_probe_upstream_version_handles_a_missing_command(tmp_path: Path) 
 
     assert version is None
     assert manager.upstream_version() is None
+
+
+async def test_probe_upstream_version_is_none_when_command_prints_nothing(tmp_path: Path) -> None:
+    """Exit 0 with empty stdout is not a version -- `upstream_version()` must
+    stay at its `None` default rather than reporting `""` as if it were one."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    upstream = UpstreamConfig(command=(sys.executable, "-c", "pass"))
+    manager = ChildManager(registry, upstream, Defaults(), tmp_path)
+
+    version = await manager.probe_upstream_version()
+
+    assert version is None
+    assert manager.upstream_version() is None
+
+
+# --- failed-site recovery (M4) ---
+
+
+async def test_client_for_recovers_a_failed_site_once_the_cooldown_elapses(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    attempts = {"count": 0}
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("simulated connect failure")
+        return FastMCPTransport(make_fake_child(site.name))
+
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05),
+        tmp_path,
+        transport_factory=factory,
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "failed"
+        assert health["acme"]["next_retry_at"] is not None
+
+        await anyio.sleep(0.1)  # past the cooldown
+        client = await manager.client_for("acme")
+
+        assert client is not None
+        assert attempts["count"] == 2
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "healthy"
+        assert health["acme"]["recovery_attempts"] == 1
+        assert health["acme"]["next_retry_at"] is None
+        assert health["acme"]["error"] is None
+
+
+async def test_client_for_does_not_retry_before_the_cooldown_elapses(tmp_path: Path) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    attempts = {"count": 0}
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        attempts["count"] += 1
+        raise RuntimeError("simulated connect failure")
+
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=30.0),
+        tmp_path,
+        transport_factory=factory,
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        assert attempts["count"] == 1
+
+        with pytest.raises(ToolError):
+            await manager.client_for("acme")
+
+        assert attempts["count"] == 1  # cooldown not elapsed yet -- no retry attempted
+
+
+async def test_client_for_stays_failed_and_updates_next_retry_at_when_recovery_keeps_failing(
+    tmp_path: Path,
+) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        raise RuntimeError("simulated connect failure")
+
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05),
+        tmp_path,
+        transport_factory=factory,
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        # Both read via `health()`, not the raw handle: `next_retry_at` is
+        # stored internally on the monotonic clock and only converted to an
+        # epoch-seconds estimate inside `health()` (see `ChildHandle`'s
+        # docstring), so comparing a raw-handle read against a `health()`
+        # read would be comparing two different clocks.
+        first_health = {h["name"]: h for h in manager.health()}
+        first_retry_at = first_health["acme"]["next_retry_at"]
+        assert isinstance(first_retry_at, float)
+
+        await anyio.sleep(0.1)
+        with pytest.raises(ToolError):
+            await manager.client_for("acme")
+
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "failed"
+        assert health["acme"]["recovery_attempts"] == 1
+        next_retry_at = health["acme"]["next_retry_at"]
+        assert isinstance(next_retry_at, float)
+        assert next_retry_at > first_retry_at
+
+
+async def test_recovery_closes_the_old_client_before_restarting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05),
+        tmp_path,
+        transport_factory=lambda site, up: FastMCPTransport(make_fake_child(site.name)),
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        handle = manager._handles["acme"]  # noqa: SLF001 - whitebox on our own fake
+        old_client = handle.client
+        assert old_client is not None
+
+        closed: list[str] = []
+        original_close = old_client.close
+
+        async def _spy_close() -> None:
+            closed.append("acme")
+            await original_close()  # type: ignore[no-untyped-call]
+
+        monkeypatch.setattr(old_client, "close", _spy_close)
+        manager.mark_failed("acme", "simulated pipe break")
+
+        await anyio.sleep(0.1)
+        new_client = await manager.client_for("acme")
+
+        assert closed == ["acme"]
+        assert new_client is not old_client
+
+
+class _EventGatedHangingTransport(ClientTransport):
+    """Sets ``entered`` the instant its connect actually starts, then never
+    yields a session -- lets a test deterministically wait for a recovery
+    attempt to be genuinely in flight before racing a second caller against
+    it, without a sleep-based guess."""
+
+    def __init__(self, entered: anyio.Event) -> None:
+        self._entered = entered
+
+    @contextlib.asynccontextmanager
+    async def connect_session(  # type: ignore[override]
+        self, *, transport_options: object = None, **session_kwargs: object
+    ) -> AsyncIterator[object]:
+        self._entered.set()
+        await anyio.sleep_forever()
+        yield None  # pragma: no cover - unreachable, connect_session never yields
+
+
+async def test_recovery_lock_uses_try_lock_so_a_second_caller_fails_fast(tmp_path: Path) -> None:
+    """The MEDIUM finding's (c): recovery now runs inside the CALLER's own
+    call-timeout budget (see mirror.py), so a second caller must not queue
+    behind `handle.recovery_lock` (burning its own budget waiting on someone
+    else's restart) -- it must fail fast with a clear "is recovering"
+    error, and only ONE recovery attempt (one factory call) must happen."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    attempts = {"count": 0}
+    entered = anyio.Event()
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("simulated connect failure")
+        return _EventGatedHangingTransport(entered)
+
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        # Short connect_timeout: once gated open, the recovery attempt's own
+        # internal deadline resolves it (as a normal failure, not an
+        # external cancellation) well within the test.
+        Defaults(recovery_cooldown_seconds=0.05, connect_timeout_seconds=0.3),
+        tmp_path,
+        transport_factory=factory,
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        await anyio.sleep(0.1)  # past the cooldown
+
+        results: dict[str, object] = {}
+
+        async def _first() -> None:
+            try:
+                results["first"] = await manager.client_for("acme")
+            except ToolError as exc:
+                results["first"] = exc
+
+        async def _second() -> None:
+            await entered.wait()  # the first caller is now genuinely mid-recovery
+            try:
+                results["second"] = await manager.client_for("acme")
+            except ToolError as exc:
+                results["second"] = exc
+
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(_first)
+            tg.start_soon(_second)
+
+        assert attempts["count"] == 2  # exactly one recovery attempt, not two
+        assert isinstance(results["second"], ToolError)
+        assert "is recovering" in str(results["second"])
+        assert not manager._handles["acme"].recovery_lock.locked()  # noqa: SLF001 - whitebox
+
+
+async def test_recovery_interrupted_by_the_callers_own_timeout_still_marks_the_site_failed(
+    tmp_path: Path,
+) -> None:
+    """Recovery now runs inside the caller's own `anyio.fail_after` (see
+    mirror.py's `MultiSiteProxyTool.run`) -- that timeout firing while
+    `_attempt_recovery` is mid-connect must not leave the handle silently
+    pointed at a half-connected client with `next_retry_at` still in the
+    past, which would make the very next call immediately re-attempt the
+    same stuck connect."""
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    attempts = {"count": 0}
+
+    def factory(site: SiteConfig, up: UpstreamConfig) -> ClientTransport:
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("simulated connect failure")
+        return _HangingTransport()  # recovery's own connect never resolves on its own
+
+    manager = ChildManager(
+        registry,
+        UpstreamConfig(),
+        Defaults(recovery_cooldown_seconds=0.05, connect_timeout_seconds=30.0),
+        tmp_path,
+        transport_factory=factory,
+    )
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        await anyio.sleep(0.1)
+
+        before = time.time()
+        with pytest.raises(TimeoutError):
+            with anyio.fail_after(0.2):
+                await manager.client_for("acme")
+
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["state"] == "failed"
+        assert health["acme"]["recovery_attempts"] == 1
+        next_retry_at = health["acme"]["next_retry_at"]
+        assert isinstance(next_retry_at, float)
+        assert next_retry_at > before  # not left stuck in the past
+        assert not manager._handles["acme"].recovery_lock.locked()  # noqa: SLF001 - whitebox
+        # A cancelled exception stringifies to "" -- a fixed, actually
+        # informative reason instead of the useless "CancelledError: ".
+        assert health["acme"]["last_error"] == "recovery interrupted by the caller's call timeout"
+
+
+async def test_aclose_logs_shutting_down_only_once_across_repeated_calls(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    registry = SiteRegistry([_cloud_site("acme", "ACME")])
+    manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        with caplog.at_level("INFO"):
+            await manager.aclose()
+            await manager.aclose()
+
+    matches = [r for r in caplog.records if "child manager shutting down" in r.message]
+    assert len(matches) == 1
