@@ -104,6 +104,29 @@ async def test_jira_list_attachments_ambiguous_without_site_is_a_tool_error(
     assert result.is_error is True
 
 
+async def test_jira_download_attachments_annotations_reflect_its_local_write_side_effect(
+    client: Client[FastMCPTransport],
+) -> None:
+    """It writes to a caller-supplied local path, so despite only reading
+    from Jira it must not advertise readOnlyHint=True -- and overwrite=False
+    (the default) can produce a different result on a second call once the
+    first call's file exists, so not idempotentHint either."""
+    tools = await client.list_tools()
+    download = next(t for t in tools if t.name == "jira_download_attachments")
+    assert download.annotations is not None
+    assert download.annotations.read_only_hint is False
+    assert download.annotations.destructive_hint is False
+    assert download.annotations.idempotent_hint is False
+
+    list_tool = next(t for t in tools if t.name == "jira_list_attachments")
+    assert list_tool.annotations is not None
+    assert list_tool.annotations.read_only_hint is True
+
+    upload = next(t for t in tools if t.name == "jira_upload_attachments")
+    assert upload.annotations is not None
+    assert upload.annotations.read_only_hint is False
+
+
 async def test_jira_upload_attachments_rejects_a_missing_path(
     client: Client[FastMCPTransport], tmp_path: Path
 ) -> None:
@@ -220,3 +243,34 @@ async def test_projects_filter_mismatch_is_a_tool_error() -> None:
     assert result.is_error is True
     text = result.content[0].text  # type: ignore[union-attr]
     assert "projects_filter" in text
+
+
+async def test_projects_filter_numeric_issue_id_is_refused_not_silently_skipped() -> None:
+    """Jira also accepts a numeric issue id in place of a key; ISSUE_KEY_RE
+    never matches one, so without an explicit refusal this check would
+    simply be skipped -- letting a numeric id bypass projects_filter
+    entirely (the identifier is never even resolved to a real project)."""
+    _registry, parent = _server_for(_site("acme", "ACME", projects_filter=("ACME",)))
+
+    c: Client[FastMCPTransport]
+    async with Client(FastMCPTransport(parent)) as c:
+        result = await c.call_tool_mcp("jira_list_attachments", {"issue_key": "81498", "site": "acme"})
+
+    assert result.is_error is True
+    text = result.content[0].text  # type: ignore[union-attr]
+    assert "projects_filter" in text
+    assert "numeric id" in text
+
+
+@respx.mock
+async def test_projects_filter_allows_a_matching_real_issue_key() -> None:
+    respx.get("https://acme.atlassian.net/rest/api/3/issue/ACME-1", params={"fields": "attachment"}).mock(
+        return_value=httpx.Response(200, json={"fields": {"attachment": []}})
+    )
+    _registry, parent = _server_for(_site("acme", "ACME", projects_filter=("ACME",)))
+
+    c: Client[FastMCPTransport]
+    async with Client(FastMCPTransport(parent)) as c:
+        result = await c.call_tool_mcp("jira_list_attachments", {"issue_key": "ACME-1", "site": "acme"})
+
+    assert result.is_error is False

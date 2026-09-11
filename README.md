@@ -50,7 +50,11 @@ prefix the same way every mirrored tool resolves it. All three also enforce
 the target site's `read_only` (write tools only), `enabled_tools`, and
 `projects_filter` settings — the same policy a mirrored tool gets for free
 from its upstream child, applied here directly since these tools never go
-through a child.
+through a child. A mirrored (child) tool relies entirely on the child
+process for `read_only` and `projects_filter` (its `READ_ONLY_MODE` and
+`JIRA_PROJECTS_FILTER` env vars); `enabled_tools` alone is enforced on both
+sides — the child's own `ENABLED_TOOLS` env var, and a wrapper-side check —
+so a misbehaving child can't serve a tool outside its configured allowlist.
 
 ## Configuration
 

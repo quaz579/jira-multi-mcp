@@ -20,6 +20,19 @@ from jira_multi_mcp.registry import SiteRegistry, SiteResolution, resolve_site
 from jira_multi_mcp.site_policy import enforce_site_policy
 
 
+def _shape_entry(entry: dict[str, str]) -> dict[str, str]:
+    """Passes a `_DownloadEntry.as_dict()` result through to the tool result,
+    keeping only the keys it actually has: `filename` for an entry describing
+    a real attachment, `selector` (e.g. `"id:999"`) for an unmatched selector
+    that was never a real filename to begin with."""
+    shaped = {"reason": entry["reason"]}
+    if "filename" in entry:
+        shaped["filename"] = entry["filename"]
+    if "selector" in entry:
+        shaped["selector"] = entry["selector"]
+    return shaped
+
+
 def _resolve_or_raise(
     registry: SiteRegistry, issue_key: str, site: str | None, tool_name: str
 ) -> SiteResolution:
@@ -115,14 +128,8 @@ def build_attachment_tools(
                 }
                 for d in downloaded
             ],
-            "skipped": [
-                {"filename": e["filename"], "reason": e["reason"]}
-                for e in entries
-                if e["status"] == "skipped"
-            ],
-            "failed": [
-                {"filename": e["filename"], "reason": e["reason"]} for e in entries if e["status"] == "failed"
-            ],
+            "skipped": [_shape_entry(e) for e in entries if e["status"] == "skipped"],
+            "failed": [_shape_entry(e) for e in entries if e["status"] == "failed"],
         }
 
     async def jira_upload_attachments(
@@ -167,11 +174,22 @@ def build_attachment_tools(
                 "Downloads one or more of an issue's attachments to disk under target_dir. "
                 "Writes files to disk and returns their paths; then use your file-reading tool "
                 "on the path. Prefer this over any base64 tool. Omit filenames/attachment_ids "
-                "to download every attachment. Jira Cloud sites only. Use an absolute target_dir "
+                "to download every attachment (an empty list for either is refused -- omit the "
+                "argument instead). Jira Cloud sites only. Use an absolute target_dir "
                 "-- a relative one resolves against the server process's own working directory, "
                 "not yours (the resolved path is echoed back in the result either way)."
             ),
-            annotations=mcp_types.ToolAnnotations(read_only_hint=True),
+            # Not read-only despite reading from Jira: it writes to a
+            # caller-supplied local path (target_dir), which is exactly the
+            # kind of side effect readOnlyHint promises a tool doesn't have.
+            # Not destructive (never removes/truncates something the caller
+            # didn't ask it to write over) and not idempotent (overwrite=False,
+            # the default, can produce a DIFFERENT result on a second call --
+            # the id-suffixed fallback name -- once the first call's file
+            # exists on disk).
+            annotations=mcp_types.ToolAnnotations(
+                read_only_hint=False, destructive_hint=False, idempotent_hint=False
+            ),
         ),
         Tool.from_function(
             jira_upload_attachments,

@@ -317,14 +317,30 @@ def _parse_enabled_tools(site_name: str, raw_tools: Any, toolset_preset: str) ->
 def _parse_projects_filter(site_name: str, raw_value: Any) -> tuple[str, ...] | None:
     """Upstream's static ``JIRA_PROJECTS_FILTER`` (restricts which projects the
     child's search/browse tools see at all) — distinct from a tool call's own
-    ``projects_filter`` argument, which only affects site *routing*."""
+    ``projects_filter`` argument, which only affects site *routing*.
+
+    Normalized to uppercase and validated as project keys here so
+    ``site_policy.enforce_site_policy``'s comparison (against an issue key's
+    project, itself uppercased) never has to guess at casing, and so a typo
+    that isn't even a valid project key shape is caught at load time instead
+    of just silently never matching anything.
+    """
     if raw_value is None:
         return None
     if not isinstance(raw_value, list) or not all(isinstance(item, str) and item for item in raw_value):
         raise ConfigError(f"site '{site_name}': 'projects_filter' must be a list of non-empty strings")
     if not raw_value:
         raise ConfigError(f"site '{site_name}': 'projects_filter' must not be empty when set")
-    return tuple(raw_value)
+    normalized: list[str] = []
+    for item in raw_value:
+        upper = item.strip().upper()
+        if not _KEY_PREFIX_RE.match(upper):
+            raise ConfigError(
+                f"site '{site_name}': projects_filter entry {item!r} is invalid; must be a project "
+                f"key matching {_KEY_PREFIX_RE.pattern} (a numeric project id is never a valid entry)"
+            )
+        normalized.append(upper)
+    return tuple(normalized)
 
 
 def _resolve_token(
