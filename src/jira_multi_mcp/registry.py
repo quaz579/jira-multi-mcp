@@ -16,13 +16,15 @@ from jira_multi_mcp.tools_meta import (
     PROJECT_KEY_ARGS,
     PROJECT_KEY_RE,
     PROJECTS_FILTER_ARGS,
+    shorten_for_error,
 )
 
 _logger = logging.getLogger(__name__)
 
 # A project-key argument may carry an issue key by mistake (e.g. "ACME-1");
 # strip a trailing issue-number suffix rather than fail the whole call.
-_TRAILING_ISSUE_NUMBER_RE = re.compile(r"(-\d+)+$")
+# `[0-9]`, not `\d`, to match ISSUE_KEY_RE's ASCII-only digit shape (tools_meta.py).
+_TRAILING_ISSUE_NUMBER_RE = re.compile(r"(-[0-9]+)+$")
 
 
 class SiteRegistry:
@@ -79,7 +81,7 @@ def resolve_site(
         site = registry.get_by_name(explicit)
         if site is None:
             names = ", ".join(s.name for s in registry.sites)
-            raise UnknownSiteError(f"unknown site '{explicit}'; configured sites: {names}")
+            raise UnknownSiteError(f"unknown site {shorten_for_error(explicit)}; configured sites: {names}")
         return SiteResolution(site=site, reason="explicit")
 
     if len(registry.sites) == 1:
@@ -98,13 +100,14 @@ def resolve_site(
         site = registry.get_by_prefix(prefix)
         if site is None:
             raise UnknownPrefixError(
-                f"tool '{tool_name}': unknown project prefix '{prefix}' (from '{token}' in '{arg_name}'); "
+                f"tool '{tool_name}': unknown project prefix {shorten_for_error(prefix)} "
+                f"(from {shorten_for_error(token)} in '{arg_name}'); "
                 f"configured prefixes: {registry.prefix_table()}"
             )
         matched_sites[site.name] = site
-        matched_detail.setdefault(site.name, []).append(f"{token} in {arg_name}")
+        matched_detail.setdefault(site.name, []).append(f"{shorten_for_error(token)} in {arg_name}")
         if first_reason is None:
-            first_reason = f"inferred from {token} in {arg_name}"
+            first_reason = f"inferred from {shorten_for_error(token)} in {arg_name}"
 
     for arg_name in ISSUE_KEY_ARGS:
         if arg_name not in arguments or arguments[arg_name] is None:

@@ -33,7 +33,7 @@ from __future__ import annotations
 from fastmcp.exceptions import ToolError
 
 from jira_multi_mcp.model import SiteConfig
-from jira_multi_mcp.tools_meta import ISSUE_KEY_RE
+from jira_multi_mcp.tools_meta import ISSUE_KEY_RE, shorten_for_error
 
 
 def enforce_site_policy(site: SiteConfig, tool_name: str, *, is_write: bool, issue_key: str | None) -> None:
@@ -57,12 +57,13 @@ def enforce_site_policy(site: SiteConfig, tool_name: str, *, is_write: bool, iss
             # Jira also accepts a numeric issue id (e.g. "81498") in place of
             # a key -- ISSUE_KEY_RE never matches one, so without this the
             # projects_filter check below would simply be skipped, letting a
-            # numeric id bypass the restriction entirely. Refuse outright
-            # rather than resolving it (that would need an extra Jira call
-            # just to find out what project it belongs to).
+            # numeric id (or any other malformed value) bypass the
+            # restriction entirely. Refuse outright rather than resolving it
+            # (that would need an extra Jira call just to find out what
+            # project it belongs to).
             raise ToolError(
                 f"[site={site.name}] {tool_name}: projects_filter is configured for this site; "
-                f"use the issue key (e.g. PROJ-123), not a numeric id ('{issue_key}')"
+                f"use a project issue key (e.g. PROJ-123); got {shorten_for_error(issue_key)}"
             )
         project = match.group(1)
         # `site.projects_filter` is normalized to uppercase at config load
@@ -70,7 +71,7 @@ def enforce_site_policy(site: SiteConfig, tool_name: str, *, is_write: bool, iss
         # above, so this comparison is already case-insensitive.
         if project not in site.projects_filter:
             raise ToolError(
-                f"[site={site.name}] {tool_name}: project '{project}' (from issue "
-                f"'{issue_key}') is not in this site's projects_filter "
+                f"[site={site.name}] {tool_name}: project {shorten_for_error(project)} (from issue "
+                f"{shorten_for_error(issue_key)}) is not in this site's projects_filter "
                 f"({', '.join(site.projects_filter)})"
             )

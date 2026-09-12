@@ -39,7 +39,7 @@ def _site() -> SiteConfig:
         name="acme",
         url="https://acme.atlassian.net",
         key_prefixes=("ACME",),
-        username="bgrossman@jumpmind.com",
+        username="you@example.com",
         api_token=Secret("token"),
     )
 
@@ -51,7 +51,7 @@ def _attachment(att_id: str, filename: str) -> dict[str, object]:
         "size": 0,
         "mimeType": "text/plain",
         "created": "2026-09-10T12:00:00.000+0000",
-        "author": {"displayName": "Ben Grossman"},
+        "author": {"displayName": "Example User"},
         "content": f"https://acme.atlassian.net/rest/api/3/attachment/content/{att_id}",
     }
 
@@ -78,7 +78,7 @@ def _mock_content(att_id: str, body: bytes, *, chunked: bool = False) -> None:
 
 @pytest.fixture
 async def http_client() -> AsyncGenerator[httpx.AsyncClient, None]:
-    async with httpx.AsyncClient(auth=httpx.BasicAuth("bgrossman@jumpmind.com", "token")) as client:
+    async with httpx.AsyncClient(auth=httpx.BasicAuth("you@example.com", "token")) as client:
         yield client
 
 

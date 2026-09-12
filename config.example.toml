@@ -46,16 +46,16 @@ workspace_dir   = "."
 # since environment variable names can't contain a dash).
 
 [[sites]]
-name         = "jumpmind"
-url          = "https://jumpmind.atlassian.net"
-key_prefixes = ["JMC", "JMCH", "JMI"]
+name         = "acme"
+url          = "https://acme.atlassian.net"
+key_prefixes = ["ACME", "ACMEH", "ACMI"]
 # Every project-key prefix across every [[sites]] entry must be globally
-# unique — that's how a bare "JMC-1234" gets routed without a `site` argument.
+# unique — that's how a bare "ACME-1234" gets routed without a `site` argument.
 
 [[sites]]
-name         = "dtlr"
-url          = "https://dtlr.atlassian.net"
-key_prefixes = ["JUMP"]
+name         = "beta"
+url          = "https://beta.atlassian.net"
+key_prefixes = ["BETA"]
 # Per-site overrides (all optional): username, api_token, api_token_env,
 # personal_token / personal_token_env (Jira Server/Data Center — mutually
 # exclusive with api_token*), read_only, enabled_tools = ["jira_get_issue", ...]
@@ -63,15 +63,15 @@ key_prefixes = ["JUMP"]
 read_only    = true
 
 [[sites]]
-name         = "valiram"
-url          = "https://valiram.atlassian.net"
-key_prefixes = ["VJAP"]
+name         = "gamma"
+url          = "https://gamma.atlassian.net"
+key_prefixes = ["GAM"]
 # Restricts which projects THIS SITE'S upstream child will search/browse at
 # all (its JIRA_PROJECTS_FILTER env var) -- separate from a tool call's own
 # projects_filter argument, which only affects routing. Entries are project
 # keys, normalized to uppercase; a numeric project id is never a valid entry
 # here (unlike upstream's JQL, which does accept one).
-projects_filter = ["VJAP"]
+projects_filter = ["GAM"]
 # enabled_tools = ["jira_get_issue", "jira_search", "jira_add_comment"]
 
 # Example Server/Data Center site (personal access token, no username needed):

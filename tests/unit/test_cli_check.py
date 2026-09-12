@@ -14,7 +14,7 @@ TOKEN = "super-secret-check-token"
 
 CONFIG = f"""
 [defaults]
-username = "bgrossman@jumpmind.com"
+username = "you@example.com"
 api_token = "{TOKEN}"
 
 [[sites]]
@@ -38,10 +38,10 @@ def _write_config(tmp_path: Path) -> Path:
 @respx.mock
 def test_check_all_sites_pass(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     respx.get("https://acme.atlassian.net/rest/api/3/myself").mock(
-        return_value=Response(200, json={"displayName": "Ben Grossman", "accountId": "acc-acme"})
+        return_value=Response(200, json={"displayName": "Example User", "accountId": "acc-acme"})
     )
     respx.get("https://beta.atlassian.net/rest/api/3/myself").mock(
-        return_value=Response(200, json={"displayName": "Ben Grossman", "accountId": "acc-beta"})
+        return_value=Response(200, json={"displayName": "Example User", "accountId": "acc-beta"})
     )
 
     exit_code = main(["--check", "--config", str(_write_config(tmp_path))])
@@ -50,7 +50,7 @@ def test_check_all_sites_pass(tmp_path: Path, capsys: pytest.CaptureFixture[str]
     captured = capsys.readouterr()
     assert "acme" in captured.out
     assert "beta" in captured.out
-    assert "Ben Grossman" in captured.out
+    assert "Example User" in captured.out
     assert TOKEN not in captured.out
     assert TOKEN not in captured.err
 
@@ -60,7 +60,7 @@ def test_check_one_site_401_fails_without_leaking_token(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     respx.get("https://acme.atlassian.net/rest/api/3/myself").mock(
-        return_value=Response(200, json={"displayName": "Ben Grossman", "accountId": "acc-acme"})
+        return_value=Response(200, json={"displayName": "Example User", "accountId": "acc-acme"})
     )
     respx.get("https://beta.atlassian.net/rest/api/3/myself").mock(
         return_value=Response(401, json={"errorMessages": ["Unauthorized"]})
@@ -81,7 +81,7 @@ def test_check_allow_partial_exits_zero_when_at_least_one_site_passes(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     respx.get("https://acme.atlassian.net/rest/api/3/myself").mock(
-        return_value=Response(200, json={"displayName": "Ben Grossman", "accountId": "acc-acme"})
+        return_value=Response(200, json={"displayName": "Example User", "accountId": "acc-acme"})
     )
     respx.get("https://beta.atlassian.net/rest/api/3/myself").mock(
         return_value=Response(401, json={"errorMessages": ["Unauthorized"]})
@@ -116,7 +116,7 @@ personal_token = "{TOKEN}"
 @respx.mock
 def test_check_dc_site_uses_bearer_and_v2_myself(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     route = respx.get("https://jira.example.com/rest/api/2/myself").mock(
-        return_value=Response(200, json={"displayName": "Ben Grossman", "key": "bgrossman"})
+        return_value=Response(200, json={"displayName": "Example User", "key": "example.user"})
     )
     path = tmp_path / "config.toml"
     path.write_text(DC_CONFIG)
@@ -127,7 +127,7 @@ def test_check_dc_site_uses_bearer_and_v2_myself(tmp_path: Path, capsys: pytest.
     assert route.calls.last.request.headers["Authorization"] == f"Bearer {TOKEN}"
     captured = capsys.readouterr()
     assert "bearer" in captured.out
-    assert "bgrossman" in captured.out
+    assert "example.user" in captured.out
     assert TOKEN not in captured.out
     assert TOKEN not in captured.err
 
@@ -137,7 +137,7 @@ def test_check_non_http_exception_becomes_a_failed_row_not_a_crash(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     respx.get("https://acme.atlassian.net/rest/api/3/myself").mock(
-        return_value=Response(200, json={"displayName": "Ben Grossman", "accountId": "acc-acme"})
+        return_value=Response(200, json={"displayName": "Example User", "accountId": "acc-acme"})
     )
     respx.get("https://beta.atlassian.net/rest/api/3/myself").mock(
         side_effect=RuntimeError(f"boom near token {TOKEN}")
@@ -160,10 +160,10 @@ def test_check_table_columns_are_not_truncated_for_long_values(
 ) -> None:
     long_account_id = "a" * 60
     respx.get("https://acme.atlassian.net/rest/api/3/myself").mock(
-        return_value=Response(200, json={"displayName": "Ben Grossman", "accountId": long_account_id})
+        return_value=Response(200, json={"displayName": "Example User", "accountId": long_account_id})
     )
     respx.get("https://beta.atlassian.net/rest/api/3/myself").mock(
-        return_value=Response(200, json={"displayName": "Ben Grossman", "accountId": "acc-beta"})
+        return_value=Response(200, json={"displayName": "Example User", "accountId": "acc-beta"})
     )
 
     exit_code = main(["--check", "--config", str(_write_config(tmp_path))])

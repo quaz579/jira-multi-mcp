@@ -1,10 +1,12 @@
-"""Direct Jira Cloud REST v3 attachment client: list, download-to-disk, upload.
+"""Direct Jira Cloud REST v3 client: attachments (list, download-to-disk,
+upload) and comment deletion.
 
 Implemented directly against the REST API (not through an upstream child)
-because upstream ``mcp-atlassian`` only exposes a base64-in-band download
-tool -- see ``tools_meta.WRAPPER_OWNED_TOOLS``. Cloud only in this version:
-Server/Data Center attachment endpoints differ and are out of scope (the
-plan's v1 decision), so every method refuses on a ``personal_token`` site.
+because upstream ``mcp-atlassian`` has no delete-comment tool at all, and
+only exposes a base64-in-band download tool for attachments -- see
+``tools_meta.WRAPPER_OWNED_TOOLS``. Cloud only in this version: Server/Data
+Center endpoints differ and are out of scope (the plan's v1 decision), so
+every method refuses on a ``personal_token`` site.
 """
 
 from __future__ import annotations
@@ -26,6 +28,7 @@ import httpx
 from fastmcp.exceptions import ToolError
 
 from jira_multi_mcp.model import Defaults, SiteConfig
+from jira_multi_mcp.tools_meta import COMMENT_ID_RE, ISSUE_KEY_RE
 
 _logger = logging.getLogger(__name__)
 
@@ -117,6 +120,17 @@ def _safe_filename(filename: str) -> str:
     return name
 
 
+def _path_segment(value: str, pattern: re.Pattern[str], label: str) -> str:
+    """Defense in depth: ``wrapper_tools`` already validates and normalizes
+    ``issue_key``/``comment_id`` before calling into this client, but every
+    method that puts one straight into a REST URL path re-checks it here too,
+    so a future caller that skips the wrapper layer can never misuse this
+    client to hit a different endpoint or issue."""
+    if not pattern.fullmatch(value):
+        raise ValueError(f"invalid {label}: {value!r}")
+    return value
+
+
 class JiraAttachmentClient:
     """One site's attachment operations, over a caller-supplied ``httpx.AsyncClient``."""
 
@@ -138,22 +152,28 @@ class JiraAttachmentClient:
         return f"{self._site.url}/rest/api/3"
 
     def _redact_exc(self, exc: BaseException) -> str:
-        return self._redact(f"{exc.__class__.__name__}: {exc}")
+        # Some httpx transport errors (e.g. a bare `httpx.ConnectError()`)
+        # stringify to "" -- without a fallback that reads as "ClassName: "
+        # with nothing after the colon, which looks like the message got
+        # truncated rather than never having existed.
+        detail = str(exc) or "(no detail)"
+        return self._redact(f"{exc.__class__.__name__}: {detail}")
 
-    def _shape_transport_error(self, exc: httpx.HTTPError, tool_name: str) -> ToolError:
+    def _shape_transport_error(self, exc: httpx.HTTPError | httpx.InvalidURL, tool_name: str) -> ToolError:
         """Gives a transport-level failure (connect/read timeout, dropped
-        connection, ...) on the LIST or UPLOAD phase the same ``[site=]``
-        shape every other error path in this module already has -- used by
-        both single-shot call sites (list/upload raise this directly); the
-        per-attachment DOWNLOAD phase collects failures as ``_DownloadEntry``
-        rows instead of raising, but shares ``_redact_exc`` for the same
-        underlying message text."""
+        connection, an ``httpx.InvalidURL`` a malformed path segment slipped
+        past validation and produced, ...) on the LIST or UPLOAD phase the
+        same ``[site=]`` shape every other error path in this module already
+        has -- used by both single-shot call sites (list/upload raise this
+        directly); the per-attachment DOWNLOAD phase collects failures as
+        ``_DownloadEntry`` rows instead of raising, but shares ``_redact_exc``
+        for the same underlying message text."""
         return ToolError(f"[site={self._site.name}] {tool_name}: {self._redact_exc(exc)}")
 
     def _require_cloud(self, tool_name: str) -> None:
         if self._site.personal_token is not None:
             raise ToolError(
-                f"[site={self._site.name}] {tool_name}: attachment tools support Jira Cloud sites "
+                f"[site={self._site.name}] {tool_name}: this tool supports Jira Cloud sites "
                 f"only in this version (site '{self._site.name}' is configured as Server/Data Center)"
             )
 
@@ -161,12 +181,16 @@ class JiraAttachmentClient:
         self, issue_key: str, *, tool_name: str = "jira_list_attachments"
     ) -> list[AttachmentMeta]:
         self._require_cloud(tool_name)
+        try:
+            issue_key = _path_segment(issue_key, ISSUE_KEY_RE, "issue_key")
+        except ValueError as exc:
+            raise ToolError(f"[site={self._site.name}] {tool_name}: {exc}") from exc
         path = f"/issue/{issue_key}"
         try:
             response = await self._http.get(f"{self.api_base}{path}", params={"fields": "attachment"})
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
             raise self._shape_transport_error(exc, tool_name) from exc
-        await self._raise_for_status(response, "GET", path)
+        await self._raise_for_status(response, "GET", path, tool_name)
         data = response.json()
         raw_attachments = (data.get("fields") or {}).get("attachment") or []
         return [self._parse_attachment(raw) for raw in raw_attachments]
@@ -225,6 +249,10 @@ class JiraAttachmentClient:
 
     async def upload(self, issue_key: str, paths: Sequence[Path]) -> list[AttachmentMeta]:
         self._require_cloud("jira_upload_attachments")
+        try:
+            issue_key = _path_segment(issue_key, ISSUE_KEY_RE, "issue_key")
+        except ValueError as exc:
+            raise ToolError(f"[site={self._site.name}] jira_upload_attachments: {exc}") from exc
         for path in paths:
             try:
                 size = path.stat().st_size
@@ -261,10 +289,29 @@ class JiraAttachmentClient:
                     files=files,
                     headers={"X-Atlassian-Token": "no-check"},
                 )
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
                 raise self._shape_transport_error(exc, "jira_upload_attachments") from exc
-        await self._raise_for_status(response, "POST", path_str)
+        await self._raise_for_status(response, "POST", path_str, "jira_upload_attachments")
         return [self._parse_attachment(raw) for raw in response.json()]
+
+    async def delete_comment(self, issue_key: str, comment_id: str) -> None:
+        """Permanently deletes one comment. ``issue_key``/``comment_id`` are
+        validated by the caller (``wrapper_tools._validate_issue_key`` /
+        ``_validate_comment_id``) before either ever reaches this method --
+        the ``_path_segment`` checks below are a defense-in-depth belt for a
+        future caller that skips that wrapper layer, not the primary guard."""
+        self._require_cloud("jira_delete_comment")
+        try:
+            issue_key = _path_segment(issue_key, ISSUE_KEY_RE, "issue_key")
+            comment_id = _path_segment(comment_id, COMMENT_ID_RE, "comment_id")
+        except ValueError as exc:
+            raise ToolError(f"[site={self._site.name}] jira_delete_comment: {exc}") from exc
+        path = f"/issue/{issue_key}/comment/{comment_id}"
+        try:
+            response = await self._http.delete(f"{self.api_base}{path}")
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            raise self._shape_transport_error(exc, "jira_delete_comment") from exc
+        await self._raise_for_status(response, "DELETE", path, "jira_delete_comment")
 
     def _select(
         self,
@@ -348,15 +395,13 @@ class JiraAttachmentClient:
 
         try:
             result = await self._stream_to_dest(attachment, dest, target_dir, overwrite=overwrite)
-        except (OSError, httpx.HTTPError, ValueError) as exc:
+        except (OSError, httpx.HTTPError, httpx.InvalidURL, ValueError) as exc:
             # Belt: any per-file failure `_stream_to_dest`'s own steps didn't
             # already shape into a clearer `_DownloadEntry` lands here instead
             # of escaping `download()`'s loop and aborting every other
             # attachment selected in the same call (the exact bug an
             # unshaped `IsADirectoryError` from `os.replace` caused).
-            return _DownloadEntry(
-                attachment.filename, self._redact(f"{exc.__class__.__name__}: {exc}"), "failed"
-            )
+            return _DownloadEntry(attachment.filename, self._redact_exc(exc), "failed")
         if isinstance(result, DownloadedFile):
             used_names.add(result.filename)
         return result
@@ -411,7 +456,9 @@ class JiraAttachmentClient:
                     "GET", attachment.content_url, follow_redirects=True
                 ) as response:
                     try:
-                        await self._raise_for_status(response, "GET", attachment.content_url)
+                        await self._raise_for_status(
+                            response, "GET", attachment.content_url, "jira_download_attachments"
+                        )
                     except ToolError as exc:
                         return _DownloadEntry(attachment.filename, str(exc), "failed")
 
@@ -435,7 +482,7 @@ class JiraAttachmentClient:
                             f"exceeded max_bytes {self._max_bytes} while streaming",
                             "failed",
                         )
-            except httpx.HTTPError as exc:
+            except (httpx.HTTPError, httpx.InvalidURL) as exc:
                 # A transport-level failure (connect/read timeout, dropped
                 # connection, a mid-stream ReadError, ...) or an error raised
                 # while just setting up the stream, before a single byte was
@@ -485,7 +532,7 @@ class JiraAttachmentClient:
         except OSError as exc:
             return _DownloadEntry(
                 attachment.filename,
-                self._redact(f"could not finalize download: {exc.__class__.__name__}: {exc}"),
+                f"could not finalize download: {self._redact_exc(exc)}",
                 "failed",
             )
         finally:
@@ -572,14 +619,17 @@ class JiraAttachmentClient:
             content_url=raw.get("content", ""),
         )
 
-    async def _raise_for_status(self, response: httpx.Response, method: str, path: str) -> None:
+    async def _raise_for_status(
+        self, response: httpx.Response, method: str, path: str, tool_name: str
+    ) -> None:
         if response.is_success:
             return
         if not response.is_stream_consumed:
             await response.aread()
         detail = self._error_detail(response)
         message = self._redact(
-            f"[site={self._site.name}] Jira returned {response.status_code} for {method} {path}: {detail}"
+            f"[site={self._site.name}] {tool_name}: Jira returned {response.status_code} "
+            f"for {method} {path}: {detail}"
         )
         raise ToolError(message)
 
