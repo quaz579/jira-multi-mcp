@@ -37,6 +37,17 @@ Requires [`uv`](https://docs.astral.sh/uv/) (which provides `uvx`) on your
 `PATH`; `jira-multi-mcp` itself and the upstream `mcp-atlassian` child are
 both run through it, so nothing else needs a manual `pip install`.
 
+**This project is not yet published to PyPI.** Once it is, install/run it
+with:
+
+```bash
+uvx jira-multi-mcp@latest
+```
+
+Until then, install straight from this git repo — every command below that
+runs `uvx --from git+https://github.com/quaz579/jira-multi-mcp jira-multi-mcp`
+is that form; swap it for `uvx jira-multi-mcp@latest` once a release ships.
+
 Register it with Claude Code:
 
 ```bash
