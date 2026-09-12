@@ -1,6 +1,6 @@
 ---
 name: jira-multi
-description: Look up, search, or update Jira issues across several Jira Cloud sites through the jira-multi-mcp server, and download or upload attachments straight to disk. Use for requests like "look at BETA-2274", "get ACME-13447", "what's the status of GAM-979", "download the screenshots on ACME-13447", "attach this file to BETA-2274", or "add a comment to ACME-13447" — anything naming a Jira issue key or asking to search/browse Jira.
+description: Look up, search, or update Jira issues across several Jira Cloud sites through the jira-multi-mcp server, download or upload attachments straight to disk, and delete a comment. Use for requests like "look at BETA-2274", "get ACME-13447", "what's the status of GAM-979", "download the screenshots on ACME-13447", "attach this file to BETA-2274", "add a comment to ACME-13447", or "delete that comment I just added to PROJ-123" — anything naming a Jira issue key or asking to search/browse Jira.
 ---
 
 # jira-multi-mcp
@@ -26,8 +26,9 @@ nothing and tells you:
 
 ## Omit `site` whenever an issue key is in your arguments
 
-Every mirrored tool and the three attachment tools accept an optional `site`
-parameter, but it's inferred automatically from any issue key in the call
+Every mirrored tool, the three attachment tools, and `jira_delete_comment`
+accept an optional `site` parameter, but it's inferred automatically from any
+issue key in the call
 (`issue_key`, `epic_key`, `parent`, and similar arguments) — just pass
 `BETA-2274` or `ACME-13447` and let it route. Only pass `site` explicitly when
 you already know it or the call has no issue key to infer from.
@@ -54,6 +55,16 @@ filename collision or an over-size file lands there, not in `downloaded`.
 
 For "attach this file to BETA-2274": call `jira_upload_attachments(issue_key=...,
 paths=[...])` with absolute local paths.
+
+## Deleting a comment is permanent — use it to clean up a mistake, nothing else
+
+`jira_delete_comment(issue_key=..., comment_id=...)` permanently deletes one
+comment. **There is no undo.** Use it when asked to remove a comment that was
+added by mistake (e.g. right after `jira_add_comment`, or when the user
+explicitly says "delete"/"remove" a comment) — never to "edit" a comment,
+which is `jira_edit_comment` instead. `comment_id` must be the numeric id
+(from `jira_get_issue`'s comment list, or the id `jira_add_comment` just
+returned); anything else is refused before any request is sent.
 
 ## Reading errors
 

@@ -14,7 +14,8 @@ tools behind a `site` selector:
 Claude Code ──stdio──▶ jira-multi-mcp (parent)
                           │  one tool set: jira_get_issue(site?, ...) etc.
                           │  + jira_sites, jira_list_attachments,
-                          │    jira_download_attachments, jira_upload_attachments
+                          │    jira_download_attachments, jira_upload_attachments,
+                          │    jira_delete_comment
                           │
                           ├─▶ child "acme":  uvx mcp-atlassian   (ACME, ACMEH, ACMI)
                           ├─▶ child "beta":  uvx mcp-atlassian   (BETA)
@@ -217,11 +218,14 @@ of which this repo has individually verified.
 
 ### Wrapper-owned tools
 
-These four are implemented directly by `jira-multi-mcp` rather than forwarded
-to a child. The three attachment tools below talk to Jira Cloud REST v3
-(`httpx`) directly and are **Cloud-only** — a Server/Data Center site
-(`personal_token`) gets a clear refusal instead; `jira_sites` has no such
-restriction and reports on every configured site regardless of auth mode.
+These five are implemented directly by `jira-multi-mcp` rather than forwarded
+to a child. The attachment tools and `jira_delete_comment` below all talk to
+Jira Cloud REST v3 (`httpx`) directly and are **Cloud-only** — a Server/Data
+Center site (`personal_token`) gets a clear refusal instead; `jira_sites` has
+no such restriction and reports on every configured site regardless of auth
+mode. Each of these four also echoes back a normalized `issue_key`
+(stripped, uppercased) rather than the raw argument, so e.g. an input of
+`" acme-1 "` comes back as `"ACME-1"`.
 
 **`jira_sites()`** — no arguments. Per-site health: `name`, `host`,
 `key_prefixes`, `read_only`, `enabled_tools_restricted`, `state` (`healthy`,
@@ -284,7 +288,25 @@ as new attachments and returns each created attachment's
 A write operation: refused with a clear `read_only = true` error on a site
 configured that way.
 
-`site` is optional on all four (except `jira_sites`, which takes no
+**`jira_delete_comment(issue_key, comment_id, site?)`** — permanently
+deletes one comment. **Irreversible — there is no undo.** Upstream has no
+delete-comment tool at all (only `jira_add_comment`/`jira_edit_comment`), so
+this is a direct REST call like the attachment tools above. `comment_id`
+must be the numeric comment id (digits only); anything else — a slash, a
+query string, letters — is refused before any request is made. On success,
+returns `{site, issue_key, comment_id, deleted: true}` — `issue_key` is
+echoed normalized (stripped, uppercased), not the raw argument.
+
+| Argument | Required | Notes |
+|---|---|---|
+| `issue_key` | yes | |
+| `comment_id` | yes | Digits only. |
+| `site` | no | Inferred from `issue_key`'s prefix if omitted. |
+
+A write operation: refused with a clear `read_only = true` error on a site
+configured that way.
+
+`site` is optional on all five (except `jira_sites`, which takes no
 arguments) and inferred from `issue_key`'s project prefix the same way every
 mirrored tool resolves it.
 

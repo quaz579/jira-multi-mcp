@@ -119,6 +119,15 @@ def test_unknown_explicit_site_lists_configured_names(multi_site_registry: SiteR
     assert "acme" in message and "beta" in message
 
 
+def test_unknown_explicit_site_bounds_a_pathological_name(multi_site_registry: SiteRegistry) -> None:
+    huge_name = "x" * 5000
+    with pytest.raises(UnknownSiteError) as exc_info:
+        resolve_site(multi_site_registry, {}, explicit=huge_name, tool_name="x")
+    message = str(exc_info.value)
+    assert len(message) < 400
+    assert "...(" in message
+
+
 def test_single_site_shortcut_ignores_arguments(single_site_registry: SiteRegistry) -> None:
     result = resolve_site(single_site_registry, {"issue_key": "does-not-matter"}, tool_name="x")
     assert result.site.name == "acme"
@@ -128,6 +137,33 @@ def test_single_site_shortcut_ignores_arguments(single_site_registry: SiteRegist
 def test_unknown_prefix_names_it(multi_site_registry: SiteRegistry) -> None:
     with pytest.raises(UnknownPrefixError, match="ZZZ"):
         resolve_site(multi_site_registry, {"issue_key": "ZZZ-1"}, tool_name="x")
+
+
+def test_unknown_prefix_bounds_a_pathological_key(multi_site_registry: SiteRegistry) -> None:
+    # ISSUE_KEY_RE has no upper bound on the digit run, so an unknown-prefix
+    # key this long reached resolve_site's error message untruncated before
+    # every pre-validation echo site shared tools_meta.shorten_for_error.
+    huge_key = "ZZZ-" + "9" * 5000
+    with pytest.raises(UnknownPrefixError) as exc_info:
+        resolve_site(multi_site_registry, {"issue_key": huge_key}, tool_name="x")
+    message = str(exc_info.value)
+    assert len(message) < 400
+    assert "...(" in message
+
+
+def test_cross_site_bounds_a_pathological_key(multi_site_registry: SiteRegistry) -> None:
+    # Each matched token is echoed into both `matched_detail` (CrossSiteError's
+    # message) and `first_reason` (SiteResolution.reason) before any length
+    # check runs, so a huge but well-shaped key on either side of the
+    # cross-site conflict must be bounded by shorten_for_error too.
+    huge_key = "ACME-" + "9" * 5000
+    with pytest.raises(CrossSiteError) as exc_info:
+        resolve_site(
+            multi_site_registry, {"issue_key": huge_key, "epic_key": "BETA-1"}, tool_name="jira_get_issue"
+        )
+    message = str(exc_info.value)
+    assert len(message) < 600
+    assert "...(" in message
 
 
 def test_cross_site_names_both_keys_and_sites(multi_site_registry: SiteRegistry) -> None:
