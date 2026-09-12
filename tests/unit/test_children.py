@@ -175,6 +175,21 @@ async def test_discovery_skips_a_read_only_first_site(tmp_path: Path) -> None:
         assert health["beta"]["discovery_source"] is True
 
 
+async def test_health_reports_each_sites_configured_source(tmp_path: Path) -> None:
+    registry = SiteRegistry(
+        [
+            _cloud_site("acme", "ACME", source="sites.d/01-acme.toml"),
+            _cloud_site("beta", "BETA", source="env"),
+        ]
+    )
+    manager = _make_manager(registry, tmp_path, lambda site, up: FastMCPTransport(make_fake_child(site.name)))
+    async with AsyncExitStack() as stack:
+        await manager.start_all(stack, connect_timeout=5)
+        health = {h["name"]: h for h in manager.health()}
+        assert health["acme"]["source"] == "sites.d/01-acme.toml"
+        assert health["beta"]["source"] == "env"
+
+
 async def test_one_failing_site_leaves_the_other_healthy(tmp_path: Path) -> None:
     registry = SiteRegistry([_cloud_site("acme", "ACME"), _cloud_site("beta", "BETA")])
 

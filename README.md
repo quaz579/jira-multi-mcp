@@ -156,6 +156,19 @@ a load-time error otherwise.
 See `config.example.toml` for a filled-in, commented example, including a
 Server/Data Center site (`personal_token_env`, no `username` needed).
 
+### Drop-in site config (`sites.d/`)
+
+Another tool (a dashboard, an installer) can add sites without editing your
+`config.toml`: any `*.toml` file placed in `sites.d/` next to `config.toml`
+(override the directory with `JIRA_MULTI_SITES_DIR`) is loaded as extra
+`[[sites]]` entries, in lexical filename order, before `config.toml` itself —
+so a site you also define in `config.toml` overrides the drop-in version
+field by field. A drop-in file may contain **only** `[[sites]]` — no
+`[defaults]`/`[upstream]`, and no literal `api_token`/`personal_token` (use
+`api_token_env`/`personal_token_env` instead; only `config.toml`, which you
+control directly, is trusted with a literal secret). A missing `sites.d/`
+directory is fine — it just contributes no sites.
+
 ### Environment variable overlay
 
 A `JIRA_MULTI_SITE_<NAME>_<FIELD>` variable overrides one field of a site
@@ -173,10 +186,12 @@ should never silently create a broken site.
 
 - `jira-multi-mcp --print-config` — show the effective, merged configuration
   with every secret masked as `***` (and where each token came from: the
-  file, or an env-overlay variable).
+  file, or an env-overlay variable), plus each site's `source` — which file
+  (`config.toml`, a `sites.d/` drop-in, or `"env"`) actually defined it.
 - `jira-multi-mcp --check` — authenticate against every configured site and
-  print a table of `displayName`/`accountId` per site; exits non-zero if any
-  site fails (`--allow-partial` to tolerate some failures).
+  print a table of `displayName`/`accountId` per site, including its
+  `source`; exits non-zero if any site fails (`--allow-partial` to tolerate
+  some failures).
 - `jira-multi-mcp --warm [--refresh]` — run the upstream command once to
   prime `uvx`'s cache ahead of time; `--refresh` forces re-resolution instead
   of reusing a cached version.
@@ -243,7 +258,9 @@ mode. Each of these four also echoes back a normalized `issue_key`
 `failed`, or `recovering` — see [How site recovery works](#how-site-recovery-works)),
 `error`/`last_error`/`last_error_at`, `timeouts`, `recovery_attempts`,
 `next_retry_at`, `log_path`, `discovery_source` (whether that site was the
-tool-discovery source), and `fastmcp_server_version` — the FastMCP *library*
+tool-discovery source), `source` (which file defined it — `config.toml`, a
+[`sites.d/`](#drop-in-site-config-sitesd) drop-in file, or `"env"`), and
+`fastmcp_server_version` — the FastMCP *library*
 version the child reports, not upstream mcp-atlassian's own version (that's
 the top-level `upstream_version`, probed once per process since every child
 launches the same command). Never credentials. `healthy` means the child

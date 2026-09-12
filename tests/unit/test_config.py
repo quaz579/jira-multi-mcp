@@ -6,10 +6,11 @@ from pathlib import Path
 
 import pytest
 
-from jira_multi_mcp.config import load_config
+from jira_multi_mcp.cli import _sources_for
+from jira_multi_mcp.config import default_sources, load_config
 from jira_multi_mcp.errors import ConfigError
 from jira_multi_mcp.model import AppConfig
-from jira_multi_mcp.sources import EnvOverlaySource, TomlFileConfigSource
+from jira_multi_mcp.sources import DropInSitesSource, EnvOverlaySource, TomlFileConfigSource
 
 MINIMAL_TOML = """
 [defaults]
@@ -342,3 +343,132 @@ def test_env_overlay_field_onto_existing_toml_site_is_unaffected(tmp_path: Path)
     config = load_config(sources=[TomlFileConfigSource(path), EnvOverlaySource(environ)])
     assert len(config.sites) == 1
     assert config.sites[0].read_only is True
+
+
+# --- sites.d drop-in directory --------------------------------------------
+
+
+def _write_drop_in(sites_dir: Path, filename: str, content: str) -> None:
+    sites_dir.mkdir(parents=True, exist_ok=True)
+    (sites_dir / filename).write_text(content)
+
+
+def test_drop_in_site_is_loaded_and_config_toml_overrides_it_per_key(tmp_path: Path) -> None:
+    sites_dir = tmp_path / "sites.d"
+    _write_drop_in(
+        sites_dir,
+        "01-beta.toml",
+        '[[sites]]\nname = "beta"\nurl = "https://beta.atlassian.net"\n'
+        'key_prefixes = ["BETA"]\nusername = "drop-in@example.com"\n',
+    )
+    config_path = _write(
+        tmp_path,
+        MINIMAL_TOML + '\n[[sites]]\nname = "beta"\nusername = "you@example.com"\n',
+    )
+    config = load_config(
+        sources=[
+            DropInSitesSource(sites_dir),
+            TomlFileConfigSource(config_path),
+            EnvOverlaySource({}),
+        ]
+    )
+    beta = next(s for s in config.sites if s.name == "beta")
+    # config.toml only overrides `username`; `url`/`key_prefixes` still come
+    # from the drop-in, proving the merge is per-key, not whole-entry.
+    assert beta.username == "you@example.com"
+    assert beta.url == "https://beta.atlassian.net"
+    assert beta.key_prefixes == ("BETA",)
+    assert beta.source == str(config_path)
+
+
+def test_drop_in_only_site_gets_the_drop_in_file_as_its_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BETA_TOKEN", "beta-token")
+    sites_dir = tmp_path / "sites.d"
+    _write_drop_in(
+        sites_dir,
+        "01-beta.toml",
+        '[[sites]]\nname = "beta"\nurl = "https://beta.atlassian.net"\n'
+        'key_prefixes = ["BETA"]\nusername = "you@example.com"\napi_token_env = "BETA_TOKEN"\n',
+    )
+    config_path = _write(tmp_path, MINIMAL_TOML)
+    config = load_config(
+        sources=[
+            DropInSitesSource(sites_dir),
+            TomlFileConfigSource(config_path),
+            EnvOverlaySource({}),
+        ]
+    )
+    beta = next(s for s in config.sites if s.name == "beta")
+    assert beta.source == str(sites_dir / "01-beta.toml")
+
+
+def test_duplicate_key_prefix_across_drop_in_and_config_toml_still_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BETA_TOKEN", "beta-token")
+    sites_dir = tmp_path / "sites.d"
+    _write_drop_in(
+        sites_dir,
+        "01-beta.toml",
+        '[[sites]]\nname = "beta"\nurl = "https://beta.atlassian.net"\n'
+        'key_prefixes = ["ACME"]\nusername = "you@example.com"\napi_token_env = "BETA_TOKEN"\n',
+    )
+    config_path = _write(tmp_path, MINIMAL_TOML)
+    with pytest.raises(ConfigError, match="ACME"):
+        load_config(
+            sources=[
+                DropInSitesSource(sites_dir),
+                TomlFileConfigSource(config_path),
+                EnvOverlaySource({}),
+            ]
+        )
+
+
+def test_pure_env_site_has_source_env(tmp_path: Path) -> None:
+    path = _write(tmp_path, MINIMAL_TOML)
+    environ = {
+        "JIRA_MULTI_SITE_BETA_URL": "https://beta.atlassian.net",
+        "JIRA_MULTI_SITE_BETA_KEY_PREFIXES": "BETA",
+        "JIRA_MULTI_SITE_BETA_API_TOKEN": "beta-token",
+        "JIRA_MULTI_SITE_BETA_USERNAME": "you@example.com",
+    }
+    config = load_config(sources=[TomlFileConfigSource(path), EnvOverlaySource(environ)])
+    beta = next(s for s in config.sites if s.name == "beta")
+    assert beta.source == "env"
+    acme = next(s for s in config.sites if s.name == "acme")
+    assert acme.source == str(path)
+
+
+def test_both_entry_points_honor_sites_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """``load_config(sources=None)`` and the CLI's own ``_sources_for`` must
+    build the identical source list from just a config path -- a prior version
+    of this codebase had two separate places that constructed sources, and
+    only one of them knew about sites.d (see config.default_sources)."""
+    config_path = tmp_path / "config.toml"
+    config_path.write_text(MINIMAL_TOML)
+    sites_dir = tmp_path / "custom-sites-dir"
+    monkeypatch.setenv("BETA_TOKEN", "beta-token")
+    _write_drop_in(
+        sites_dir,
+        "01-beta.toml",
+        '[[sites]]\nname = "beta"\nurl = "https://beta.atlassian.net"\n'
+        'key_prefixes = ["BETA"]\nusername = "you@example.com"\napi_token_env = "BETA_TOKEN"\n',
+    )
+    monkeypatch.setenv("JIRA_MULTI_CONFIG", str(config_path))
+    monkeypatch.setenv("JIRA_MULTI_SITES_DIR", str(sites_dir))
+
+    config = load_config(sources=None)
+    assert {s.name for s in config.sites} == {"acme", "beta"}
+
+    cli_sources = _sources_for(config_path)
+    assert cli_sources is not None
+    drop_in_sources = [source for source in cli_sources if isinstance(source, DropInSitesSource)]
+    assert len(drop_in_sources) == 1
+    assert drop_in_sources[0].directory == sites_dir
+
+    default_drop_in_sources = [
+        source for source in default_sources(config_path) if isinstance(source, DropInSitesSource)
+    ]
+    assert default_drop_in_sources[0].directory == sites_dir

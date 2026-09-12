@@ -864,6 +864,7 @@ class ChildManager:
                 "log_path": str(handle.log_path),
                 "fastmcp_server_version": handle.fastmcp_server_version,
                 "discovery_source": handle.site.name == self._discovery_source,
+                "source": handle.site.source,
             }
             if note is not None:
                 entry["note"] = note
